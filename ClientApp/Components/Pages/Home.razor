@@ -1,0 +1,322 @@
+@page "/"
+@inject ApiClientService Api
+@inject AuthStateProvider Auth
+@inject ChatClientService Chat
+@inject NavigationManager Nav
+
+<div class="rooms-layout">
+        <aside class="room-list">
+            <div class="room-list-header">
+                <h4>Chat Rooms</h4>
+                <button class="btn-primary btn-small" @onclick="ShowCreateRoom">+</button>
+            </div>
+
+            @if (_showCreateRoom)
+            {
+                <div class="create-room-form">
+                    <input @bind="_newRoomName" placeholder="Room name" />
+                    <input @bind="_newRoomDesc" placeholder="Description (optional)" />
+                    <label class="checkbox-label">
+                        <input type="checkbox" @bind="_newRoomVoice" /> Voice
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" @bind="_newRoomVideo" /> Video
+                    </label>
+                    <div class="form-actions">
+                        <button class="btn-primary btn-small" @onclick="CreateRoom">Create</button>
+                        <button class="btn-secondary btn-small" @onclick="() => _showCreateRoom = false">Cancel</button>
+                    </div>
+                </div>
+            }
+
+            @foreach (var room in _rooms)
+            {
+                <div class="room-item @(room.Id == _selectedRoomId ? "active" : "")" @onclick="() => SelectRoom(room.Id)">
+                    <span class="room-name">@room.Name</span>
+                    <span class="room-members">@room.MemberCount members</span>
+                </div>
+            }
+        </aside>
+
+        <section class="chat-area">
+            @if (_selectedRoomId != null)
+            {
+                <div class="chat-header">
+                    <h4>@(_rooms.FirstOrDefault(r => r.Id == _selectedRoomId)?.Name)</h4>
+                    <div class="chat-actions">
+                        @if (_selectedRoom?.IsVoiceEnabled == true || _selectedRoom?.IsVideoEnabled == true)
+                        {
+                            <button class="btn-secondary btn-small" @onclick="NavigateToVoice">
+                                Join Call
+                            </button>
+                        }
+                        <button class="btn-secondary btn-small" @onclick="ToggleMembers">Members</button>
+                    </div>
+                </div>
+
+                <div class="chat-messages" @ref="_messagesContainer">
+                    @foreach (var msg in _messages)
+                    {
+                        <div class="message @(msg.SenderId == Auth.CurrentUser?.Id ? "own" : "") @(msg.IsDeleted ? "deleted" : "")">
+                            <div class="message-header">
+                                <span class="message-sender">@msg.SenderName</span>
+                                <span class="message-time">@msg.SentAt.ToLocalTime().ToString("HH:mm")</span>
+                                @if (msg.SenderId == Auth.CurrentUser?.Id || _currentUserRole >= UserRole.Moderator)
+                                {
+                                    <button class="btn-delete" @onclick="() => DeleteMessage(msg.Id)">X</button>
+                                }
+                            </div>
+                            @if (!msg.IsDeleted)
+                            {
+                                <div class="message-content">
+                                    @if (msg.MentionedUserIds.Length > 0)
+                                    {
+                                        <span class="mention-badge">@msg.MentionedUserIds.Length mention(s)</span>
+                                    }
+                                    @msg.Content
+                                </div>
+                                @if (msg.Attachments.Length > 0)
+                                {
+                                    <div class="message-attachments">
+                                        @foreach (var att in msg.Attachments)
+                                        {
+                                            <a href="@att.Url" target="_blank" class="attachment-link">@att.FileName</a>
+                                        }
+                                    </div>
+                                }
+                            }
+                            else
+                            {
+                                <div class="message-content deleted-text">Message deleted</div>
+                            }
+                        </div>
+                    }
+                </div>
+
+                <div class="chat-input">
+                    <textarea @bind="_messageText" @onkeydown="HandleKeyDown" placeholder="Type a message..." rows="1"></textarea>
+                    <button class="btn-primary" @onclick="SendMessage" disabled="@string.IsNullOrWhiteSpace(_messageText)">Send</button>
+                </div>
+            }
+            else
+            {
+                <div class="no-room-selected">
+                    <p>Select a room to start chatting</p>
+                </div>
+            }
+        </section>
+
+        @if (_showMembers && _selectedRoomId != null)
+        {
+            <aside class="members-panel">
+                <div class="members-header">
+                    <h4>Members</h4>
+                    <button class="btn-secondary btn-small" @onclick="ToggleMembers">X</button>
+                </div>
+                @foreach (var member in _members)
+                {
+                    <div class="member-item">
+                        <span class="member-name">
+                            @member.DisplayName
+                            @if (member.IsOnline) { <span class="online-dot"></span> }
+                        </span>
+                        <span class="member-role">@member.Role</span>
+                        @if (_currentUserRole >= UserRole.Moderator && member.UserId != Auth.CurrentUser?.Id)
+                        {
+                            <div class="member-actions">
+                                <button class="btn-small btn-danger" @onclick="() => KickUser(member.UserId)">Kick</button>
+                                @if (_currentUserRole >= UserRole.Admin)
+                                {
+                                    <select @onchange="(e) => ChangeRole(member.UserId, e)">
+                                        @foreach (var role in Enum.GetValues<UserRole>())
+                                        {
+                                            <option value="@role" selected="@(member.Role == role)">@role</option>
+                                        }
+                                    </select>
+                                }
+                            </div>
+                        }
+                    </div>
+                }
+            </aside>
+        }
+    </div>
+
+@code {
+    private ChatRoomInfo[] _rooms = [];
+    private Guid? _selectedRoomId;
+    private ChatRoomInfo? _selectedRoom;
+    private List<ChatMessage> _messages = [];
+    private ChatMemberInfo[] _members = [];
+    private UserRole _currentUserRole = UserRole.Member;
+    private string _messageText = "";
+    private bool _showCreateRoom;
+    private bool _showMembers;
+    private string _newRoomName = "";
+    private string? _newRoomDesc;
+    private bool _newRoomVoice;
+    private bool _newRoomVideo;
+    private ElementReference _messagesContainer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        if (!Auth.IsAuthenticated) return;
+
+        Chat.OnMessageReceived += OnMessageReceived;
+        Chat.OnMessageDeleted += OnMessageDeleted;
+        Chat.OnUserJoinedRoom += OnUserJoined;
+        Chat.OnUserLeftRoom += OnUserLeft;
+
+        try
+        {
+            _rooms = await Api.GetRoomsAsync();
+        }
+        catch { }
+    }
+
+    private async Task SelectRoom(Guid roomId)
+    {
+        if (_selectedRoomId == roomId) return;
+
+        if (_selectedRoomId != null)
+        {
+            try { await Chat.LeaveRoomAsync(_selectedRoomId.Value); } catch { }
+        }
+
+        _selectedRoomId = roomId;
+        _selectedRoom = _rooms.FirstOrDefault(r => r.Id == roomId);
+        _messages.Clear();
+
+        try
+        {
+            await Chat.JoinRoomAsync(roomId);
+            var msgs = await Api.GetRoomMessagesAsync(roomId);
+            _messages = msgs.Reverse().ToList();
+            _members = await Api.GetRoomMembersAsync(roomId);
+            _currentUserRole = _members.FirstOrDefault(m => m.UserId == Auth.CurrentUser?.Id)?.Role ?? UserRole.Member;
+        }
+        catch { }
+
+        StateHasChanged();
+    }
+
+    private async Task SendMessage()
+    {
+        if (string.IsNullOrWhiteSpace(_messageText) || _selectedRoomId == null) return;
+        var text = _messageText;
+        _messageText = "";
+        try
+        {
+            await Chat.SendMessageAsync(_selectedRoomId.Value, text);
+        }
+        catch { }
+    }
+
+    private async Task DeleteMessage(Guid messageId)
+    {
+        if (_selectedRoomId == null) return;
+        try
+        {
+            await Chat.DeleteMessageAsync(_selectedRoomId.Value, messageId);
+        }
+        catch { }
+    }
+
+    private async Task KickUser(Guid userId)
+    {
+        if (_selectedRoomId == null) return;
+        try
+        {
+            await Chat.KickUserAsync(_selectedRoomId.Value, userId);
+            _members = await Api.GetRoomMembersAsync(_selectedRoomId.Value);
+            StateHasChanged();
+        }
+        catch { }
+    }
+
+    private async Task ChangeRole(Guid userId, ChangeEventArgs e)
+    {
+        if (_selectedRoomId == null || e.Value == null) return;
+        if (Enum.TryParse<UserRole>(e.Value.ToString(), out var role))
+        {
+            try
+            {
+                await Chat.SetUserRoleAsync(_selectedRoomId.Value, userId, role);
+                _members = await Api.GetRoomMembersAsync(_selectedRoomId.Value);
+                StateHasChanged();
+            }
+            catch { }
+        }
+    }
+
+    private async Task CreateRoom()
+    {
+        if (string.IsNullOrWhiteSpace(_newRoomName)) return;
+        try
+        {
+            await Api.CreateRoomAsync(_newRoomName, _newRoomDesc, _newRoomVoice, _newRoomVideo);
+            _rooms = await Api.GetRoomsAsync();
+            _showCreateRoom = false;
+            _newRoomName = "";
+            _newRoomDesc = null;
+            _newRoomVoice = false;
+            _newRoomVideo = false;
+        }
+        catch { }
+    }
+
+    private void ShowCreateRoom() => _showCreateRoom = true;
+    private void ToggleMembers() => _showMembers = !_showMembers;
+    private void NavigateToVoice() => Nav.NavigateTo($"/voice?room={_selectedRoomId}");
+
+    private async Task HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !e.ShiftKey)
+        {
+            await SendMessage();
+        }
+    }
+
+    private void OnMessageReceived(ChatMessage message)
+    {
+        if (message.RoomId == _selectedRoomId)
+        {
+            _messages.Add(message);
+            InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void OnMessageDeleted(Guid roomId, Guid messageId)
+    {
+        if (roomId == _selectedRoomId)
+        {
+            var msg = _messages.FirstOrDefault(m => m.Id == messageId);
+            if (msg != null) msg.IsDeleted = true;
+            InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void OnUserJoined(Guid roomId, ChatMemberInfo member)
+    {
+        if (roomId == _selectedRoomId)
+        {
+            InvokeAsync(async () =>
+            {
+                _members = await Api.GetRoomMembersAsync(roomId);
+                StateHasChanged();
+            });
+        }
+    }
+
+    private void OnUserLeft(Guid roomId, Guid userId)
+    {
+        if (roomId == _selectedRoomId)
+        {
+            InvokeAsync(async () =>
+            {
+                _members = await Api.GetRoomMembersAsync(roomId);
+                StateHasChanged();
+            });
+        }
+    }
+}

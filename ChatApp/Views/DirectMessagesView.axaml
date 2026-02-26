@@ -1,0 +1,87 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:ChatApp.ViewModels"
+             x:Class="ChatApp.Views.DirectMessagesView"
+             x:DataType="vm:DirectMessagesViewModel">
+
+    <Grid ColumnDefinitions="240,*">
+
+        <!-- Contacts Sidebar -->
+        <Border Grid.Column="0" Background="#1e1e2e" BorderBrush="#313244" BorderThickness="0,0,1,0">
+            <DockPanel>
+                <TextBlock DockPanel.Dock="Top" Text="Contacts" FontSize="15" FontWeight="SemiBold"
+                           Margin="12,12,12,8" />
+                <ListBox ItemsSource="{Binding Contacts}" SelectedItem="{Binding SelectedContact}"
+                         Background="Transparent" Margin="4,0">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <StackPanel Spacing="2">
+                                <TextBlock Text="{Binding DisplayName}" FontWeight="Medium" />
+                                <TextBlock Text="{Binding UserName, StringFormat='@{0}'}"
+                                           FontSize="11" Foreground="#6c7086" />
+                            </StackPanel>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </DockPanel>
+        </Border>
+
+        <!-- Chat Area -->
+        <DockPanel Grid.Column="1">
+            <!-- Header -->
+            <Border DockPanel.Dock="Top" Background="#1e1e2e" BorderBrush="#313244"
+                    BorderThickness="0,0,0,1" Padding="16,10"
+                    IsVisible="{Binding SelectedContact, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <TextBlock Text="{Binding SelectedContact.DisplayName}" FontSize="16"
+                           FontWeight="SemiBold" />
+            </Border>
+
+            <!-- Message Input -->
+            <Border DockPanel.Dock="Bottom" Background="#1e1e2e" BorderBrush="#313244"
+                    BorderThickness="0,1,0,0" Padding="12"
+                    IsVisible="{Binding SelectedContact, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <DockPanel>
+                    <Button Classes="primary" Content="Send" DockPanel.Dock="Right"
+                            Command="{Binding SendMessageCommand}" Margin="8,0,0,0" />
+                    <TextBox Text="{Binding MessageText}" Watermark="Type a message..."
+                             AcceptsReturn="False" />
+                </DockPanel>
+            </Border>
+
+            <!-- Messages -->
+            <Panel>
+                <TextBlock Text="Select a contact to start chatting" HorizontalAlignment="Center"
+                           VerticalAlignment="Center" Foreground="#6c7086"
+                           IsVisible="{Binding SelectedContact, Converter={x:Static ObjectConverters.IsNull}}" />
+
+                <ScrollViewer IsVisible="{Binding SelectedContact, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <StackPanel>
+                        <Button Classes="secondary" Content="Load older messages"
+                                Command="{Binding LoadOlderMessagesCommand}"
+                                IsVisible="{Binding HasMoreMessages}"
+                                HorizontalAlignment="Center" Margin="0,8" Padding="16,4" />
+                    <ItemsControl ItemsSource="{Binding Messages}" Margin="12">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border Margin="0,2" Padding="8,6" CornerRadius="6"
+                                        Background="#1e1e2e">
+                                    <StackPanel Spacing="2">
+                                        <DockPanel>
+                                            <TextBlock Text="{Binding SentAt, StringFormat='{}{0:HH:mm}'}"
+                                                       DockPanel.Dock="Right" FontSize="11" Foreground="#6c7086" />
+                                            <TextBlock Text="{Binding SenderName}" FontWeight="SemiBold"
+                                                       Foreground="#cba6f7" FontSize="13" />
+                                        </DockPanel>
+                                        <TextBlock Text="{Binding Content}" TextWrapping="Wrap"
+                                                   Foreground="#cdd6f4" />
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    </StackPanel>
+                </ScrollViewer>
+            </Panel>
+        </DockPanel>
+    </Grid>
+</UserControl>

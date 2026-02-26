@@ -1,0 +1,139 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:ChatApp.ViewModels"
+             xmlns:controls="using:ChatApp.Controls"
+             x:Class="ChatApp.Views.VoiceVideoView"
+             x:DataType="vm:VoiceVideoViewModel">
+
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Background="#1e1e2e" BorderBrush="#313244"
+                BorderThickness="0,0,0,1" Padding="16,10">
+            <DockPanel>
+                <TextBlock Text="{Binding SelectedRoom.Name, StringFormat='Room: {0}'}"
+                           DockPanel.Dock="Right" FontSize="12" Foreground="#6c7086"
+                           VerticalAlignment="Center"
+                           IsVisible="{Binding IsInCall}" />
+                <TextBlock Text="Voice / Video" FontSize="16" FontWeight="SemiBold" />
+            </DockPanel>
+        </Border>
+
+        <Border DockPanel.Dock="Bottom" Background="#1e1e2e" BorderBrush="#313244"
+                BorderThickness="0,1,0,0" Padding="16,12">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="12">
+                <Button Classes="primary" Command="{Binding JoinCallCommand}"
+                        IsVisible="{Binding !IsInCall}" Padding="24,8">
+                    <TextBlock Text="Join Call" />
+                </Button>
+                <Button Classes="danger" Command="{Binding LeaveCallCommand}"
+                        IsVisible="{Binding IsInCall}" Padding="24,8">
+                    <TextBlock Text="Leave" />
+                </Button>
+                <Button Classes="secondary" Command="{Binding ToggleMuteCommand}"
+                        IsVisible="{Binding IsInCall}" Padding="16,8">
+                    <Panel>
+                        <TextBlock Text="Mute" IsVisible="{Binding !IsMuted}" />
+                        <TextBlock Text="Unmute" IsVisible="{Binding IsMuted}" />
+                    </Panel>
+                </Button>
+                <Button Classes="secondary" Command="{Binding ToggleCameraCommand}"
+                        IsVisible="{Binding IsInCall}" Padding="16,8">
+                    <Panel>
+                        <TextBlock Text="Cam Off" IsVisible="{Binding !IsCameraOff}" />
+                        <TextBlock Text="Cam On" IsVisible="{Binding IsCameraOff}" />
+                    </Panel>
+                </Button>
+                <Button Classes="secondary" Command="{Binding ToggleScreenShareCommand}"
+                        IsVisible="{Binding IsInCall}" Padding="16,8">
+                    <Panel>
+                        <TextBlock Text="Share Screen" IsVisible="{Binding !IsScreenSharing}" />
+                        <TextBlock Text="Stop Share" IsVisible="{Binding IsScreenSharing}" />
+                    </Panel>
+                </Button>
+                <Button Classes="secondary" Command="{Binding ToggleSettingsCommand}"
+                        Padding="16,8">
+                    <TextBlock Text="⚙ Settings" />
+                </Button>
+            </StackPanel>
+        </Border>
+
+        <Panel>
+            <Grid ColumnDefinitions="*,Auto">
+                <Panel Grid.Column="0">
+                    <controls:WebView2Host x:Name="WebViewHost" />
+
+                    <Border Background="#181825" IsVisible="{Binding !IsInCall}" ZIndex="1">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
+                            <TextBlock Text="{Binding StatusText}" Foreground="#f38ba8"
+                                       HorizontalAlignment="Center"
+                                       IsVisible="{Binding StatusText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                            <TextBlock Text="Select a room to join a voice/video call"
+                                       Foreground="#6c7086" HorizontalAlignment="Center"
+                                       IsVisible="{Binding !SelectedRoom}" />
+                            <ComboBox ItemsSource="{Binding Rooms}" SelectedItem="{Binding SelectedRoom}"
+                                      Width="300" PlaceholderText="Select a room...">
+                                <ComboBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Name}" />
+                                    </DataTemplate>
+                                </ComboBox.ItemTemplate>
+                            </ComboBox>
+                        </StackPanel>
+                    </Border>
+                </Panel>
+
+                <Border Grid.Column="1" Width="260" Background="#1e1e2e" BorderBrush="#313244"
+                        BorderThickness="1,0,0,0" Padding="16,12"
+                        IsVisible="{Binding ShowSettings}">
+                    <ScrollViewer>
+                        <StackPanel Spacing="16">
+                            <TextBlock Text="Settings" FontSize="14" FontWeight="SemiBold"
+                                       Foreground="#cba6f7" />
+
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Microphone" FontSize="12" Foreground="#a6adc8" />
+                                <ComboBox ItemsSource="{Binding Microphones}"
+                                          SelectedItem="{Binding SelectedMicrophone}"
+                                          HorizontalAlignment="Stretch"
+                                          PlaceholderText="Default">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" />
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                            </StackPanel>
+
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Camera" FontSize="12" Foreground="#a6adc8" />
+                                <ComboBox ItemsSource="{Binding Cameras}"
+                                          SelectedItem="{Binding SelectedCamera}"
+                                          HorizontalAlignment="Stretch"
+                                          PlaceholderText="Default">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" />
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                            </StackPanel>
+
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="Resolution" FontSize="12" Foreground="#a6adc8" />
+                                <ComboBox ItemsSource="{Binding AvailableResolutions}"
+                                          SelectedItem="{Binding SelectedResolution}"
+                                          HorizontalAlignment="Stretch" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="FPS" FontSize="12" Foreground="#a6adc8" />
+                                <ComboBox ItemsSource="{Binding AvailableFps}"
+                                          SelectedItem="{Binding SelectedFps}"
+                                          HorizontalAlignment="Stretch" />
+                            </StackPanel>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Border>
+            </Grid>
+        </Panel>
+    </DockPanel>
+</UserControl>

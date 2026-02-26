@@ -1,0 +1,146 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:ChatApp.ViewModels"
+             x:Class="ChatApp.Views.ChatRoomView"
+             x:DataType="vm:ChatRoomViewModel">
+
+    <Grid ColumnDefinitions="240,*,Auto">
+
+        <!-- Room List Sidebar -->
+        <Border Grid.Column="0" Background="#1e1e2e" BorderBrush="#313244" BorderThickness="0,0,1,0">
+            <DockPanel>
+                <DockPanel DockPanel.Dock="Top" Margin="12,12,12,8">
+                    <Button Classes="primary" Content="+" DockPanel.Dock="Right"
+                            Command="{Binding ToggleCreateRoomCommand}" Padding="8,4"
+                            MinWidth="0" />
+                    <TextBlock Text="Chat Rooms" FontSize="15" FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                </DockPanel>
+
+                <!-- Create Room Form -->
+                <Border DockPanel.Dock="Top" IsVisible="{Binding ShowCreateRoom}"
+                        Background="#313244" CornerRadius="8" Padding="10" Margin="8,0,8,8">
+                    <StackPanel Spacing="6">
+                        <TextBox Text="{Binding NewRoomName}" Watermark="Room name" />
+                        <TextBox Text="{Binding NewRoomDesc}" Watermark="Description (optional)" />
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <CheckBox IsChecked="{Binding NewRoomVoice}" Content="Voice" Foreground="#cdd6f4" />
+                            <CheckBox IsChecked="{Binding NewRoomVideo}" Content="Video" Foreground="#cdd6f4" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <Button Classes="primary" Content="Create" Command="{Binding CreateRoomCommand}" Padding="12,4" />
+                            <Button Classes="secondary" Content="Cancel"
+                                    Command="{Binding ToggleCreateRoomCommand}" Padding="12,4" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <ListBox ItemsSource="{Binding Rooms}" SelectedItem="{Binding SelectedRoom}"
+                         Background="Transparent" Margin="4,0">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <DockPanel>
+                                <TextBlock Text="{Binding MemberCount, StringFormat='{}{0} members'}"
+                                           DockPanel.Dock="Right" FontSize="11" Foreground="#6c7086" />
+                                <TextBlock Text="{Binding Name}" FontWeight="Medium" />
+                            </DockPanel>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </DockPanel>
+        </Border>
+
+        <!-- Chat Area -->
+        <DockPanel Grid.Column="1">
+            <!-- Header -->
+            <Border DockPanel.Dock="Top" Background="#1e1e2e" BorderBrush="#313244"
+                    BorderThickness="0,0,0,1" Padding="16,10">
+                <DockPanel>
+                    <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" Spacing="6">
+                        <Button Classes="secondary" Content="Delete Room"
+                                Command="{Binding DeleteRoomCommand}" Padding="12,4"
+                                IsVisible="{Binding IsRoomOwner}" Foreground="#f38ba8" />
+                        <Button Classes="secondary" Content="Members"
+                                Command="{Binding ToggleMembersCommand}" Padding="12,4" />
+                    </StackPanel>
+                    <TextBlock Text="{Binding SelectedRoom.Name}" FontSize="16" FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                </DockPanel>
+            </Border>
+
+            <!-- Message Input -->
+            <Border DockPanel.Dock="Bottom" Background="#1e1e2e" BorderBrush="#313244"
+                    BorderThickness="0,1,0,0" Padding="12">
+                <DockPanel>
+                    <Button Classes="primary" Content="Send" DockPanel.Dock="Right"
+                            Command="{Binding SendMessageCommand}" Margin="8,0,0,0" />
+                    <TextBox Text="{Binding MessageText}" Watermark="Type a message..."
+                             AcceptsReturn="False" />
+                </DockPanel>
+            </Border>
+
+            <!-- Messages -->
+            <ScrollViewer>
+                <StackPanel>
+                    <Button Classes="secondary" Content="Load older messages"
+                            Command="{Binding LoadOlderMessagesCommand}"
+                            IsVisible="{Binding HasMoreMessages}"
+                            HorizontalAlignment="Center" Margin="0,8" Padding="16,4" />
+                <ItemsControl ItemsSource="{Binding Messages}" Margin="12">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Margin="0,2" Padding="8,6" CornerRadius="6"
+                                    Background="#1e1e2e">
+                                <StackPanel Spacing="2">
+                                    <DockPanel>
+                                        <TextBlock Text="{Binding SentAt, StringFormat='{}{0:HH:mm}'}"
+                                                   DockPanel.Dock="Right" FontSize="11" Foreground="#6c7086" />
+                                        <TextBlock Text="{Binding SenderName}" FontWeight="SemiBold"
+                                                   Foreground="#cba6f7" FontSize="13" />
+                                    </DockPanel>
+                                    <TextBlock Text="{Binding Content}" TextWrapping="Wrap"
+                                               Foreground="#cdd6f4" />
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                </StackPanel>
+            </ScrollViewer>
+        </DockPanel>
+
+        <!-- Members Panel -->
+        <Border Grid.Column="2" Width="200" Background="#1e1e2e" BorderBrush="#313244"
+                BorderThickness="1,0,0,0" IsVisible="{Binding ShowMembers}">
+            <DockPanel>
+                <DockPanel DockPanel.Dock="Top" Margin="12,12,12,8">
+                    <Button Classes="secondary" Content="X" DockPanel.Dock="Right"
+                            Command="{Binding ToggleMembersCommand}" Padding="6,2" MinWidth="0" />
+                    <TextBlock Text="Members" FontSize="14" FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                </DockPanel>
+                <ItemsControl ItemsSource="{Binding Members}" Margin="8,0">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <DockPanel Margin="0,3">
+                                <Button Classes="secondary" Content="DM" DockPanel.Dock="Right"
+                                        Command="{Binding $parent[ItemsControl].((vm:ChatRoomViewModel)DataContext).StartPrivateMessageCommand}"
+                                        CommandParameter="{Binding}"
+                                        Padding="6,2" MinWidth="0" FontSize="11" />
+                                <StackPanel>
+                                    <DockPanel>
+                                        <TextBlock Text="{Binding Role}" DockPanel.Dock="Right"
+                                                   FontSize="11" Foreground="#6c7086" VerticalAlignment="Center" />
+                                        <TextBlock Text="{Binding DisplayName}" FontSize="13" />
+                                    </DockPanel>
+                                    <Ellipse Width="8" Height="8" IsVisible="{Binding IsOnline}"
+                                             Fill="#a6e3a1" HorizontalAlignment="Left" />
+                                </StackPanel>
+                            </DockPanel>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </DockPanel>
+        </Border>
+    </Grid>
+</UserControl>

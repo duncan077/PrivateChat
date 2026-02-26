@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>WebRTC</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#181825;color:#cdd6f4;font-family:'Segoe UI',sans-serif;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+.video-grid{flex:1;display:flex;flex-wrap:wrap;gap:4px;padding:4px;align-content:flex-start;overflow-y:auto}
+.video-cell{position:relative;background:#1e1e2e;border-radius:8px;overflow:hidden;min-width:200px;flex:1 1 300px;max-height:50vh}
+.video-cell video{width:100%;height:100%;object-fit:cover;display:block}
+.video-label{position:absolute;bottom:6px;left:8px;font-size:11px;background:rgba(0,0,0,.6);padding:2px 8px;border-radius:4px}
+</style>
+</head>
+<body>
+<div class="video-grid" id="videoGrid">
+  <div class="video-cell" id="localCell">
+    <video id="localVideo" autoplay muted playsinline></video>
+    <span class="video-label" id="localLabel">You</span>
+  </div>
+</div>
+<script>
+const state = {
+  localStream: null,
+  screenStream: null,
+  publisherPc: null,
+  subscribers: {},
+  feeds: {},
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  isMuted: false,
+  isCameraOff: false,
+  isScreenSharing: false,
+  userId: '',
+  roomId: '',
+  janusRoomId: 0,
+  janusSessionId: 0,
+  janusHandleId: 0,
+  serverBaseUrl: '',
+  authToken: '',
+  micDeviceId: '',
+  cameraDeviceId: '',
+  resolution: '1280x720',
+  fps: '30',
+  polling: false,
+  myPrivateId: 0
+};
+
+const videoGrid = document.getElementById('videoGrid');
+const localVideo = document.getElementById('localVideo');
+
+function getResolution() {
+  const val = state.resolution.split('x');
+  return { width: parseInt(val[0]), height: parseInt(val[1]) };
+}
+
+function getFps() {
+  return parseInt(state.fps) || 30;
+}
+
+async function enumerateAndReport() {
+  try {
+    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+    tempStream.getTracks().forEach(t => t.stop());
+  } catch {}
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const microphones = devices.filter(d => d.kind === 'audioinput').map(d => ({
+    deviceId: d.deviceId,
+    label: d.label || 'Mic ' + d.deviceId.substring(0, 6)
+  }));
+  const cameras = devices.filter(d => d.kind === 'videoinput').map(d => ({
+    deviceId: d.deviceId,
+    label: d.label || 'Camera ' + d.deviceId.substring(0, 6)
+  }));
+  postMessage('devices', { microphones, cameras });
+}
+
+async function apiPost(path, body) {
+  const resp = await fetch(state.serverBaseUrl + path, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + state.authToken
+    },
+    body: JSON.stringify(body)
+  });
+  return await resp.json();
+}
+
+async function apiGet(path) {
+  const resp = await fetch(state.serverBaseUrl + path, {
+    headers: { 'Authorization': 'Bearer ' + state.authToken }
+  });
+  return await resp.json();
+}
+
+async function startLocalStream() {
+  try {
+    if (state.localStream) {
+      state.localStream.getTracks().forEach(t => t.stop());
+    }
+    const res = getResolution();
+    const fps = getFps();
+    const videoConstraint = {
+      width: { ideal: res.width },
+      height: { ideal: res.height },
+      frameRate: { ideal: fps }
+    };
+    if (state.cameraDeviceId) {
+      videoConstraint.deviceId = { exact: state.cameraDeviceId };
+    }
+    const audioConstraint = state.micDeviceId
+      ? { deviceId: { exact: state.micDeviceId } }
+      : true;
+
+    state.localStream = await navigator.mediaDevices.getUserMedia({
+      audio: audioConstraint,
+      video: videoConstraint
+    });
+    localVideo.srcObject = state.localStream;
+
+    if (state.isMuted) {
+      state.localStream.getAudioTracks().forEach(t => t.enabled = false);
+    }
+    if (state.isCameraOff) {
+      state.localStream.getVideoTracks().forEach(t => t.enabled = false);
+    }
+
+    await enumerateAndReport();
+    postMessage('streamReady', {});
+  } catch (err) {
+    postMessage('error', { message: 'Failed to access media: ' + err.message });
+  }
+}
+
+async function publishOwnFeed() {
+  const pc = new RTCPeerConnection({ iceServers: state.iceServers });
+  state.publisherPc = pc;
+
+  const activeStream = state.isScreenSharing && state.screenStream ? state.screenStream : state.localStream;
+  if (activeStream) {
+    activeStream.getTracks().forEach(track => pc.addTrack(track, activeStream));
+  }
+  if (state.isScreenSharing && state.screenStream && state.localStream) {
+    state.localStream.getAudioTracks().forEach(track => pc.addTrack(track, state.localStream));
+  }
+
+  pc.onicecandidate = async (event) => {
+    if (event.candidate) {
+      await apiPost(
+        `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/trickle`,
+        event.candidate
+      );
+    } else {
+      await apiPost(
+        `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/trickle`,
+        null
+      );
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  const joinResult = await apiPost(
+    `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/message`,
+    {
+      body: {
+        request: 'joinandconfigure',
+        room: state.janusRoomId,
+        ptype: 'publisher',
+        display: state.userId
+      },
+      jsep: { type: offer.type, sdp: offer.sdp }
+    }
+  );
+
+  if (joinResult.plugindata && joinResult.plugindata.data) {
+    const data = joinResult.plugindata.data;
+    if (data.private_id) {
+      state.myPrivateId = data.private_id;
+    }
+    if (data.publishers && data.publishers.length > 0) {
+      for (const pub of data.publishers) {
+        await subscribeFeed(pub.id, pub.display);
+      }
+    }
+  }
+
+  if (joinResult.jsep) {
+    await pc.setRemoteDescription(new RTCSessionDescription(joinResult.jsep));
+  }
+}
+
+async function subscribeFeed(feedId, display) {
+  if (state.feeds[feedId]) return;
+
+  const subResult = await apiPost(
+    `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/message`,
+    {
+      body: {
+        request: 'join',
+        room: state.janusRoomId,
+        ptype: 'subscriber',
+        feed: feedId,
+        private_id: state.myPrivateId
+      }
+    }
+  );
+
+  if (!subResult.jsep) return;
+
+  const subPc = new RTCPeerConnection({ iceServers: state.iceServers });
+
+  subPc.ontrack = (event) => {
+    let cell = document.getElementById('remote-' + feedId);
+    if (!cell) {
+      cell = document.createElement('div');
+      cell.className = 'video-cell';
+      cell.id = 'remote-' + feedId;
+      const vid = document.createElement('video');
+      vid.autoplay = true;
+      vid.playsInline = true;
+      const lbl = document.createElement('span');
+      lbl.className = 'video-label';
+      lbl.textContent = display || ('User ' + feedId);
+      cell.appendChild(vid);
+      cell.appendChild(lbl);
+      videoGrid.appendChild(cell);
+    }
+    const vid = cell.querySelector('video');
+    if (event.streams[0]) {
+      vid.srcObject = event.streams[0];
+    }
+  };
+
+  subPc.onicecandidate = async (event) => {
+    if (event.candidate) {
+      await apiPost(
+        `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/trickle`,
+        event.candidate
+      );
+    } else {
+      await apiPost(
+        `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/trickle`,
+        null
+      );
+    }
+  };
+
+  await subPc.setRemoteDescription(new RTCSessionDescription(subResult.jsep));
+
+  const answer = await subPc.createAnswer();
+  await subPc.setLocalDescription(answer);
+
+  await apiPost(
+    `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/message`,
+    {
+      body: { request: 'start', room: state.janusRoomId },
+      jsep: { type: answer.type, sdp: answer.sdp }
+    }
+  );
+
+  state.feeds[feedId] = { pc: subPc, display };
+  state.subscribers[feedId] = subPc;
+}
+
+function removeFeed(feedId) {
+  const sub = state.feeds[feedId];
+  if (sub) {
+    sub.pc.close();
+    delete state.feeds[feedId];
+    delete state.subscribers[feedId];
+  }
+  const cell = document.getElementById('remote-' + feedId);
+  if (cell) cell.remove();
+}
+
+async function startPolling() {
+  state.polling = true;
+  while (state.polling) {
+    try {
+      const event = await apiGet(`/api/janus/session/${state.janusSessionId}/poll`);
+      if (!event || !state.polling) break;
+
+      const janus = event.janus;
+      if (janus === 'event') {
+        const plugindata = event.plugindata;
+        if (plugindata && plugindata.data) {
+          const data = plugindata.data;
+          if (data.publishers) {
+            for (const pub of data.publishers) {
+              await subscribeFeed(pub.id, pub.display);
+            }
+          }
+          if (data.leaving) {
+            removeFeed(data.leaving);
+          }
+          if (data.unpublished) {
+            if (data.unpublished !== 'ok') {
+              removeFeed(data.unpublished);
+            }
+          }
+        }
+        if (event.jsep && state.publisherPc) {
+          await state.publisherPc.setRemoteDescription(new RTCSessionDescription(event.jsep));
+        }
+      }
+    } catch {
+      if (!state.polling) break;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+}
+
+async function startScreenShare() {
+  try {
+    state.screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { cursor: 'always' },
+      audio: true
+    });
+    state.isScreenSharing = true;
+    localVideo.srcObject = state.screenStream;
+
+    state.screenStream.getVideoTracks()[0].onended = () => stopScreenShare();
+
+    if (state.publisherPc) {
+      const senders = state.publisherPc.getSenders();
+      state.screenStream.getTracks().forEach(track => {
+        const sender = senders.find(s => s.track && s.track.kind === track.kind);
+        if (sender) sender.replaceTrack(track);
+      });
+    }
+
+    postMessage('screenShareStarted', {});
+  } catch (err) {
+    postMessage('error', { message: 'Screen share failed: ' + err.message });
+  }
+}
+
+function stopScreenShare() {
+  if (state.screenStream) {
+    state.screenStream.getTracks().forEach(t => t.stop());
+    state.screenStream = null;
+  }
+  state.isScreenSharing = false;
+  localVideo.srcObject = state.localStream;
+
+  if (state.publisherPc && state.localStream) {
+    const senders = state.publisherPc.getSenders();
+    state.localStream.getTracks().forEach(track => {
+      const sender = senders.find(s => s.track && s.track.kind === track.kind);
+      if (sender) sender.replaceTrack(track);
+    });
+  }
+
+  postMessage('screenShareStopped', {});
+}
+
+function toggleMute() {
+  state.isMuted = !state.isMuted;
+  if (state.localStream) {
+    state.localStream.getAudioTracks().forEach(t => t.enabled = !state.isMuted);
+  }
+  postMessage('muteChanged', { isMuted: state.isMuted });
+}
+
+function toggleCamera() {
+  state.isCameraOff = !state.isCameraOff;
+  if (state.localStream) {
+    state.localStream.getVideoTracks().forEach(t => t.enabled = !state.isCameraOff);
+  }
+  postMessage('cameraChanged', { isCameraOff: state.isCameraOff });
+}
+
+function stopAll() {
+  state.polling = false;
+
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(t => t.stop());
+    state.localStream = null;
+  }
+  if (state.screenStream) {
+    state.screenStream.getTracks().forEach(t => t.stop());
+    state.screenStream = null;
+  }
+  if (state.publisherPc) {
+    state.publisherPc.close();
+    state.publisherPc = null;
+  }
+  Object.values(state.subscribers).forEach(pc => pc.close());
+  state.subscribers = {};
+  state.feeds = {};
+  localVideo.srcObject = null;
+  document.querySelectorAll('.video-cell:not(#localCell)').forEach(el => el.remove());
+}
+
+async function updateSettings(settings) {
+  if (settings.micDeviceId !== undefined) state.micDeviceId = settings.micDeviceId;
+  if (settings.cameraDeviceId !== undefined) state.cameraDeviceId = settings.cameraDeviceId;
+  if (settings.resolution !== undefined) state.resolution = settings.resolution;
+  if (settings.fps !== undefined) state.fps = settings.fps;
+
+  await startLocalStream();
+
+  if (state.publisherPc && state.localStream) {
+    const senders = state.publisherPc.getSenders();
+    const activeStream = state.isScreenSharing && state.screenStream ? state.screenStream : state.localStream;
+    activeStream.getTracks().forEach(track => {
+      const sender = senders.find(s => s.track && s.track.kind === track.kind);
+      if (sender) sender.replaceTrack(track);
+    });
+  }
+}
+
+function postMessage(type, data) {
+  if (window.chrome && window.chrome.webview) {
+    window.chrome.webview.postMessage(JSON.stringify({ type, ...data }));
+  }
+}
+
+if (window.chrome && window.chrome.webview) {
+  window.chrome.webview.addEventListener('message', async (e) => {
+    const msg = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+    switch (msg.type) {
+      case 'init':
+        state.userId = msg.userId || '';
+        state.roomId = msg.roomId || '';
+        state.janusSessionId = msg.janusSessionId || 0;
+        state.janusHandleId = msg.janusHandleId || 0;
+        state.janusRoomId = msg.janusRoomId || 0;
+        state.serverBaseUrl = msg.serverBaseUrl || '';
+        state.authToken = msg.authToken || '';
+        state.micDeviceId = msg.micDeviceId || '';
+        state.cameraDeviceId = msg.cameraDeviceId || '';
+        state.resolution = msg.resolution || '1280x720';
+        state.fps = msg.fps || '30';
+        if (msg.iceServers) {
+          try { state.iceServers = JSON.parse(msg.iceServers); } catch {}
+        }
+        await startLocalStream();
+        await publishOwnFeed();
+        startPolling();
+        break;
+      case 'toggleMute':
+        toggleMute();
+        break;
+      case 'toggleCamera':
+        toggleCamera();
+        break;
+      case 'startScreenShare':
+        startScreenShare();
+        break;
+      case 'stopScreenShare':
+        stopScreenShare();
+        break;
+      case 'stop':
+        stopAll();
+        break;
+      case 'enumerateDevices':
+        enumerateAndReport();
+        break;
+      case 'updateSettings':
+        await updateSettings(msg);
+        break;
+    }
+  });
+  postMessage('ready', {});
+}
+</script>
+</body>
+</html>

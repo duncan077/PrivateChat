@@ -1,0 +1,143 @@
+.dm-layout {
+    display: flex;
+    height: 100%;
+}
+
+.contacts-list {
+    width: 240px;
+    background: #1e1e2e;
+    border-right: 1px solid #313244;
+    overflow-y: auto;
+}
+
+.contacts-header {
+    padding: 12px;
+    border-bottom: 1px solid #313244;
+}
+
+.contact-item {
+    padding: 10px 14px;
+    cursor: pointer;
+    transition: background 0.15s;
+    border-bottom: 1px solid #313244;
+}
+
+.contact-item:hover {
+    background: #313244;
+}
+
+.contact-item.active {
+    background: #45475a;
+}
+
+.contact-name {
+    display: block;
+    font-weight: 500;
+}
+
+.contact-username {
+    font-size: 0.75rem;
+    color: #6c7086;
+}
+
+.dm-chat-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
+.dm-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-bottom: 1px solid #313244;
+    background: #1e1e2e;
+}
+
+.dm-username {
+    font-size: 0.85rem;
+    color: #6c7086;
+}
+
+.dm-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.dm-message {
+    max-width: 70%;
+    padding: 8px 12px;
+    border-radius: 12px;
+    background: #313244;
+}
+
+.dm-message.own {
+    align-self: flex-end;
+    background: #45475a;
+}
+
+.dm-message-header {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.dm-sender {
+    font-weight: 600;
+    font-size: 0.85rem;
+    color: #cba6f7;
+}
+
+.dm-time {
+    font-size: 0.7rem;
+    color: #6c7086;
+}
+
+.dm-content {
+    font-size: 0.95rem;
+    word-break: break-word;
+}
+
+.dm-attachments {
+    margin-top: 4px;
+}
+
+.dm-att-link {
+    font-size: 0.85rem;
+    color: #89b4fa;
+}
+
+.dm-input {
+    display: flex;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid #313244;
+    background: #1e1e2e;
+}
+
+.dm-input textarea {
+    flex: 1;
+    resize: none;
+    min-height: 38px;
+}
+
+.no-contact-selected {
+    flex: 1;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    color: #6c7086;
+}
+
+.empty-state {
+    padding: 20px;
+    text-align: center;
+    color: #6c7086;
+    font-size: 0.85rem;
+}

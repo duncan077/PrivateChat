@@ -1,0 +1,134 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ChatApp.ViewModels"
+        xmlns:v="using:ChatApp.Views"
+        x:Class="ChatApp.Views.MainWindow"
+        x:DataType="vm:MainViewModel"
+        Title="PrivateChat"
+        Width="1100" Height="700"
+        MinWidth="800" MinHeight="500"
+        WindowStartupLocation="CenterScreen">
+
+    <Panel>
+        <!-- Auth Views (Login/Register) - shown when not authenticated -->
+        <ContentControl Content="{Binding CurrentPage}"
+                        IsVisible="{Binding !IsAuthenticated}">
+            <ContentControl.DataTemplates>
+                <DataTemplate DataType="vm:LoginViewModel">
+                    <v:LoginView />
+                </DataTemplate>
+                <DataTemplate DataType="vm:RegisterViewModel">
+                    <v:RegisterView />
+                </DataTemplate>
+            </ContentControl.DataTemplates>
+        </ContentControl>
+
+        <!-- Main App Shell - shown when authenticated -->
+        <Grid ColumnDefinitions="260,*" IsVisible="{Binding IsAuthenticated}">
+
+            <!-- Sidebar -->
+            <Border Grid.Column="0" Background="#1e1e2e" BorderBrush="#313244"
+                    BorderThickness="0,0,1,0">
+                <DockPanel>
+                    <!-- Header -->
+                    <StackPanel DockPanel.Dock="Top" Margin="16" Spacing="6">
+                        <TextBlock Text="PrivateChat" FontSize="18" FontWeight="Bold"
+                                   Foreground="#cba6f7" />
+                        <TextBlock Text="{Binding DisplayName}" FontSize="13"
+                                   Foreground="#a6adc8" />
+                    </StackPanel>
+
+                    <Border DockPanel.Dock="Top" Height="1" Background="#313244" />
+
+                    <!-- Nav Items -->
+                    <StackPanel DockPanel.Dock="Top" Margin="8" Spacing="4">
+                        <Button Command="{Binding NavigateToRoomsCommand}"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                                Padding="14,10" CornerRadius="8">
+                            <Button.Styles>
+                                <Style Selector="Button">
+                                    <Setter Property="Background" Value="Transparent" />
+                                    <Setter Property="Foreground" Value="#cdd6f4" />
+                                </Style>
+                                <Style Selector="Button:pointerover /template/ ContentPresenter">
+                                    <Setter Property="Background" Value="#313244" />
+                                </Style>
+                            </Button.Styles>
+                            <TextBlock Text="💬  Rooms" />
+                        </Button>
+
+                        <Button Command="{Binding NavigateToMessagesCommand}"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                                Padding="14,10" CornerRadius="8">
+                            <Button.Styles>
+                                <Style Selector="Button">
+                                    <Setter Property="Background" Value="Transparent" />
+                                    <Setter Property="Foreground" Value="#cdd6f4" />
+                                </Style>
+                                <Style Selector="Button:pointerover /template/ ContentPresenter">
+                                    <Setter Property="Background" Value="#313244" />
+                                </Style>
+                            </Button.Styles>
+                            <TextBlock Text="✉️  Messages" />
+                        </Button>
+
+                        <Button Command="{Binding NavigateToVoiceCommand}"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                                Padding="14,10" CornerRadius="8">
+                            <Button.Styles>
+                                <Style Selector="Button">
+                                    <Setter Property="Background" Value="Transparent" />
+                                    <Setter Property="Foreground" Value="#cdd6f4" />
+                                </Style>
+                                <Style Selector="Button:pointerover /template/ ContentPresenter">
+                                    <Setter Property="Background" Value="#313244" />
+                                </Style>
+                            </Button.Styles>
+                            <TextBlock Text="🎙️  Voice/Video" />
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Spacer -->
+                    <Panel />
+
+                    <!-- Footer -->
+                    <Border DockPanel.Dock="Bottom" Margin="16,0,16,16">
+                        <Button Classes="danger" Content="Logout"
+                                Command="{Binding LogoutCommand}"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center"
+                                Padding="8">
+                            <Button.Styles>
+                                <Style Selector="Button">
+                                    <Setter Property="Background" Value="Transparent" />
+                                    <Setter Property="Foreground" Value="#f38ba8" />
+                                    <Setter Property="BorderBrush" Value="#f38ba8" />
+                                    <Setter Property="BorderThickness" Value="1" />
+                                </Style>
+                                <Style Selector="Button:pointerover /template/ ContentPresenter">
+                                    <Setter Property="Background" Value="#f38ba8" />
+                                    <Setter Property="Foreground" Value="#1e1e2e" />
+                                </Style>
+                            </Button.Styles>
+                        </Button>
+                    </Border>
+                </DockPanel>
+            </Border>
+
+            <!-- Main Content -->
+            <ContentControl Grid.Column="1" Content="{Binding CurrentPage}">
+                <ContentControl.DataTemplates>
+                    <DataTemplate DataType="vm:ChatRoomViewModel">
+                        <v:ChatRoomView />
+                    </DataTemplate>
+                    <DataTemplate DataType="vm:DirectMessagesViewModel">
+                        <v:DirectMessagesView />
+                    </DataTemplate>
+                    <DataTemplate DataType="vm:VoiceVideoViewModel">
+                        <v:VoiceVideoView />
+                    </DataTemplate>
+                </ContentControl.DataTemplates>
+            </ContentControl>
+        </Grid>
+    </Panel>
+</Window>
