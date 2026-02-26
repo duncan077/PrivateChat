@@ -21,58 +21,68 @@ body{background:#181825;color:#cdd6f4;font-family:'Segoe UI',sans-serif;overflow
   </div>
 </div>
 <script>
+'use strict';
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
 const state = {
+  // Media
   localStream: null,
   screenStream: null,
-  publisherPc: null,
-  subscribers: {},
-  feeds: {},
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   isMuted: false,
   isCameraOff: false,
   isScreenSharing: false,
+
+  // Janus session (publisher)
+  janusSessionId: 0,
+  janusHandleId: 0,   // publisher handle only
+  janusRoomId: 0,
+  myPrivateId: 0,
+
+  // Per-feed subscriber handles: feedId → { handleId, pc }
+  feeds: {},
+
+  // Publisher PeerConnection
+  publisherPc: null,
+
+  // Auth / server
   userId: '',
   roomId: '',
-  janusRoomId: 0,
-  janusSessionId: 0,
-  janusHandleId: 0,
   serverBaseUrl: '',
   authToken: '',
+
+  // Media constraints
   micDeviceId: '',
   cameraDeviceId: '',
   resolution: '1280x720',
   fps: '30',
+
+  // ICE
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+
+  // Polling / keepalive
   polling: false,
-  myPrivateId: 0
+  keepaliveTimer: null,
 };
 
 const videoGrid = document.getElementById('videoGrid');
 const localVideo = document.getElementById('localVideo');
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 function getResolution() {
-  const val = state.resolution.split('x');
-  return { width: parseInt(val[0]), height: parseInt(val[1]) };
+  const [w, h] = (state.resolution || '1280x720').split('x').map(Number);
+  return { width: w || 1280, height: h || 720 };
 }
 
 function getFps() {
   return parseInt(state.fps) || 30;
 }
 
-async function enumerateAndReport() {
-  try {
-    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-    tempStream.getTracks().forEach(t => t.stop());
-  } catch {}
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const microphones = devices.filter(d => d.kind === 'audioinput').map(d => ({
-    deviceId: d.deviceId,
-    label: d.label || 'Mic ' + d.deviceId.substring(0, 6)
-  }));
-  const cameras = devices.filter(d => d.kind === 'videoinput').map(d => ({
-    deviceId: d.deviceId,
-    label: d.label || 'Camera ' + d.deviceId.substring(0, 6)
-  }));
-  postMessage('devices', { microphones, cameras });
+function postMsg(type, data) {
+  if (window.chrome && window.chrome.webview) {
+    window.chrome.webview.postMessage(JSON.stringify({ type, ...data }));
+  }
 }
 
 async function apiPost(path, body) {
@@ -84,15 +94,22 @@ async function apiPost(path, body) {
     },
     body: JSON.stringify(body)
   });
-  return await resp.json();
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`POST ${path} → ${resp.status}: ${text}`);
+  }
+  return resp.json();
 }
 
 async function apiGet(path) {
   const resp = await fetch(state.serverBaseUrl + path, {
     headers: { 'Authorization': 'Bearer ' + state.authToken }
   });
-  return await resp.json();
+  if (!resp.ok) throw new Error(`GET ${path} → ${resp.status}`);
+  return resp.json();
 }
+
+// ─── Media ───────────────────────────────────────────────────────────────────
 
 async function startLocalStream() {
   try {
@@ -102,13 +119,12 @@ async function startLocalStream() {
     const res = getResolution();
     const fps = getFps();
     const videoConstraint = {
-      width: { ideal: res.width },
-      height: { ideal: res.height },
+      width:     { ideal: res.width },
+      height:    { ideal: res.height },
       frameRate: { ideal: fps }
     };
-    if (state.cameraDeviceId) {
-      videoConstraint.deviceId = { exact: state.cameraDeviceId };
-    }
+    if (state.cameraDeviceId) videoConstraint.deviceId = { exact: state.cameraDeviceId };
+
     const audioConstraint = state.micDeviceId
       ? { deviceId: { exact: state.micDeviceId } }
       : true;
@@ -119,198 +135,286 @@ async function startLocalStream() {
     });
     localVideo.srcObject = state.localStream;
 
-    if (state.isMuted) {
-      state.localStream.getAudioTracks().forEach(t => t.enabled = false);
-    }
-    if (state.isCameraOff) {
-      state.localStream.getVideoTracks().forEach(t => t.enabled = false);
-    }
+    // Re-apply mute / camera-off state.
+    state.localStream.getAudioTracks().forEach(t => t.enabled = !state.isMuted);
+    state.localStream.getVideoTracks().forEach(t => t.enabled = !state.isCameraOff);
 
     await enumerateAndReport();
-    postMessage('streamReady', {});
+    postMsg('streamReady', {});
   } catch (err) {
-    postMessage('error', { message: 'Failed to access media: ' + err.message });
+    postMsg('error', { message: 'Failed to access media: ' + err.message });
+    throw err;
   }
 }
+
+async function enumerateAndReport() {
+  try {
+    // Trigger a permission prompt so labels are populated.
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      tmp.getTracks().forEach(t => t.stop());
+    } catch {}
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const microphones = devices
+      .filter(d => d.kind === 'audioinput')
+      .map(d => ({ deviceId: d.deviceId, label: d.label || 'Mic ' + d.deviceId.slice(0, 6) }));
+    const cameras = devices
+      .filter(d => d.kind === 'videoinput')
+      .map(d => ({ deviceId: d.deviceId, label: d.label || 'Camera ' + d.deviceId.slice(0, 6) }));
+
+    postMsg('devices', { microphones, cameras });
+  } catch {}
+}
+
+// ─── Publisher ───────────────────────────────────────────────────────────────
 
 async function publishOwnFeed() {
   const pc = new RTCPeerConnection({ iceServers: state.iceServers });
   state.publisherPc = pc;
 
-  const activeStream = state.isScreenSharing && state.screenStream ? state.screenStream : state.localStream;
-  if (activeStream) {
-    activeStream.getTracks().forEach(track => pc.addTrack(track, activeStream));
-  }
+  // Add local tracks.
+  const stream = (state.isScreenSharing && state.screenStream) ? state.screenStream : state.localStream;
+  if (stream) stream.getTracks().forEach(track => pc.addTrack(track, stream));
+  // If screen-sharing, also add local audio.
   if (state.isScreenSharing && state.screenStream && state.localStream) {
-    state.localStream.getAudioTracks().forEach(track => pc.addTrack(track, state.localStream));
+    state.localStream.getAudioTracks().forEach(t => pc.addTrack(t, state.localStream));
   }
 
-  pc.onicecandidate = async (event) => {
-    if (event.candidate) {
+  // Collect trickle candidates.
+  pc.onicecandidate = async ({ candidate }) => {
+    try {
       await apiPost(
         `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/trickle`,
-        event.candidate
+        candidate   // null signals end-of-candidates
       );
-    } else {
-      await apiPost(
-        `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/trickle`,
-        null
-      );
-    }
+    } catch {}
   };
 
+  // Create offer and set local description.
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
-  const joinResult = await apiPost(
-    `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/message`,
-    {
-      body: {
-        request: 'joinandconfigure',
-        room: state.janusRoomId,
-        ptype: 'publisher',
-        display: state.userId
-      },
-      jsep: { type: offer.type, sdp: offer.sdp }
-    }
-  );
+  // Send joinandconfigure — the server waits for the real Janus event (not just ack).
+  let joinResult;
+  try {
+    joinResult = await apiPost(
+      `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/message`,
+      {
+        body: {
+          request: 'joinandconfigure',
+          room:    state.janusRoomId,
+          ptype:   'publisher',
+          display: state.userId
+        },
+        jsep: { type: offer.type, sdp: offer.sdp }
+      }
+    );
+  } catch (err) {
+    postMsg('error', { message: 'Failed to join room: ' + err.message });
+    return;
+  }
 
-  if (joinResult.plugindata && joinResult.plugindata.data) {
-    const data = joinResult.plugindata.data;
-    if (data.private_id) {
-      state.myPrivateId = data.private_id;
-    }
-    if (data.publishers && data.publishers.length > 0) {
-      for (const pub of data.publishers) {
+  // Extract private_id and existing publishers.
+  const pluginData = joinResult?.plugindata?.data;
+  if (pluginData) {
+    if (pluginData.private_id) state.myPrivateId = pluginData.private_id;
+    if (Array.isArray(pluginData.publishers)) {
+      for (const pub of pluginData.publishers) {
         await subscribeFeed(pub.id, pub.display);
       }
     }
   }
 
-  if (joinResult.jsep) {
+  // Apply the answer SDP from Janus.
+  if (joinResult?.jsep) {
     await pc.setRemoteDescription(new RTCSessionDescription(joinResult.jsep));
   }
+
+  postMsg('joined', {});
 }
 
+// ─── Subscriber (one handle per remote publisher) ────────────────────────────
+
 async function subscribeFeed(feedId, display) {
-  if (state.feeds[feedId]) return;
+  if (state.feeds[feedId]) return;   // already subscribed
 
-  const subResult = await apiPost(
-    `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/message`,
-    {
-      body: {
-        request: 'join',
-        room: state.janusRoomId,
-        ptype: 'subscriber',
-        feed: feedId,
-        private_id: state.myPrivateId
+  // Attach a DEDICATED handle for this subscriber — Janus requires this.
+  let subHandleId;
+  try {
+    subHandleId = await attachHandle();
+  } catch (err) {
+    console.error('Failed to attach subscriber handle:', err);
+    return;
+  }
+
+  // Join as subscriber — server polls until Janus sends the JSEP offer back.
+  let subResult;
+  try {
+    subResult = await apiPost(
+      `/api/janus/session/${state.janusSessionId}/handle/${subHandleId}/message`,
+      {
+        body: {
+          request:    'join',
+          room:       state.janusRoomId,
+          ptype:      'subscriber',
+          feed:       feedId,
+          private_id: state.myPrivateId
+        }
       }
-    }
-  );
+    );
+  } catch (err) {
+    console.error('Subscriber join failed:', err);
+    return;
+  }
 
-  if (!subResult.jsep) return;
+  if (!subResult?.jsep) {
+    console.warn('No JSEP in subscriber join response — feed', feedId);
+    return;
+  }
 
   const subPc = new RTCPeerConnection({ iceServers: state.iceServers });
+  state.feeds[feedId] = { handleId: subHandleId, pc: subPc };
 
-  subPc.ontrack = (event) => {
+  subPc.ontrack = ({ streams }) => {
     let cell = document.getElementById('remote-' + feedId);
     if (!cell) {
       cell = document.createElement('div');
       cell.className = 'video-cell';
       cell.id = 'remote-' + feedId;
       const vid = document.createElement('video');
-      vid.autoplay = true;
-      vid.playsInline = true;
+      vid.autoplay = vid.playsInline = true;
       const lbl = document.createElement('span');
       lbl.className = 'video-label';
       lbl.textContent = display || ('User ' + feedId);
-      cell.appendChild(vid);
-      cell.appendChild(lbl);
+      cell.append(vid, lbl);
       videoGrid.appendChild(cell);
     }
     const vid = cell.querySelector('video');
-    if (event.streams[0]) {
-      vid.srcObject = event.streams[0];
-    }
+    if (streams[0]) vid.srcObject = streams[0];
   };
 
-  subPc.onicecandidate = async (event) => {
-    if (event.candidate) {
+  // Trickle ICE for this subscriber handle.
+  subPc.onicecandidate = async ({ candidate }) => {
+    try {
       await apiPost(
-        `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/trickle`,
-        event.candidate
+        `/api/janus/session/${state.janusSessionId}/handle/${subHandleId}/trickle`,
+        candidate
       );
-    } else {
-      await apiPost(
-        `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/trickle`,
-        null
-      );
-    }
+    } catch {}
   };
 
+  // Set Janus's offer and create our answer.
   await subPc.setRemoteDescription(new RTCSessionDescription(subResult.jsep));
-
   const answer = await subPc.createAnswer();
   await subPc.setLocalDescription(answer);
 
-  await apiPost(
-    `/api/janus/session/${state.janusSessionId}/handle/${state.janusHandleId}/message`,
-    {
-      body: { request: 'start', room: state.janusRoomId },
-      jsep: { type: answer.type, sdp: answer.sdp }
-    }
-  );
+  // Send "start" with our answer — server waits for the Janus event.
+  try {
+    await apiPost(
+      `/api/janus/session/${state.janusSessionId}/handle/${subHandleId}/message`,
+      {
+        body: { request: 'start', room: state.janusRoomId },
+        jsep: { type: answer.type, sdp: answer.sdp }
+      }
+    );
+  } catch (err) {
+    console.error('Subscriber start failed:', err);
+  }
+}
 
-  state.feeds[feedId] = { pc: subPc, display };
-  state.subscribers[feedId] = subPc;
+async function attachHandle() {
+  // Ask the server to attach a new plugin handle and return its ID.
+  // We reuse the same session; just POST to /api/janus/attach.
+  const result = await apiPost(
+    `/api/janus/session/${state.janusSessionId}/attach`,
+    {}
+  );
+  // Server returns { handleId: <long> }
+  if (result?.handleId) return result.handleId;
+  throw new Error('attachHandle: unexpected response ' + JSON.stringify(result));
 }
 
 function removeFeed(feedId) {
-  const sub = state.feeds[feedId];
-  if (sub) {
-    sub.pc.close();
+  const feed = state.feeds[feedId];
+  if (feed) {
+    feed.pc.close();
     delete state.feeds[feedId];
-    delete state.subscribers[feedId];
   }
-  const cell = document.getElementById('remote-' + feedId);
-  if (cell) cell.remove();
+  document.getElementById('remote-' + feedId)?.remove();
 }
+
+// ─── Event polling loop ───────────────────────────────────────────────────────
 
 async function startPolling() {
   state.polling = true;
+
   while (state.polling) {
     try {
       const event = await apiGet(`/api/janus/session/${state.janusSessionId}/poll`);
       if (!event || !state.polling) break;
 
-      const janus = event.janus;
-      if (janus === 'event') {
-        const plugindata = event.plugindata;
-        if (plugindata && plugindata.data) {
-          const data = plugindata.data;
-          if (data.publishers) {
+      const type = event.janus;
+
+      if (type === 'event') {
+        const data = event?.plugindata?.data;
+        if (data) {
+          // New remote publisher(s) joined.
+          if (Array.isArray(data.publishers)) {
             for (const pub of data.publishers) {
               await subscribeFeed(pub.id, pub.display);
             }
           }
-          if (data.leaving) {
-            removeFeed(data.leaving);
-          }
-          if (data.unpublished) {
-            if (data.unpublished !== 'ok') {
-              removeFeed(data.unpublished);
-            }
-          }
+          // Publisher left or unpublished.
+          if (data.leaving)     removeFeed(data.leaving);
+          if (data.unpublished && data.unpublished !== 'ok') removeFeed(data.unpublished);
         }
+
+        // Re-negotiation JSEP on the publisher connection.
         if (event.jsep && state.publisherPc) {
-          await state.publisherPc.setRemoteDescription(new RTCSessionDescription(event.jsep));
+          await state.publisherPc.setRemoteDescription(
+            new RTCSessionDescription(event.jsep)
+          );
         }
       }
     } catch {
       if (!state.polling) break;
-      await new Promise(r => setTimeout(r, 1000));
+      await sleep(1000);
     }
   }
+}
+
+// ─── Keepalive ────────────────────────────────────────────────────────────────
+
+function startKeepalive() {
+  // Janus default session timeout is 60s; ping every 30s.
+  state.keepaliveTimer = setInterval(async () => {
+    if (!state.polling) return;
+    try {
+      await apiPost(`/api/janus/session/${state.janusSessionId}/keepalive`, {});
+    } catch {}
+  }, 30_000);
+}
+
+function stopKeepalive() {
+  if (state.keepaliveTimer) {
+    clearInterval(state.keepaliveTimer);
+    state.keepaliveTimer = null;
+  }
+}
+
+// ─── Controls ────────────────────────────────────────────────────────────────
+
+function toggleMute() {
+  state.isMuted = !state.isMuted;
+  state.localStream?.getAudioTracks().forEach(t => t.enabled = !state.isMuted);
+  postMsg('muteChanged', { isMuted: state.isMuted });
+}
+
+function toggleCamera() {
+  state.isCameraOff = !state.isCameraOff;
+  state.localStream?.getVideoTracks().forEach(t => t.enabled = !state.isCameraOff);
+  postMsg('cameraChanged', { isCameraOff: state.isCameraOff });
 }
 
 async function startScreenShare() {
@@ -321,151 +425,128 @@ async function startScreenShare() {
     });
     state.isScreenSharing = true;
     localVideo.srcObject = state.screenStream;
-
     state.screenStream.getVideoTracks()[0].onended = () => stopScreenShare();
 
+    // Replace tracks in publisher PC.
     if (state.publisherPc) {
       const senders = state.publisherPc.getSenders();
       state.screenStream.getTracks().forEach(track => {
-        const sender = senders.find(s => s.track && s.track.kind === track.kind);
-        if (sender) sender.replaceTrack(track);
+        const s = senders.find(x => x.track?.kind === track.kind);
+        if (s) s.replaceTrack(track);
       });
     }
-
-    postMessage('screenShareStarted', {});
+    postMsg('screenShareStarted', {});
   } catch (err) {
-    postMessage('error', { message: 'Screen share failed: ' + err.message });
+    postMsg('error', { message: 'Screen share failed: ' + err.message });
   }
 }
 
 function stopScreenShare() {
-  if (state.screenStream) {
-    state.screenStream.getTracks().forEach(t => t.stop());
-    state.screenStream = null;
-  }
+  state.screenStream?.getTracks().forEach(t => t.stop());
+  state.screenStream = null;
   state.isScreenSharing = false;
   localVideo.srcObject = state.localStream;
 
   if (state.publisherPc && state.localStream) {
     const senders = state.publisherPc.getSenders();
     state.localStream.getTracks().forEach(track => {
-      const sender = senders.find(s => s.track && s.track.kind === track.kind);
-      if (sender) sender.replaceTrack(track);
+      const s = senders.find(x => x.track?.kind === track.kind);
+      if (s) s.replaceTrack(track);
     });
   }
-
-  postMessage('screenShareStopped', {});
-}
-
-function toggleMute() {
-  state.isMuted = !state.isMuted;
-  if (state.localStream) {
-    state.localStream.getAudioTracks().forEach(t => t.enabled = !state.isMuted);
-  }
-  postMessage('muteChanged', { isMuted: state.isMuted });
-}
-
-function toggleCamera() {
-  state.isCameraOff = !state.isCameraOff;
-  if (state.localStream) {
-    state.localStream.getVideoTracks().forEach(t => t.enabled = !state.isCameraOff);
-  }
-  postMessage('cameraChanged', { isCameraOff: state.isCameraOff });
+  postMsg('screenShareStopped', {});
 }
 
 function stopAll() {
   state.polling = false;
+  stopKeepalive();
 
-  if (state.localStream) {
-    state.localStream.getTracks().forEach(t => t.stop());
-    state.localStream = null;
-  }
-  if (state.screenStream) {
-    state.screenStream.getTracks().forEach(t => t.stop());
-    state.screenStream = null;
-  }
-  if (state.publisherPc) {
-    state.publisherPc.close();
-    state.publisherPc = null;
-  }
-  Object.values(state.subscribers).forEach(pc => pc.close());
-  state.subscribers = {};
+  state.localStream?.getTracks().forEach(t => t.stop());
+  state.localStream = null;
+  state.screenStream?.getTracks().forEach(t => t.stop());
+  state.screenStream = null;
+
+  state.publisherPc?.close();
+  state.publisherPc = null;
+
+  Object.values(state.feeds).forEach(f => f.pc.close());
   state.feeds = {};
+
   localVideo.srcObject = null;
   document.querySelectorAll('.video-cell:not(#localCell)').forEach(el => el.remove());
+
+  postMsg('stopped', {});
 }
 
 async function updateSettings(settings) {
-  if (settings.micDeviceId !== undefined) state.micDeviceId = settings.micDeviceId;
+  if (settings.micDeviceId    !== undefined) state.micDeviceId    = settings.micDeviceId;
   if (settings.cameraDeviceId !== undefined) state.cameraDeviceId = settings.cameraDeviceId;
-  if (settings.resolution !== undefined) state.resolution = settings.resolution;
-  if (settings.fps !== undefined) state.fps = settings.fps;
+  if (settings.resolution     !== undefined) state.resolution     = settings.resolution;
+  if (settings.fps            !== undefined) state.fps            = settings.fps;
 
   await startLocalStream();
 
   if (state.publisherPc && state.localStream) {
     const senders = state.publisherPc.getSenders();
-    const activeStream = state.isScreenSharing && state.screenStream ? state.screenStream : state.localStream;
-    activeStream.getTracks().forEach(track => {
-      const sender = senders.find(s => s.track && s.track.kind === track.kind);
-      if (sender) sender.replaceTrack(track);
+    const active = (state.isScreenSharing && state.screenStream) ? state.screenStream : state.localStream;
+    active.getTracks().forEach(track => {
+      const s = senders.find(x => x.track?.kind === track.kind);
+      if (s) s.replaceTrack(track);
     });
   }
 }
 
-function postMessage(type, data) {
-  if (window.chrome && window.chrome.webview) {
-    window.chrome.webview.postMessage(JSON.stringify({ type, ...data }));
-  }
+// ─── Utilities ───────────────────────────────────────────────────────────────
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
-if (window.chrome && window.chrome.webview) {
+// ─── WebView2 message bridge ──────────────────────────────────────────────────
+
+if (window.chrome?.webview) {
   window.chrome.webview.addEventListener('message', async (e) => {
     const msg = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+
     switch (msg.type) {
       case 'init':
-        state.userId = msg.userId || '';
-        state.roomId = msg.roomId || '';
+        state.userId         = msg.userId         || '';
+        state.roomId         = msg.roomId         || '';
         state.janusSessionId = msg.janusSessionId || 0;
-        state.janusHandleId = msg.janusHandleId || 0;
-        state.janusRoomId = msg.janusRoomId || 0;
-        state.serverBaseUrl = msg.serverBaseUrl || '';
-        state.authToken = msg.authToken || '';
-        state.micDeviceId = msg.micDeviceId || '';
+        state.janusHandleId  = msg.janusHandleId  || 0;
+        state.janusRoomId    = msg.janusRoomId    || 0;
+        state.serverBaseUrl  = msg.serverBaseUrl  || '';
+        state.authToken      = msg.authToken      || '';
+        state.micDeviceId    = msg.micDeviceId    || '';
         state.cameraDeviceId = msg.cameraDeviceId || '';
-        state.resolution = msg.resolution || '1280x720';
-        state.fps = msg.fps || '30';
+        state.resolution     = msg.resolution     || '1280x720';
+        state.fps            = msg.fps            || '30';
+
         if (msg.iceServers) {
           try { state.iceServers = JSON.parse(msg.iceServers); } catch {}
         }
-        await startLocalStream();
-        await publishOwnFeed();
-        startPolling();
+
+        try {
+          await startLocalStream();
+          await publishOwnFeed();
+          startPolling();
+          startKeepalive();
+        } catch (err) {
+          postMsg('error', { message: 'Init failed: ' + err.message });
+        }
         break;
-      case 'toggleMute':
-        toggleMute();
-        break;
-      case 'toggleCamera':
-        toggleCamera();
-        break;
-      case 'startScreenShare':
-        startScreenShare();
-        break;
-      case 'stopScreenShare':
-        stopScreenShare();
-        break;
-      case 'stop':
-        stopAll();
-        break;
-      case 'enumerateDevices':
-        enumerateAndReport();
-        break;
-      case 'updateSettings':
-        await updateSettings(msg);
-        break;
+
+      case 'toggleMute':        toggleMute();        break;
+      case 'toggleCamera':      toggleCamera();      break;
+      case 'startScreenShare':  startScreenShare();  break;
+      case 'stopScreenShare':   stopScreenShare();   break;
+      case 'stop':              stopAll();            break;
+      case 'enumerateDevices':  enumerateAndReport(); break;
+      case 'updateSettings':    await updateSettings(msg); break;
     }
   });
-  postMessage('ready', {});
+
+  postMsg('ready', {});
 }
 </script>
 </body>

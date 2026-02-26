@@ -13,6 +13,11 @@ public partial class ChatRoomViewModel : ViewModelBase
     private readonly ChatClientService _chat;
     private readonly NavigationService _nav;
 
+    /// <summary>
+    /// Exposed so ChatRoomView can bind call controls and attach the WebView.
+    /// </summary>
+    public VoiceVideoViewModel VoiceVideo { get; }
+
     public ObservableCollection<ChatRoomInfo> Rooms { get; } = [];
     public ObservableCollection<ChatMessage> Messages { get; } = [];
     public ObservableCollection<ChatMemberInfo> Members { get; } = [];
@@ -28,14 +33,26 @@ public partial class ChatRoomViewModel : ViewModelBase
     [ObservableProperty] private UserRole _currentUserRole = UserRole.Member;
     [ObservableProperty] private bool _hasMoreMessages;
 
+    /// <summary>
+    /// True when the selected room has voice or video enabled — drives the Join Call button visibility.
+    /// </summary>
+    public bool SelectedRoomHasCall =>
+        SelectedRoom?.IsVoiceEnabled == true || SelectedRoom?.IsVideoEnabled == true;
+
     private const int PageSize = 50;
 
-    public ChatRoomViewModel(ApiClientService api, AuthStateProvider auth, ChatClientService chat, NavigationService nav)
+    public ChatRoomViewModel(
+        ApiClientService api,
+        AuthStateProvider auth,
+        ChatClientService chat,
+        NavigationService nav,
+        VoiceVideoViewModel voiceVideo)
     {
         _api = api;
         _auth = auth;
         _chat = chat;
         _nav = nav;
+        VoiceVideo = voiceVideo;
 
         _chat.OnMessageReceived += OnMessageReceived;
         _chat.OnMessageDeleted += OnMessageDeleted;
@@ -66,6 +83,16 @@ public partial class ChatRoomViewModel : ViewModelBase
         Members.Clear();
         HasMoreMessages = false;
         OnPropertyChanged(nameof(IsRoomOwner));
+        OnPropertyChanged(nameof(SelectedRoomHasCall));
+
+        // Leave any active voice/video call when switching rooms.
+        if (VoiceVideo.IsInCall)
+        {
+            try { await VoiceVideo.LeaveCallCommand.ExecuteAsync(null); } catch { }
+        }
+
+        // Propagate the selected room into the voice VM — no separate room picker needed.
+        VoiceVideo.SelectedRoom = newValue;
 
         if (newValue == null) return;
 
@@ -163,7 +190,10 @@ public partial class ChatRoomViewModel : ViewModelBase
         catch { }
     }
 
-    public bool IsRoomOwner => SelectedRoom != null && _auth.CurrentUser != null && SelectedRoom.OwnerId == _auth.CurrentUser.Id;
+    public bool IsRoomOwner =>
+        SelectedRoom != null &&
+        _auth.CurrentUser != null &&
+        SelectedRoom.OwnerId == _auth.CurrentUser.Id;
 
     [RelayCommand]
     private void ToggleCreateRoom() => ShowCreateRoom = !ShowCreateRoom;

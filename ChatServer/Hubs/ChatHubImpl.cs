@@ -406,12 +406,13 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
         group.All.OnUserJoinedVoiceVideo(roomId, _userId);
 
         var sessionId = await _janus.CreateSessionAsync();
-        var handleId = await _janus.AttachPluginAsync(sessionId);
-
-        long janusRoomId = Math.Abs(roomId.GetHashCode());
-        if (janusRoomId == 0) janusRoomId = 1;
-
-        await _janus.EnsureVideoRoomAsync(sessionId, handleId, janusRoomId);
+           var handleId = await _janus.AttachPluginAsync(sessionId);
+    
+          var guidBytes = roomId.ToByteArray();
+           long janusRoomId = Math.Abs((long)(BitConverter.ToInt32(guidBytes, 0) ^ BitConverter.ToInt32(guidBytes, 4)));
+         if (janusRoomId == 0) janusRoomId = 1;
+    
+            await _janus.EnsureVideoRoomAsync(sessionId, janusRoomId);
 
         var serverBase = _config["Server:BaseUrl"] ?? "http://localhost:5000";
         var iceServersJson = _config["Janus:IceServers"]

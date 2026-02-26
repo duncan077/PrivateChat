@@ -21,18 +21,27 @@ public partial class App : Application
     {
         var services = new ServiceCollection();
 
+        // Core services
         services.AddSingleton<AuthStateProvider>();
         services.AddSingleton<GrpcChannelProvider>();
         services.AddSingleton<ApiClientService>();
         services.AddSingleton<ChatClientService>();
         services.AddSingleton<NavigationService>();
 
+        // ViewModels
         services.AddTransient<LoginViewModel>();
         services.AddTransient<RegisterViewModel>();
         services.AddTransient<MainViewModel>();
-        services.AddTransient<ChatRoomViewModel>();
-        services.AddTransient<DirectMessagesViewModel>();
+
+        // VoiceVideoViewModel must be singleton so the same WebView instance
+        // is shared between ChatRoomViewModel and VoiceVideoView (if still used).
         services.AddSingleton<VoiceVideoViewModel>();
+
+        // ChatRoomViewModel must be singleton so it holds onto its injected
+        // VoiceVideoViewModel and the embedded WebView stays alive across navigation.
+        services.AddSingleton<ChatRoomViewModel>();
+
+        services.AddTransient<DirectMessagesViewModel>();
 
         Services = services.BuildServiceProvider();
 
