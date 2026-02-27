@@ -1,0 +1,123 @@
+@inherits LayoutComponentBase
+@implements IDisposable
+@inject AuthStateProvider Auth
+@inject ChatClientService Chat
+@inject GrpcChannelProvider Grpc
+@inject NavigationManager Nav
+
+@if (!_initialized)
+{
+    <div class="loading-screen">
+        <div class="loading-spinner"></div>
+        <p>Initializing...</p>
+    </div>
+}
+else if (!Auth.IsAuthenticated)
+{
+    <ErrorBoundary>
+        <ChildContent>
+            @if (_showRegister)
+            {
+                <Register />
+            }
+            else
+            {
+                <Login />
+            }
+        </ChildContent>
+        <ErrorContent Context="ex">
+            <div class="error-screen">
+                <strong>Auth error:</strong> @ex.Message
+            </div>
+        </ErrorContent>
+    </ErrorBoundary>
+}
+else
+{
+    <div class="app-layout">
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h3>PrivateChat</h3>
+                <span class="user-badge">@Auth.CurrentUser?.DisplayName</span>
+            </div>
+            <div class="sidebar-nav">
+                <a class="nav-item @(IsActive("/"))" href="/">
+                    <span class="nav-icon">&#x1F4AC;</span> Rooms
+                </a>
+                <a class="nav-item @(IsActive("/dm"))" href="/dm">
+                    <span class="nav-icon">&#x2709;</span> Messages
+                </a>
+                <a class="nav-item @(IsActive("/voice"))" href="/voice">
+                    <span class="nav-icon">&#x1F3A4;</span> Voice/Video
+                </a>
+            </div>
+            <div class="sidebar-footer">
+                <button class="btn-logout" @onclick="Logout">Logout</button>
+            </div>
+        </nav>
+        <main class="main-content">
+            <ErrorBoundary>
+                <ChildContent>
+                    @Body
+                </ChildContent>
+                <ErrorContent Context="ex">
+                    <div class="error-screen">
+                        <strong>Error:</strong> @ex.Message
+                        <button class="btn-secondary" @onclick="() => Nav.NavigateTo(Nav.Uri, true)">Reload</button>
+                    </div>
+                </ErrorContent>
+            </ErrorBoundary>
+        </main>
+    </div>
+}
+
+@code {
+    private bool _initialized;
+    private bool _showRegister;
+
+    protected override void OnInitialized()
+    {
+        Auth.OnAuthStateChanged += OnAuthChanged;
+        Nav.LocationChanged += OnLocationChanged;
+        _showRegister = IsRegisterPage();
+        _initialized = true;
+    }
+
+    private void OnAuthChanged()
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e)
+    {
+        _showRegister = IsRegisterPage();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private bool IsRegisterPage() =>
+        Nav.ToBaseRelativePath(Nav.Uri).StartsWith("register", StringComparison.OrdinalIgnoreCase);
+
+    private string IsActive(string path)
+    {
+        var relative = Nav.ToBaseRelativePath(Nav.Uri);
+        if (path == "/") return string.IsNullOrEmpty(relative) ? "active" : "";
+        return relative.StartsWith(path.TrimStart('/'), StringComparison.OrdinalIgnoreCase) ? "active" : "";
+    }
+
+    private async Task Logout()
+    {
+        try
+        {
+            await Chat.DisconnectAsync();
+        }
+        catch { }
+        Grpc.ResetChannel();
+        Auth.ClearAuth();
+    }
+
+    public void Dispose()
+    {
+        Auth.OnAuthStateChanged -= OnAuthChanged;
+        Nav.LocationChanged -= OnLocationChanged;
+    }
+}

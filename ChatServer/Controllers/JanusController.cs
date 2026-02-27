@@ -11,10 +11,12 @@ namespace ChatServer.Controllers;
 public class JanusController : ControllerBase
 {
     private readonly JanusService _janus;
+    private readonly ILogger<JanusController> _logger;
 
-    public JanusController(JanusService janus)
+    public JanusController(JanusService janus, ILogger<JanusController> logger)
     {
         _janus = janus;
+        _logger = logger;
     }
 
     /// <summary>
@@ -62,10 +64,14 @@ public class JanusController : ControllerBase
         }
         catch (TimeoutException ex)
         {
+            _logger.LogWarning("Janus timeout for session {Session}/handle {Handle}: {Error}",
+                sessionId, handleId, ex.Message);
             return StatusCode(504, new { error = ex.Message });
         }
         catch (Exception ex)
         {
+            _logger.LogError(ex, "Janus error for session {Session}/handle {Handle}",
+                sessionId, handleId);
             return StatusCode(502, new { error = ex.Message });
         }
     }
