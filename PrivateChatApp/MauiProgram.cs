@@ -36,8 +36,21 @@ public static class MauiProgram
 #if DEBUG
         builder.Services.AddBlazorWebViewDeveloperTools();
         builder.Logging.AddDebug();
+        builder.Logging.SetMinimumLevel(LogLevel.Debug);
 #endif
 
-        return builder.Build();
+        var app = builder.Build();
+
+        // Catch unhandled exceptions globally for diagnostics
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            System.Diagnostics.Debug.WriteLine($"[FATAL] Unhandled: {e.ExceptionObject}");
+        };
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            System.Diagnostics.Debug.WriteLine($"[FATAL] Unobserved task: {e.Exception}");
+        };
+
+        return app;
     }
 }

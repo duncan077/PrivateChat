@@ -13,9 +13,10 @@
         </Router>
     </ChildContent>
     <ErrorContent Context="ex">
-        <div style="padding:2rem;color:#f38ba8;font-family:monospace;white-space:pre-wrap;">
-            <strong>Error:</strong>
+        <div style="padding:2rem;color:red;font-family:monospace;white-space:pre-wrap;">
+            <strong>Startup error:</strong>
             @ex.Message
+            @ex.StackTrace
         </div>
     </ErrorContent>
 </ErrorBoundary>
