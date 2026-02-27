@@ -1,5 +1,7 @@
 <Solution>
+  <Project Path="ChatAppBlazor/ChatAppBlazor.csproj" Id="c1cb50ae-aebd-42e4-a298-70b1c1fd0fc8">
+    <Deploy Solution="Debug|*" />
+  </Project>
   <Project Path="ChatServer/ChatServer.csproj" Id="ff1ef5ab-7282-45fe-8c97-b77c4cd01db2" />
   <Project Path="Shared/Shared.csproj" />
-  <Project Path="PrivateChatApp/PrivateChatApp.csproj" />
 </Solution>
