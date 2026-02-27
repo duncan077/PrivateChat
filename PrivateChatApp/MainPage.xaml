@@ -6,7 +6,8 @@
 
     <BlazorWebView x:Name="blazorWebView" HostPage="wwwroot/index.html">
         <BlazorWebView.RootComponents>
-            <RootComponent Selector="#app" ComponentType="{x:Type components:Routes}" />
+            @* TEMP: Test with minimal component to verify BlazorWebView works *@
+            <RootComponent Selector="#app" ComponentType="{x:Type components:TestRoot}" />
         </BlazorWebView.RootComponents>
     </BlazorWebView>
 
