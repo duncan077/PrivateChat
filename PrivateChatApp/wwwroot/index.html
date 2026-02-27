@@ -25,6 +25,18 @@
     <script src="_framework/blazor.webview.js"></script>
     <script src="js/webrtc-manager.js"></script>
 
+    <script>
+        // Diagnostics: catch JS errors and show them visibly
+        window.addEventListener('error', function(e) {
+            document.getElementById('app').innerHTML =
+                '<pre style="color:red;padding:2rem;">JS Error: ' + e.message + '\n' + e.filename + ':' + e.lineno + '</pre>';
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+            document.getElementById('app').innerHTML =
+                '<pre style="color:red;padding:2rem;">Unhandled rejection: ' + (e.reason?.message || e.reason) + '</pre>';
+        });
+    </script>
+
 </body>
 
 </html>
