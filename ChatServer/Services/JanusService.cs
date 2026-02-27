@@ -12,6 +12,7 @@ namespace ChatServer.Services;
 public class JanusService
 {
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly ILogger<JanusService> _logger;
     private readonly string _janusUrl;
 
     // How long to wait for an event response after an ack, in total.
@@ -19,9 +20,10 @@ public class JanusService
     // Individual long-poll timeout sent to Janus.
     private const int LongPollSeconds = 10;
 
-    public JanusService(IHttpClientFactory httpClientFactory, IConfiguration config)
+    public JanusService(IHttpClientFactory httpClientFactory, IConfiguration config, ILogger<JanusService> logger)
     {
         _httpClientFactory = httpClientFactory;
+        _logger = logger;
         _janusUrl = config["Janus:Url"] ?? "http://localhost:8088/janus";
     }
 
@@ -159,13 +161,21 @@ public class JanusService
         if (jsep != null)
             msg["jsep"] = jsep;
 
+        _logger.LogDebug("Sending plugin message to session {Session}/handle {Handle}, txn={Txn}",
+            sessionId, handleId, txn);
+
         var immediate = await PostAsync($"{_janusUrl}/{sessionId}/{handleId}", msg);
 
         // If we got a direct response (not an ack), return it immediately.
         if (immediate.TryGetProperty("janus", out var j) && j.GetString() != "ack")
+        {
+            _logger.LogDebug("Got direct response (not ack) for txn={Txn}: {Type}",
+                txn, j.GetString());
             return immediate;
+        }
 
-        // Otherwise poll until we see an event for our handle.
+        // Otherwise poll until we see a matching event for our handle/transaction.
+        _logger.LogDebug("Got ack for txn={Txn}, polling for event...", txn);
         var deadline = DateTime.UtcNow + EventTimeout;
         while (DateTime.UtcNow < deadline)
         {
@@ -176,16 +186,26 @@ public class JanusService
             var evTypeStr = evType.GetString();
             if (evTypeStr is "keepalive" or "ack") continue;
 
-            // Match by sender (handleId) — Janus attaches "sender" to events.
-            if (ev.Value.TryGetProperty("sender", out var sender) &&
-                sender.GetInt64() == handleId)
+            // Match by transaction ID first (most reliable).
+            if (ev.Value.TryGetProperty("transaction", out var evTxn) &&
+                evTxn.GetString() == txn)
             {
+                _logger.LogDebug("Matched event by transaction {Txn}", txn);
                 return ev.Value;
             }
 
-            // Also accept any event if there's only one handle (fallback).
-            if (evTypeStr == "event")
+            // Fallback: match by sender (handleId) — Janus attaches "sender" to events.
+            if (ev.Value.TryGetProperty("sender", out var sender) &&
+                sender.GetInt64() == handleId)
+            {
+                _logger.LogDebug("Matched event by sender handle {Handle} for txn={Txn}", handleId, txn);
                 return ev.Value;
+            }
+
+            // Log unmatched events for debugging
+            _logger.LogWarning("Unmatched event while waiting for txn={Txn}: janus={Type}, sender={Sender}",
+                txn, evTypeStr,
+                ev.Value.TryGetProperty("sender", out var s) ? s.ToString() : "none");
         }
 
         throw new TimeoutException($"Janus did not respond to transaction {txn} within {EventTimeout.TotalSeconds}s");
@@ -207,10 +227,12 @@ public class JanusService
 
     public async Task TrickleCompletedAsync(long sessionId, long handleId)
     {
+        // Janus expects {"completed": true} to signal end-of-candidates,
+        // NOT null. Sending null causes ICE gathering to stall.
         await PostAsync($"{_janusUrl}/{sessionId}/{handleId}", new
         {
             janus = "trickle",
-            candidate = (object?)null,
+            candidate = new { completed = true },
             transaction = NewTxn()
         });
     }
@@ -262,8 +284,14 @@ public class JanusService
             var doc = JsonSerializer.Deserialize<JsonElement>(body);
             return doc;
         }
-        catch
+        catch (TaskCanceledException)
         {
+            // Timeout — normal for long-poll
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "RawPollAsync failed for session {Session}", sessionId);
             return null;
         }
     }
@@ -273,10 +301,12 @@ public class JanusService
         var client = _httpClientFactory.CreateClient();
         client.Timeout = TimeSpan.FromSeconds(30);
         var json = JsonSerializer.Serialize(payload);
+        _logger.LogDebug("POST {Url}: {Json}", url, json);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await client.PostAsync(url, content);
-        response.EnsureSuccessStatusCode();
         var body = await response.Content.ReadAsStringAsync();
+        _logger.LogDebug("Response from {Url}: {Status} {Body}", url, response.StatusCode, body);
+        response.EnsureSuccessStatusCode();
         return JsonSerializer.Deserialize<JsonElement>(body);
     }
 

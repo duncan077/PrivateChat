@@ -49,6 +49,18 @@ builder.Services.AddHttpClient();
 builder.Services.AddSingleton<ChatServer.Services.JanusService>();
 builder.Services.AddMagicOnion();
 
+// CORS for Blazor WebView (MAUI BlazorWebView runs from https://0.0.0.0)
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy
+            .AllowAnyOrigin()
+            .AllowAnyMethod()
+            .AllowAnyHeader();
+    });
+});
+
 var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
@@ -57,6 +69,7 @@ using (var scope = app.Services.CreateScope())
     await db.Database.EnsureCreatedAsync();
 }
 
+app.UseCors();
 app.UseAuthentication();
 app.UseAuthorization();
 
