@@ -36,6 +36,7 @@ public class ChatRoomStore : IDisposable
         _chat.OnRoomDeleted += HandleRoomDeleted;
         _chat.OnUserKicked += HandleUserKicked;
         _chat.OnUserRoleChanged += HandleUserRoleChanged;
+        _chat.OnConnectionStateChanged += HandleConnectionStateChanged;
     }
 
     public async Task LoadRoomsAsync()
@@ -73,6 +74,10 @@ public class ChatRoomStore : IDisposable
         {
             await _chat.JoinRoomAsync(roomId);
             var msgs = await _api.GetRoomMessagesAsync(roomId);
+            foreach (var message in msgs)
+            {
+                _api.NormalizeAttachments(message.Attachments);
+            }
             Messages = msgs.Reverse().ToList();
             Members = await _api.GetRoomMembersAsync(roomId);
             CurrentUserRole = Members.FirstOrDefault(m => m.UserId == _auth.CurrentUser?.Id)?.Role ?? UserRole.Member;
@@ -85,12 +90,16 @@ public class ChatRoomStore : IDisposable
         }
     }
 
-    public async Task SendMessageAsync(string content)
+    public async Task SendMessageAsync(string content, AttachmentInfo[]? attachments = null)
     {
-        if (string.IsNullOrWhiteSpace(content) || SelectedRoomId == null) return;
+        if (SelectedRoomId == null) return;
+        var hasText = !string.IsNullOrWhiteSpace(content);
+        var hasAttachments = attachments is { Length: > 0 };
+        if (!hasText && !hasAttachments) return;
+
         try
         {
-            await _chat.SendMessageAsync(SelectedRoomId.Value, content);
+            await _chat.SendMessageAsync(SelectedRoomId.Value, content.Trim(), attachments: attachments);
         }
         catch (Exception ex)
         {
@@ -123,6 +132,21 @@ public class ChatRoomStore : IDisposable
         catch (Exception ex)
         {
             Error = $"Failed to create room: {ex.Message}";
+            NotifyChanged();
+        }
+    }
+
+    public async Task DeleteRoomAsync(Guid roomId)
+    {
+        try
+        {
+            await _chat.DeleteRoomAsync(roomId);
+            await LoadRoomsAsync();
+            HandleRoomDeleted(roomId);
+        }
+        catch (Exception ex)
+        {
+            Error = $"Failed to delete room: {ex.Message}";
             NotifyChanged();
         }
     }
@@ -161,6 +185,7 @@ public class ChatRoomStore : IDisposable
 
     private void HandleMessageReceived(ChatMessage message)
     {
+        _api.NormalizeAttachments(message.Attachments);
         if (message.RoomId == SelectedRoomId)
         {
             Messages.Add(message);
@@ -241,6 +266,36 @@ public class ChatRoomStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// When the gRPC connection drops and reconnects, the server-side hub has a
+    /// fresh _joinedRooms set (empty). We must re-join the currently selected room
+    /// so that SendMessageAsync works and messages are received again.
+    /// </summary>
+    private async void HandleConnectionStateChanged(bool connected)
+    {
+        if (!connected || SelectedRoomId == null) return;
+
+        var roomId = SelectedRoomId.Value;
+        try
+        {
+            System.Diagnostics.Debug.WriteLine($"[ChatRoomStore] Reconnected — re-joining room {roomId}");
+            await _chat.JoinRoomAsync(roomId);
+
+            // Reload messages that may have arrived while disconnected
+            var msgs = await _api.GetRoomMessagesAsync(roomId);
+            foreach (var message in msgs)
+            {
+                _api.NormalizeAttachments(message.Attachments);
+            }
+            Messages = msgs.Reverse().ToList();
+            NotifyChanged();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[ChatRoomStore] Re-join after reconnect failed: {ex.Message}");
+        }
+    }
+
     private void NotifyChanged() => OnChange?.Invoke();
 
     public void Dispose()
@@ -252,5 +307,6 @@ public class ChatRoomStore : IDisposable
         _chat.OnRoomDeleted -= HandleRoomDeleted;
         _chat.OnUserKicked -= HandleUserKicked;
         _chat.OnUserRoleChanged -= HandleUserRoleChanged;
+        _chat.OnConnectionStateChanged -= HandleConnectionStateChanged;
     }
 }

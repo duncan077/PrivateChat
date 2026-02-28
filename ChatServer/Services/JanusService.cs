@@ -190,7 +190,10 @@ public class JanusService
             if (!ev.Value.TryGetProperty("janus", out var evType)) continue;
 
             var evTypeStr = evType.GetString();
-            if (evTypeStr is "keepalive" or "ack") continue;
+            // Skip non-plugin-response event types. With full_trickle enabled,
+            // Janus sends trickle/webrtcup/media events that must not be
+            // mistaken for the actual plugin response.
+            if (evTypeStr is not "event") continue;
 
             // Match by transaction ID first (most reliable).
             if (ev.Value.TryGetProperty("transaction", out var evTxn) &&

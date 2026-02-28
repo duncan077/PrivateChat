@@ -3,16 +3,21 @@ using Shared.Models;
 using Shared.Requests;
 using Shared.Responses;
 using Shared.Services;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Json.Serialization;
 
 namespace ChatAppBlazor.Services;
 
 public class ApiClientService
 {
     private readonly GrpcChannelProvider _channelProvider;
+    private readonly AuthStateProvider _auth;
 
-    public ApiClientService(GrpcChannelProvider channelProvider)
+    public ApiClientService(GrpcChannelProvider channelProvider, AuthStateProvider auth)
     {
         _channelProvider = channelProvider;
+        _auth = auth;
     }
 
     public async Task<AuthResponse> LoginAsync(string userName, string password)
@@ -105,5 +110,93 @@ public class ApiClientService
         var client = MagicOnionClient.Create<IFileUploadService>(
             _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
         return await client.GetUploadUrlAsync(fileName, contentType, sizeBytes);
+    }
+
+    public async Task<AttachmentInfo> UploadFileAsync(Stream fileStream, string fileName, string contentType, long sizeBytes, CancellationToken cancellationToken = default)
+    {
+        using var client = CreateAuthorizedHttpClient();
+        using var multipart = new MultipartFormDataContent();
+
+        var streamContent = new StreamContent(fileStream);
+        streamContent.Headers.ContentType = MediaTypeHeaderValue.Parse(string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType);
+        multipart.Add(streamContent, "file", fileName);
+
+        using var response = await client.PostAsync("api/upload", multipart, cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var upload = await response.Content.ReadFromJsonAsync<UploadResponse>(cancellationToken: cancellationToken);
+        if (upload == null)
+        {
+            throw new InvalidOperationException("Upload failed: empty response.");
+        }
+
+        return new AttachmentInfo
+        {
+            Id = upload.Id,
+            FileName = string.IsNullOrWhiteSpace(upload.FileName) ? fileName : upload.FileName,
+            ContentType = string.IsNullOrWhiteSpace(upload.ContentType) ? contentType : upload.ContentType,
+            SizeBytes = upload.SizeBytes > 0 ? upload.SizeBytes : sizeBytes,
+            Url = ToAbsoluteUrl(upload.Url)
+        };
+    }
+
+    public AttachmentInfo[] NormalizeAttachments(AttachmentInfo[] attachments)
+    {
+        foreach (var attachment in attachments)
+        {
+            attachment.Url = ToAbsoluteUrl(attachment.Url);
+        }
+
+        return attachments;
+    }
+
+    public string ToAbsoluteUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return string.Empty;
+        }
+
+        if (Uri.TryCreate(url, UriKind.Absolute, out _))
+        {
+            return url;
+        }
+
+        var baseUrl = _channelProvider.ServerUrl.TrimEnd('/');
+        var path = url.StartsWith('/') ? url : $"/{url}";
+        return $"{baseUrl}{path}";
+    }
+
+    private HttpClient CreateAuthorizedHttpClient()
+    {
+        var client = new HttpClient
+        {
+            BaseAddress = new Uri(_channelProvider.ServerUrl.EndsWith("/") ? _channelProvider.ServerUrl : $"{_channelProvider.ServerUrl}/")
+        };
+
+        if (!string.IsNullOrWhiteSpace(_auth.Token))
+        {
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _auth.Token);
+        }
+
+        return client;
+    }
+
+    private sealed class UploadResponse
+    {
+        [JsonPropertyName("id")]
+        public Guid Id { get; set; }
+
+        [JsonPropertyName("fileName")]
+        public string FileName { get; set; } = string.Empty;
+
+        [JsonPropertyName("contentType")]
+        public string ContentType { get; set; } = string.Empty;
+
+        [JsonPropertyName("sizeBytes")]
+        public long SizeBytes { get; set; }
+
+        [JsonPropertyName("url")]
+        public string Url { get; set; } = string.Empty;
     }
 }

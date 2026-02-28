@@ -38,10 +38,11 @@ else if (!Auth.IsAuthenticated)
 else
 {
     <MudLayout>
-        <MudAppBar Elevation="1" Dense="true" Color="Color.Surface">
-            <MudIconButton Icon="Icons.Material.Filled.Menu" Color="Color.Inherit" Edge="Edge.Start"
+        <MudAppBar Elevation="0" Dense="true" Color="Color.Surface" Class="app-shell-bar">
+            <MudIconButton Icon="@Icons.Material.Filled.Menu" Color="Color.Inherit" Edge="Edge.Start"
                            OnClick="ToggleDrawer" />
-            <MudText Typo="Typo.h6" Class="ml-2">PrivateChat</MudText>
+            <MudText Typo="Typo.h6" Class="ml-2 app-brand">PrivateChat</MudText>
+            <MudText Typo="Typo.caption" Class="app-shell-subtitle">secure team messaging</MudText>
             <MudSpacer />
             @if (!Chat.IsConnected)
             {
@@ -50,21 +51,21 @@ else
             <MudChip T="string" Size="Size.Small" Color="Color.Primary" Variant="Variant.Text">
                 @Auth.CurrentUser?.DisplayName
             </MudChip>
-            <MudIconButton Icon="Icons.Material.Filled.Logout" Color="Color.Inherit"
-                           OnClick="Logout" Title="Logout" />
+            <MudIconButton Icon="@Icons.Material.Filled.ExitToApp" Color="Color.Inherit"
+                           OnClick="Logout" title="Logout" />
         </MudAppBar>
 
-        <MudDrawer @bind-Open="_drawerOpen" Elevation="2" ClipMode="DrawerClipMode.Always"
-                   Variant="DrawerVariant.Mini" OpenMiniOnHover="true">
-            <MudNavMenu>
+        <MudDrawer @bind-Open="_drawerOpen" Elevation="0" ClipMode="DrawerClipMode.Always"
+                   Variant="DrawerVariant.Mini" OpenMiniOnHover="true" Class="app-shell-drawer">
+            <MudNavMenu Class="app-shell-nav">
                 <MudNavLink Href="/" Match="NavLinkMatch.All"
-                            Icon="Icons.Material.Filled.Forum">Rooms</MudNavLink>
+                            Icon="@Icons.Material.Filled.Forum">Rooms</MudNavLink>
                 <MudNavLink Href="/dm" Match="NavLinkMatch.Prefix"
-                            Icon="Icons.Material.Filled.Email">Messages</MudNavLink>
+                            Icon="@Icons.Material.Filled.Email">Messages</MudNavLink>
             </MudNavMenu>
         </MudDrawer>
 
-        <MudMainContent Class="main-content-area">
+        <MudMainContent Class="main-content-area app-shell-main">
             <ErrorBoundary>
                 <ChildContent>
                     @Body
@@ -93,29 +94,60 @@ else
 
     private MudTheme _theme = new()
     {
-        PaletteLight = new PaletteLight(),
+        PaletteLight = new PaletteLight
+        {
+            Primary = "#128a80",
+            Secondary = "#d99a2f",
+            Surface = "#ffffff",
+            Background = "#f4f7fb",
+            AppbarBackground = "#ffffff",
+            DrawerBackground = "#f7f9fc",
+            DrawerText = "#21314d",
+            TextPrimary = "#18253b",
+            TextSecondary = "#54657f",
+            ActionDefault = "#324a6b",
+            Error = "#d0464f",
+            Success = "#1f9f69",
+            Warning = "#d7892b",
+            Info = "#237fcf"
+        },
         PaletteDark = new PaletteDark
         {
-            Primary = "#7c4dff",
-            Secondary = "#448aff",
-            Surface = "#1e1e2e",
-            Background = "#141420",
-            AppbarBackground = "#1e1e2e",
-            DrawerBackground = "#1a1a28",
-            DrawerText = "#ffffffcc",
-            TextPrimary = "#ffffffde",
-            TextSecondary = "#ffffff99",
-            ActionDefault = "#ffffffb3",
-            Error = "#ef5350",
-            Success = "#66bb6a",
-            Warning = "#ffa726",
-            Info = "#42a5f5"
+            Primary = "#16a59a",
+            Secondary = "#f1b645",
+            Surface = "#121a29",
+            Background = "#070d17",
+            AppbarBackground = "#0d1422",
+            DrawerBackground = "#0d1422",
+            DrawerText = "#cfd9ea",
+            TextPrimary = "#eef3fb",
+            TextSecondary = "#9eacc6",
+            ActionDefault = "#c7d1e2",
+            Error = "#ff6375",
+            Success = "#3fd495",
+            Warning = "#ffb95a",
+            Info = "#57b6ff"
         },
         Typography = new Typography
         {
             Default = new DefaultTypography
             {
-                FontFamily = ["Inter", "Segoe UI", "Helvetica Neue", "Arial", "sans-serif"]
+                FontFamily = ["Manrope", "Segoe UI", "Helvetica Neue", "Arial", "sans-serif"]
+            },
+            H6 = new H6Typography
+            {
+                FontFamily = ["Sora", "Manrope", "Segoe UI", "sans-serif"],
+                FontWeight = "600",
+                LetterSpacing = ".015em"
+            },
+            Subtitle1 = new Subtitle1Typography
+            {
+                FontWeight = "600"
+            },
+            Button = new ButtonTypography
+            {
+                FontWeight = "700",
+                TextTransform = "none"
             }
         }
     };

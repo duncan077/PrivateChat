@@ -13,10 +13,10 @@
             <MudStack Row Spacing="0">
                 <MudIconButton Icon="@(_minimized ? Icons.Material.Filled.OpenInFull : Icons.Material.Filled.CloseFullscreen)"
                                Size="Size.Small" Color="Color.Inherit"
-                               OnClick="ToggleMinimize" Title="@(_minimized ? "Expand" : "Minimize")" />
-                <MudIconButton Icon="Icons.Material.Filled.CallEnd"
+                               OnClick="ToggleMinimize" title="@(_minimized ? "Expand" : "Minimize")" />
+                <MudIconButton Icon="@Icons.Material.Filled.CallEnd"
                                Size="Size.Small" Color="Color.Error"
-                               OnClick="LeaveCall" Title="Leave Call" />
+                               OnClick="LeaveCall" title="Leave Call" />
             </MudStack>
         </div>
 

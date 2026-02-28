@@ -3,7 +3,7 @@
 <MudDialog>
     <TitleContent>
         <MudText Typo="Typo.h6">
-            <MudIcon Icon="Icons.Material.Filled.Settings" Class="mr-2" /> Call Settings
+            <MudIcon Icon="@Icons.Material.Filled.Tune" Class="mr-2" /> Call Settings
         </MudText>
     </TitleContent>
     <DialogContent>
@@ -65,25 +65,44 @@
             @if (_pttEnabled)
             {
                 <MudStack Spacing="2">
-                    <MudSelect T="string" @bind-Value="_pttKey" Label="PTT Key" Variant="Variant.Outlined" Dense="true">
-                        <MudSelectItem T="string" Value="@("Space")">Space</MudSelectItem>
-                        <MudSelectItem T="string" Value="@("KeyV")">V</MudSelectItem>
-                        <MudSelectItem T="string" Value="@("KeyB")">B</MudSelectItem>
-                        <MudSelectItem T="string" Value="@("KeyT")">T</MudSelectItem>
-                        <MudSelectItem T="string" Value="@("CapsLock")">Caps Lock</MudSelectItem>
-                        <MudSelectItem T="string" Value="@("ControlLeft")">Left Ctrl</MudSelectItem>
-                        <MudSelectItem T="string" Value="@("AltLeft")">Left Alt</MudSelectItem>
-                        <MudSelectItem T="string" Value="@("ShiftLeft")">Left Shift</MudSelectItem>
-                        <MudSelectItem T="string" Value="@("Backquote")">` (Backtick)</MudSelectItem>
-                    </MudSelect>
+                    <MudStack Row AlignItems="AlignItems.Center" Spacing="1">
+                        <MudText Typo="Typo.caption" Color="Color.Secondary">Shortcut:</MudText>
+                        <MudChip T="string" Color="Color.Primary" Variant="Variant.Outlined">@FormatShortcut(_pttKey)</MudChip>
+                        <MudButton Variant="Variant.Outlined" Size="Size.Small" Color="Color.Primary"
+                                   StartIcon="@Icons.Material.Filled.Keyboard" OnClick="StartPttCapture">
+                            @(_capturingPtt ? "Listening..." : "Set Shortcut")
+                        </MudButton>
+                        <MudButton Variant="Variant.Text" Size="Size.Small" Color="Color.Default"
+                                   OnClick="ResetPttShortcut">
+                            Reset to default (Space)
+                        </MudButton>
+                        @if (_capturingPtt)
+                        {
+                            <MudButton Variant="Variant.Text" Size="Size.Small" Color="Color.Default"
+                                       OnClick="StopPttCapture">Cancel</MudButton>
+                        }
+                    </MudStack>
+
+                    @if (_capturingPtt)
+                    {
+                        <div class="ptt-capture-box"
+                             tabindex="0"
+                             @ref="_pttCaptureBox"
+                             @onkeydown="CapturePttShortcut"
+                             @onkeydown:preventDefault="true"
+                             @onkeydown:stopPropagation="true">
+                            Press a key or combo (example: Ctrl + Shift + V). Press Esc to cancel.
+                        </div>
+                    }
+
                     <MudText Typo="Typo.caption" Color="Color.Secondary">
-                        Hold the key to unmute. Release to mute.
+                        Hold the shortcut to unmute. Release to mute.
                     </MudText>
                 </MudStack>
             }
 
             <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="RefreshDevices"
-                       StartIcon="Icons.Material.Filled.Refresh" FullWidth="true" Size="Size.Small">
+                       StartIcon="@Icons.Material.Filled.Refresh" FullWidth="true" Size="Size.Small">
                 Refresh Devices
             </MudButton>
         </MudStack>
@@ -107,6 +126,9 @@
     private double _volume = 1.0;
     private bool _pttEnabled;
     private string _pttKey = "Space";
+    private bool _capturingPtt;
+    private ElementReference _pttCaptureBox;
+    private readonly HashSet<string> _captureModifiers = [];
 
     protected override void OnInitialized()
     {
@@ -117,18 +139,13 @@
         _selectedBitrate = Store.SelectedBitrate;
         _volume = Store.Volume;
         _pttEnabled = Store.PushToTalkEnabled;
-        _pttKey = Store.PushToTalkKey;
+        _pttKey = string.IsNullOrWhiteSpace(Store.PushToTalkKey) ? "Space" : Store.PushToTalkKey;
     }
 
     private async Task Apply()
     {
-        Store.SelectedMicId = _selectedMicId;
-        Store.SelectedCameraId = _selectedCameraId;
-        Store.SelectedResolution = _selectedResolution;
-        Store.SelectedFps = _selectedFps;
-        Store.SelectedBitrate = _selectedBitrate;
-        Store.PushToTalkEnabled = _pttEnabled;
-        Store.PushToTalkKey = _pttKey;
+        Store.ApplyCallSettings(_selectedMicId, _selectedCameraId, _selectedResolution, _selectedFps, _selectedBitrate);
+        Store.SetPushToTalkPreference(_pttEnabled, _pttKey);
 
         await WebRtc.UpdateSettingsAsync(
             string.IsNullOrEmpty(_selectedMicId) ? null : _selectedMicId,
@@ -154,15 +171,132 @@
     private async Task OnVolumeChanged(double vol)
     {
         _volume = vol;
-        Store.Volume = vol;
+        Store.SetVolumePreference(vol);
         await WebRtc.SetVolumeAsync(vol);
     }
 
     private async Task OnPttToggled(bool enabled)
     {
         _pttEnabled = enabled;
-        Store.PushToTalkEnabled = enabled;
-        Store.PushToTalkKey = _pttKey;
+        if (!enabled) _capturingPtt = false;
+        Store.SetPushToTalkPreference(enabled, _pttKey);
         await WebRtc.SetPushToTalkAsync(enabled, _pttKey);
+    }
+
+    private async Task StartPttCapture()
+    {
+        _capturingPtt = true;
+        await InvokeAsync(StateHasChanged);
+        await Task.Delay(1);
+        try { await _pttCaptureBox.FocusAsync(); } catch { }
+    }
+
+    private void StopPttCapture()
+    {
+        _capturingPtt = false;
+        _captureModifiers.Clear();
+    }
+
+    private async Task CapturePttShortcut(KeyboardEventArgs e)
+    {
+        if (!_capturingPtt) return;
+
+        if (string.Equals(e.Key, "Escape", StringComparison.OrdinalIgnoreCase))
+        {
+            _capturingPtt = false;
+            _captureModifiers.Clear();
+            return;
+        }
+
+        // Track held modifiers while listening; don't finalize on modifier-only keydown.
+        if (e.CtrlKey) _captureModifiers.Add("Ctrl");
+        if (e.AltKey) _captureModifiers.Add("Alt");
+        if (e.ShiftKey) _captureModifiers.Add("Shift");
+        if (e.MetaKey) _captureModifiers.Add("Meta");
+
+        var code = e.Code ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(code) || IsModifierCode(code))
+        {
+            return;
+        }
+
+        var binding = BuildShortcutBinding(e);
+        if (string.IsNullOrWhiteSpace(binding)) return;
+
+        _pttKey = binding;
+        _capturingPtt = false;
+        _captureModifiers.Clear();
+        Store.SetPushToTalkPreference(_pttEnabled, _pttKey);
+        await WebRtc.SetPushToTalkAsync(_pttEnabled, _pttKey);
+    }
+
+    private string BuildShortcutBinding(KeyboardEventArgs e)
+    {
+        var parts = new List<string>();
+        if (_captureModifiers.Contains("Ctrl")) parts.Add("Ctrl");
+        if (_captureModifiers.Contains("Alt")) parts.Add("Alt");
+        if (_captureModifiers.Contains("Shift")) parts.Add("Shift");
+        if (_captureModifiers.Contains("Meta")) parts.Add("Meta");
+
+        var code = e.Code ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(code))
+        {
+            parts.Add(code);
+        }
+
+        return string.Join("+", parts);
+    }
+
+    private static bool IsModifierCode(string code) =>
+        code is "ControlLeft" or "ControlRight" or "ShiftLeft" or "ShiftRight" or "AltLeft" or "AltRight" or "MetaLeft" or "MetaRight";
+
+    private static string ModifierFromCode(string code) => code switch
+    {
+        "ControlLeft" or "ControlRight" => "Ctrl",
+        "ShiftLeft" or "ShiftRight" => "Shift",
+        "AltLeft" or "AltRight" => "Alt",
+        "MetaLeft" or "MetaRight" => "Meta",
+        _ => code
+    };
+
+    private async Task ResetPttShortcut()
+    {
+        _pttKey = "Space";
+        _capturingPtt = false;
+        _captureModifiers.Clear();
+        Store.SetPushToTalkPreference(_pttEnabled, _pttKey);
+        await WebRtc.SetPushToTalkAsync(_pttEnabled, _pttKey);
+    }
+
+    private static string FormatShortcut(string binding)
+    {
+        if (string.IsNullOrWhiteSpace(binding)) return "Space";
+        var tokens = binding.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length == 0) return "Space";
+
+        return string.Join(" + ", tokens.Select(FormatShortcutToken));
+    }
+
+    private static string FormatShortcutToken(string token)
+    {
+        return token switch
+        {
+            "Ctrl" => "Ctrl",
+            "Alt" => "Alt",
+            "Shift" => "Shift",
+            "Meta" => "Meta",
+            "Space" => "Space",
+            _ when token.StartsWith("Key", StringComparison.Ordinal) && token.Length == 4
+                => token[3].ToString().ToUpperInvariant(),
+            _ when token.StartsWith("Digit", StringComparison.Ordinal) && token.Length == 6
+                => token[5].ToString(),
+            _ when token.StartsWith("Numpad", StringComparison.Ordinal)
+                => token.Replace("Numpad", "Num ", StringComparison.Ordinal),
+            _ when token.StartsWith("Arrow", StringComparison.Ordinal)
+                => token.Replace("Arrow", string.Empty, StringComparison.Ordinal),
+            "Backquote" => "`",
+            "CapsLock" => "Caps Lock",
+            _ => token
+        };
     }
 }

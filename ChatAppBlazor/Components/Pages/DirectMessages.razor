@@ -2,6 +2,8 @@
 @implements IDisposable
 @inject DirectMessageStore Store
 @inject AuthStateProvider Auth
+@inject ApiClientService Api
+@inject IJSRuntime JS
 
 <div class="dm-page">
     @* ─── Left: Contacts list ─── *@
@@ -79,20 +81,55 @@
             </div>
 
             <div class="chat-input-area">
-                <MudTextField @bind-Value="_messageText" Placeholder="Type a message..."
-                              Variant="Variant.Outlined" Immediate="true" Dense="true"
-                              OnKeyDown="HandleKeyDown"
-                              Adornment="Adornment.End"
-                              AdornmentIcon="Icons.Material.Filled.Send"
-                              AdornmentColor="Color.Primary"
-                              OnAdornmentClick="SendMessage"
-                              Class="chat-input-field" />
+                @if (_pendingAttachments.Count > 0)
+                {
+                    <MudStack Row Wrap="Wrap.Wrap" Spacing="1" Class="mb-2">
+                        @foreach (var attachment in _pendingAttachments)
+                        {
+                            <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="pending-attachment-pill">
+                                <MudChip T="string" Color="Color.Primary" Variant="Variant.Outlined">
+                                    @attachment.FileName
+                                </MudChip>
+                                <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                                               Color="Color.Default" OnClick="() => RemovePendingAttachment(attachment.Id)" />
+                            </MudStack>
+                        }
+                    </MudStack>
+                }
+
+                @if (!string.IsNullOrWhiteSpace(_uploadError))
+                {
+                    <MudText Typo="Typo.caption" Color="Color.Error" Class="mb-2">@_uploadError</MudText>
+                }
+
+                <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-composer-row">
+                    <div class="file-picker-wrapper">
+                        <MudButton Variant="Variant.Text" Size="Size.Small" Class="file-picker-button"
+                                   Disabled="_uploading"
+                                   OnClick="TriggerFilePicker">
+                            <MudIcon Icon="@Icons.Material.Filled.AttachFile" Size="Size.Small" />
+                            <span class="ml-1">@(_uploading ? "Uploading..." : "Attach")</span>
+                        </MudButton>
+                        <InputFile @ref="_fileInput" OnChange="HandleAttachmentSelected" multiple
+                                   style="display:none" id="dmFileInput" />
+                    </div>
+
+                    <MudTextField @bind-Value="_messageText" Placeholder="Type a message..."
+                                  Variant="Variant.Outlined" Immediate="true" Dense="true"
+                                  OnKeyDown="HandleKeyDown"
+                                  Class="chat-input-field" />
+
+                    <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SendMessage"
+                               Disabled="@(_uploading || (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0))">
+                        Send
+                    </MudButton>
+                </MudStack>
             </div>
         }
         else
         {
-            <MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Class="fill-parent">
-                <MudIcon Icon="Icons.Material.Filled.Email" Size="Size.Large" Color="Color.Secondary" />
+            <MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Class="fill-parent chat-empty-state">
+                <MudIcon Icon="@Icons.Material.Filled.Email" Size="Size.Large" Color="Color.Secondary" />
                 <MudText Typo="Typo.body1" Color="Color.Secondary">Select a contact to start messaging</MudText>
             </MudStack>
         }
@@ -101,11 +138,16 @@
 
 @if (!string.IsNullOrEmpty(Store.Error))
 {
-    <MudSnackbar Severity="Severity.Error" Visible="true">@Store.Error</MudSnackbar>
+    <MudAlert Severity="Severity.Error" Dense="true" Class="dm-error-banner">@Store.Error</MudAlert>
 }
 
 @code {
     private string _messageText = "";
+    private bool _uploading;
+    private string? _uploadError;
+    private readonly List<AttachmentInfo> _pendingAttachments = [];
+    private const long MaxUploadBytes = 50L * 1024 * 1024;
+    private InputFile? _fileInput;
 
     protected override async Task OnInitializedAsync()
     {
@@ -117,10 +159,25 @@
 
     private async Task SendMessage()
     {
-        if (string.IsNullOrWhiteSpace(_messageText)) return;
+        if (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0) return;
         var text = _messageText;
+        var attachments = _pendingAttachments.ToArray();
         _messageText = "";
-        await Store.SendMessageAsync(text);
+        _pendingAttachments.Clear();
+        await Store.SendMessageAsync(text, attachments);
+    }
+
+    private async Task TriggerFilePicker()
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("eval", "document.getElementById('dmFileInput')?.click()");
+        }
+        catch (Exception ex)
+        {
+            _uploadError = $"Could not open file picker: {ex.Message}";
+            StateHasChanged();
+        }
     }
 
     private async Task HandleKeyDown(KeyboardEventArgs e)
@@ -131,6 +188,55 @@
         }
     }
 
+    private async Task HandleAttachmentSelected(InputFileChangeEventArgs e)
+    {
+        _uploadError = null;
+        _uploading = true;
+        StateHasChanged();
+
+        try
+        {
+            foreach (var file in e.GetMultipleFiles())
+            {
+                if (file.Size > MaxUploadBytes)
+                {
+                    _uploadError = $"'{file.Name}' is larger than 50 MB.";
+                    StateHasChanged();
+                    continue;
+                }
+
+                try
+                {
+                    await using var stream = file.OpenReadStream(MaxUploadBytes);
+                    var attachment = await Api.UploadFileAsync(stream, file.Name, file.ContentType, file.Size);
+                    _pendingAttachments.Add(attachment);
+                    StateHasChanged();
+                }
+                catch (Exception fileEx)
+                {
+                    _uploadError = $"Failed to upload '{file.Name}': {fileEx.Message}";
+                    System.Diagnostics.Debug.WriteLine($"[DirectMessages] Upload failed for {file.Name}: {fileEx}");
+                    StateHasChanged();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _uploadError = $"Attachment error: {ex.Message}";
+            System.Diagnostics.Debug.WriteLine($"[DirectMessages] Attachment selection failed: {ex}");
+        }
+        finally
+        {
+            _uploading = false;
+            StateHasChanged();
+        }
+    }
+
+    private void RemovePendingAttachment(Guid attachmentId)
+    {
+        _pendingAttachments.RemoveAll(a => a.Id == attachmentId);
+    }
+
     private void OnStoreChanged() => InvokeAsync(StateHasChanged);
 
     public void Dispose()
@@ -138,3 +244,4 @@
         Store.OnChange -= OnStoreChanged;
     }
 }
+

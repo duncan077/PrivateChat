@@ -4,25 +4,28 @@
 
 @* Legacy route — redirects to main rooms page. Call is now embedded in ChatRooms. *@
 
-<MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Class="fill-parent">
-    @if (Store.IsInCall)
-    {
-        <MudText Typo="Typo.body1">You are currently in a call.</MudText>
-        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="GoToRooms">
-            Go to Chat Rooms
-        </MudButton>
-    }
-    else
-    {
-        <MudIcon Icon="Icons.Material.Filled.CallEnd" Size="Size.Large" Color="Color.Secondary" />
-        <MudText Typo="Typo.body1" Color="Color.Secondary">
-            Voice and video calls are now embedded in chat rooms.
-        </MudText>
-        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="GoToRooms">
-            Go to Chat Rooms
-        </MudButton>
-    }
-</MudStack>
+<div class="voice-legacy">
+    <MudPaper Class="voice-legacy-card pa-5">
+        <MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Spacing="2">
+            @if (Store.IsInCall)
+            {
+                <MudChip T="string" Size="Size.Small" Color="Color.Success" Variant="Variant.Filled">In Active Call</MudChip>
+                <MudText Typo="Typo.body1">You are currently in a call.</MudText>
+            }
+            else
+            {
+                <MudIcon Icon="@Icons.Material.Filled.CallEnd" Size="Size.Large" Color="Color.Secondary" />
+                <MudText Typo="Typo.body1" Align="Align.Center">
+                    Voice and video calls are now embedded in chat rooms.
+                </MudText>
+            }
+
+            <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="GoToRooms" Class="mt-1">
+                Go to Chat Rooms
+            </MudButton>
+        </MudStack>
+    </MudPaper>
+</div>
 
 @code {
     protected override void OnInitialized()

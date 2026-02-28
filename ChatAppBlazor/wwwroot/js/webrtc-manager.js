@@ -15,8 +15,8 @@ window.webrtcManager = {
 
     localStream: null,
     screenStream: null,
-    isMuted: false,
-    isCameraOff: false,
+    isMuted: true,
+    isCameraOff: true,
     isScreenSharing: false,
 
     // Janus session (publisher)
@@ -27,6 +27,7 @@ window.webrtcManager = {
 
     // Per-feed subscriber handles: feedId → { handleId, pc }
     feeds: {},
+    remoteFeedVolumes: {},
 
     // Pending subscriber joins: handleId → { feedId, display }
     // Tracks handles waiting for JSEP offer from Janus via polling loop.
@@ -61,11 +62,32 @@ window.webrtcManager = {
     // Push-to-talk
     pttEnabled: false,
     pttKey: 'Space',
+    pttBinding: null,
     pttKeyDown: false,
+    pttPressedCodes: new Set(),
     _pttKeyDownHandler: null,
     _pttKeyUpHandler: null,
+    _pttBlurHandler: null,
+    _pttVisibilityHandler: null,
 
     // ─── Helpers ────────────────────────────────────────────────────────────────
+
+    /**
+     * Find a sender for the given media kind ('audio' or 'video').
+     * Handles both normal senders (with a track) and recvonly senders
+     * (track is null, must match via transceiver).
+     */
+    findSenderByKind(pc, kind) {
+        // First try: sender with an active track of the right kind
+        const senders = pc.getSenders();
+        let s = senders.find(x => x.track?.kind === kind);
+        if (s) return s;
+        // Fallback: find via transceiver (for recvonly where sender.track is null)
+        const t = pc.getTransceivers().find(t =>
+            t.receiver?.track?.kind === kind || t.mid === (kind === 'audio' ? '0' : '1')
+        );
+        return t?.sender || null;
+    },
 
     async apiPost(path, body) {
         const resp = await fetch(this.serverBaseUrl + path, {
@@ -104,6 +126,18 @@ window.webrtcManager = {
         }
     },
 
+    notifyHostPttConfig() {
+        try {
+            if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+                window.chrome.webview.postMessage({
+                    type: 'ptt-config',
+                    enabled: !!this.pttEnabled,
+                    key: this.pttKey || 'Space'
+                });
+            }
+        } catch { }
+    },
+
     sleep(ms) {
         return new Promise(r => setTimeout(r, ms));
     },
@@ -132,8 +166,8 @@ window.webrtcManager = {
             try { this.iceServers = JSON.parse(config.iceServers); } catch { }
         }
 
-        this.isMuted = false;
-        this.isCameraOff = false;
+        this.isMuted = true;
+        this.isCameraOff = true;
         this.isScreenSharing = false;
         this.pendingSubscribes = {};
 
@@ -222,10 +256,35 @@ window.webrtcManager = {
 
         this.log('media', `getUserMedia: audio=${JSON.stringify(audioConstraint)}, video=${width}x${height}@${fps}fps`);
 
-        this.localStream = await navigator.mediaDevices.getUserMedia({
-            audio: audioConstraint,
-            video: videoConstraint
-        });
+        // Try audio+video first, fall back to audio-only if video fails
+        try {
+            this.localStream = await navigator.mediaDevices.getUserMedia({
+                audio: audioConstraint,
+                video: videoConstraint
+            });
+        } catch (err) {
+            this.log('media', `Audio+video failed (${err.message}), trying audio-only...`);
+            try {
+                this.localStream = await navigator.mediaDevices.getUserMedia({
+                    audio: audioConstraint,
+                    video: false
+                });
+                this.log('media', 'Audio-only stream acquired');
+            } catch (err2) {
+                this.log('media', `Audio-only also failed (${err2.message}), trying video-only...`);
+                try {
+                    this.localStream = await navigator.mediaDevices.getUserMedia({
+                        audio: false,
+                        video: videoConstraint
+                    });
+                    this.log('media', 'Video-only stream acquired');
+                } catch (err3) {
+                    this.logError('media', `All media sources failed: ${err3.message}`);
+                    this.localStream = null;
+                    return;
+                }
+            }
+        }
 
         const localVideo = document.getElementById('localVideo');
         if (localVideo) {
@@ -305,9 +364,44 @@ window.webrtcManager = {
         const pc = new RTCPeerConnection({ iceServers: this.iceServers });
         this.publisherPc = pc;
 
-        // Add local tracks
+        // Monitor publisher connection state — detect ICE/DTLS failures
+        pc.oniceconnectionstatechange = () => {
+            const state = pc.iceConnectionState;
+            this.log('publish', `ICE connection state: ${state}`);
+            if (state === 'failed') {
+                this.logError('publish', 'Publisher ICE connection FAILED — Janus cannot receive our media');
+                this.notifyDotNet('OnPublisherConnectionFailed');
+            } else if (state === 'disconnected') {
+                this.log('publish', 'Publisher ICE disconnected — may recover or fail');
+            } else if (state === 'connected' || state === 'completed') {
+                this.log('publish', 'Publisher ICE connected to Janus');
+            }
+        };
+        pc.onconnectionstatechange = () => {
+            this.log('publish', `PeerConnection state: ${pc.connectionState}`);
+        };
+
+        // Add local tracks (or receive-only transceivers if no media available)
         const stream = this.localStream;
-        if (stream) stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        if (stream && stream.getTracks().length > 0) {
+            stream.getTracks().forEach(track => pc.addTrack(track, stream));
+            // Ensure both audio and video lines exist in SDP even if only one media type is available
+            const hasAudio = stream.getAudioTracks().length > 0;
+            const hasVideo = stream.getVideoTracks().length > 0;
+            if (!hasAudio) {
+                pc.addTransceiver('audio', { direction: 'recvonly' });
+                this.log('publish', 'No audio track — added recvonly audio transceiver');
+            }
+            if (!hasVideo) {
+                pc.addTransceiver('video', { direction: 'recvonly' });
+                this.log('publish', 'No video track — added recvonly video transceiver');
+            }
+        } else {
+            // No local media at all — add recvonly so Janus gets a valid SDP
+            pc.addTransceiver('audio', { direction: 'recvonly' });
+            pc.addTransceiver('video', { direction: 'recvonly' });
+            this.log('publish', 'No local media — added recvonly transceivers');
+        }
 
         // Buffer ICE candidates until after joinandconfigure completes
         const candidateBuffer = [];
@@ -432,6 +526,38 @@ window.webrtcManager = {
         }
     },
 
+    /**
+     * Renegotiates the publisher PeerConnection with Janus by creating a new
+     * SDP offer and sending a 'configure' request via fire-and-forget.
+     * The JSEP answer arrives via the polling loop (handled at the
+     * "Re-negotiation JSEP received for publisher" block).
+     * This avoids competing with the polling loop for Janus events.
+     */
+    async renegotiatePublisher(tag) {
+        if (!this.publisherPc || !this.janusSessionId || !this.janusHandleId) {
+            this.log(tag, 'Cannot renegotiate — no publisher PC or Janus session');
+            return;
+        }
+        try {
+            const offer = await this.publisherPc.createOffer();
+            await this.publisherPc.setLocalDescription(offer);
+            this.log(tag, 'Created renegotiation SDP offer, sending configure (nowait)...');
+
+            // Use message-nowait so we don't compete with the polling loop.
+            // The JSEP answer will arrive via the poll event handler.
+            await this.apiPost(
+                `/api/janus/session/${this.janusSessionId}/handle/${this.janusHandleId}/message-nowait`,
+                {
+                    body: { request: 'configure' },
+                    jsep: { type: offer.type, sdp: offer.sdp }
+                }
+            );
+            this.log(tag, 'Configure sent — waiting for JSEP answer via polling loop');
+        } catch (err) {
+            this.logError(tag, `Renegotiation failed: ${err.message}`);
+        }
+    },
+
     // ─── Subscriber (two-phase: initiate → complete via polling) ────────────────
 
     /**
@@ -497,27 +623,31 @@ window.webrtcManager = {
         const subPc = new RTCPeerConnection({ iceServers: this.iceServers });
         this.feeds[feedId] = { handleId: subHandleId, pc: subPc };
 
+        // Monitor subscriber connection state
+        subPc.oniceconnectionstatechange = () => {
+            const state = subPc.iceConnectionState;
+            this.log('subscribe', `Feed ${feedId} ICE state: ${state}`);
+            if (state === 'failed') {
+                this.logError('subscribe', `Feed ${feedId} ICE FAILED — cannot receive their media`);
+            }
+        };
+        subPc.onconnectionstatechange = () => {
+            this.log('subscribe', `Feed ${feedId} PC state: ${subPc.connectionState}`);
+        };
+
         // Handle remote tracks
         subPc.ontrack = ({ streams }) => {
             this.log('subscribe', `ontrack fired for feed ${feedId}, streams: ${streams.length}`);
             const videoGrid = document.getElementById('videoGrid');
             if (!videoGrid) return;
 
-            let cell = document.getElementById('remote-' + feedId);
-            if (!cell) {
-                cell = document.createElement('div');
-                cell.className = 'video-cell';
-                cell.id = 'remote-' + feedId;
-                const vid = document.createElement('video');
-                vid.autoplay = vid.playsInline = true;
-                const lbl = document.createElement('span');
-                lbl.className = 'video-label';
-                lbl.textContent = display || ('User ' + String(feedId).slice(0, 8));
-                cell.append(vid, lbl);
-                videoGrid.appendChild(cell);
-            }
+            const cell = this.ensureRemoteFeedCell(feedId, display);
+            if (!cell) return;
             const vid = cell.querySelector('video');
-            if (streams[0]) vid.srcObject = streams[0];
+            if (streams[0]) {
+                vid.srcObject = streams[0];
+            }
+            this.applyRemoteFeedVolume(feedId, vid);
         };
 
         // Trickle ICE for subscriber
@@ -557,9 +687,117 @@ window.webrtcManager = {
             delete this.pendingSubscribes[feed.handleId];
             delete this.feeds[feedId];
         }
+        delete this.remoteFeedVolumes[feedId];
         const el = document.getElementById('remote-' + feedId);
         if (el) el.remove();
         this.log('subscribe', `Removed feed ${feedId}`);
+    },
+
+    ensureRemoteFeedCell(feedId, display) {
+        const videoGrid = document.getElementById('videoGrid');
+        if (!videoGrid) return null;
+
+        let cell = document.getElementById('remote-' + feedId);
+        if (cell) return cell;
+
+        cell = document.createElement('div');
+        cell.className = 'video-cell';
+        cell.id = 'remote-' + feedId;
+
+        const vid = document.createElement('video');
+        vid.autoplay = true;
+        vid.playsInline = true;
+        vid.dataset.feedId = String(feedId);
+
+        const label = document.createElement('span');
+        label.className = 'video-label';
+        label.textContent = this.getRemoteFeedDisplayName(feedId, display);
+
+        const controls = document.createElement('div');
+        controls.className = 'video-controls';
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.type = 'button';
+        fullscreenBtn.className = 'video-control-btn';
+        fullscreenBtn.textContent = 'Fullscreen';
+        fullscreenBtn.addEventListener('click', () => this.toggleRemoteFullscreen(feedId));
+
+        const volumeWrap = document.createElement('div');
+        volumeWrap.className = 'video-volume-wrap';
+
+        const volumeLabel = document.createElement('span');
+        volumeLabel.className = 'video-volume-label';
+        volumeLabel.textContent = '100%';
+
+        const volumeSlider = document.createElement('input');
+        volumeSlider.type = 'range';
+        volumeSlider.min = '0';
+        volumeSlider.max = '100';
+        volumeSlider.step = '1';
+        volumeSlider.value = '100';
+        volumeSlider.className = 'video-volume-slider';
+        volumeSlider.addEventListener('input', () => {
+            this.setRemoteFeedVolume(feedId, volumeSlider.value);
+            volumeLabel.textContent = `${volumeSlider.value}%`;
+        });
+
+        volumeWrap.append(volumeSlider, volumeLabel);
+        controls.append(fullscreenBtn, volumeWrap);
+
+        vid.addEventListener('dblclick', () => this.toggleRemoteFullscreen(feedId));
+
+        cell.append(vid, label, controls);
+        videoGrid.appendChild(cell);
+
+        this.setRemoteFeedVolume(feedId, this.remoteFeedVolumes[feedId] ?? 100);
+        return cell;
+    },
+
+    getRemoteFeedDisplayName(feedId, display) {
+        if (display && typeof display === 'string') {
+            // If display is a GUID/userId, shorten it. Otherwise keep custom display names.
+            if (/^[0-9a-fA-F-]{20,}$/.test(display)) {
+                return `User ${display.slice(0, 8)}`;
+            }
+            return display;
+        }
+        return 'User ' + String(feedId).slice(0, 8);
+    },
+
+    toggleRemoteFullscreen(feedId) {
+        const cell = document.getElementById('remote-' + feedId);
+        if (!cell) return;
+
+        const isThisFullscreen = document.fullscreenElement === cell;
+        if (isThisFullscreen) {
+            document.exitFullscreen?.().catch(() => { });
+            return;
+        }
+
+        cell.requestFullscreen?.().catch(() => { });
+    },
+
+    setRemoteFeedVolume(feedId, value) {
+        const volumePercent = Math.max(0, Math.min(100, parseInt(value, 10) || 0));
+        this.remoteFeedVolumes[feedId] = volumePercent;
+
+        const cell = document.getElementById('remote-' + feedId);
+        if (!cell) return;
+        const vid = cell.querySelector('video');
+        if (vid) {
+            vid.volume = volumePercent / 100;
+        }
+
+        const slider = cell.querySelector('.video-volume-slider');
+        if (slider) slider.value = String(volumePercent);
+        const label = cell.querySelector('.video-volume-label');
+        if (label) label.textContent = `${volumePercent}%`;
+    },
+
+    applyRemoteFeedVolume(feedId, videoElement) {
+        if (!videoElement) return;
+        const volumePercent = this.remoteFeedVolumes[feedId] ?? 100;
+        videoElement.volume = volumePercent / 100;
     },
 
     // ─── Event polling loop ─────────────────────────────────────────────────────
@@ -605,13 +843,22 @@ window.webrtcManager = {
 
                     const data = event?.plugindata?.data;
                     if (data) {
-                        // New remote publishers joining the room
+                        // New or updated remote publishers
                         if (Array.isArray(data.publishers) && data.publishers.length > 0) {
-                            this.log('poll', `New publisher(s) detected: ${data.publishers.length}`,
+                            this.log('poll', `Publisher(s) event: ${data.publishers.length}`,
                                 data.publishers.map(p => ({ id: p.id, display: p.display })));
 
                             for (const pub of data.publishers) {
-                                await this.initiateSubscribe(pub.id, pub.display);
+                                if (this.feeds[pub.id]) {
+                                    // Already subscribed — publisher updated their streams
+                                    // (e.g. started screen share, enabled video).
+                                    // Re-subscribe to pick up the new media.
+                                    this.log('poll', `Publisher ${pub.id} updated streams — re-subscribing`);
+                                    this.removeFeed(pub.id);
+                                    await this.initiateSubscribe(pub.id, pub.display);
+                                } else {
+                                    await this.initiateSubscribe(pub.id, pub.display);
+                                }
                             }
                             continue;
                         }
@@ -654,6 +901,33 @@ window.webrtcManager = {
                         await this.publisherPc.setRemoteDescription(
                             new RTCSessionDescription(event.jsep)
                         );
+                    }
+                } else if (type === 'trickle') {
+                    // Handle Janus trickle ICE candidates (sent when full_trickle is enabled)
+                    const candidate = event.candidate;
+                    const sender = event.sender;
+                    if (candidate && sender == this.janusHandleId && this.publisherPc) {
+                        if (candidate.completed) {
+                            this.log('poll', 'Janus trickle: end-of-candidates for publisher');
+                        } else if (candidate.candidate) {
+                            this.log('poll', `Janus trickle: adding remote candidate for publisher`);
+                            try {
+                                await this.publisherPc.addIceCandidate(new RTCIceCandidate(candidate));
+                            } catch (err) {
+                                this.log('poll', `Failed to add trickle candidate: ${err.message}`);
+                            }
+                        }
+                    } else if (candidate && sender) {
+                        // Check subscriber feeds
+                        const feed = Object.values(this.feeds).find(f => f.handleId == sender);
+                        if (feed && feed.pc && candidate.candidate) {
+                            this.log('poll', `Janus trickle: adding remote candidate for subscriber handle ${sender}`);
+                            try {
+                                await feed.pc.addIceCandidate(new RTCIceCandidate(candidate));
+                            } catch (err) {
+                                this.log('poll', `Failed to add subscriber trickle candidate: ${err.message}`);
+                            }
+                        }
                     }
                 } else if (type !== 'keepalive') {
                     this.log('poll', `Non-event type: ${type}`);
@@ -726,20 +1000,37 @@ window.webrtcManager = {
                 return;
             }
 
+            const feedIds = Object.keys(this.feeds);
+            this.log('participants', `Room has ${participants.length} participant(s), we have ${feedIds.length} subscribed feed(s) [${feedIds.join(',')}]`);
+
             for (const p of participants) {
                 // Skip ourselves (by handle ID or by display/userId for stale sessions)
-                if (p.id == this.janusHandleId) continue;
-                if (p.display && p.display === this.userId) continue;
+                if (p.id == this.janusHandleId) {
+                    this.log('participants', `  skip self (handle match): ${p.id}`);
+                    continue;
+                }
+                if (p.display && p.display === this.userId) {
+                    this.log('participants', `  skip self (display match): ${p.id} display=${p.display}`);
+                    continue;
+                }
                 // Skip already-subscribed feeds
-                if (this.feeds[p.id]) continue;
+                if (this.feeds[p.id]) {
+                    this.log('participants', `  skip already subscribed: ${p.id}`);
+                    continue;
+                }
                 // Skip feeds we're already subscribing to
                 const alreadyPending = Object.values(this.pendingSubscribes)
                     .some(ps => ps.feedId === p.id);
-                if (alreadyPending) continue;
+                if (alreadyPending) {
+                    this.log('participants', `  skip pending subscribe: ${p.id}`);
+                    continue;
+                }
 
                 if (p.publisher) {
                     this.log('participants', `Discovered new publisher: feed ${p.id} (${p.display || 'unknown'})`);
                     await this.initiateSubscribe(p.id, p.display);
+                } else {
+                    this.log('participants', `  skip non-publisher: ${p.id} (publisher=${p.publisher})`);
                 }
             }
         } catch (err) {
@@ -765,11 +1056,15 @@ window.webrtcManager = {
     // ─── Controls ───────────────────────────────────────────────────────────────
 
     toggleMute() {
-        // If PTT is active, clicking mute button disables PTT mode
+        // In PTT mode, mute button forces mute but keeps PTT enabled.
         if (this.pttEnabled) {
-            this.log('ptt', 'Mute button pressed during PTT — disabling PTT');
-            this.setPushToTalk(false, this.pttKey);
-            this.notifyDotNet('OnPushToTalkChanged', false);
+            this.log('ptt', 'Mute button pressed during PTT — forcing mute, PTT stays enabled');
+            this.pttKeyDown = false;
+            this.isMuted = true;
+            if (this.localStream) {
+                this.localStream.getAudioTracks().forEach(t => t.enabled = false);
+            }
+            this.notifyDotNet('OnMuteChanged', true);
             return;
         }
         this.ensureAudioContextActive();
@@ -824,13 +1119,30 @@ window.webrtcManager = {
 
             this.screenStream.getVideoTracks()[0].onended = () => this.stopScreenShare();
 
-            // Replace tracks in publisher PC
+            // Replace tracks in publisher PC and renegotiate with Janus if needed
             if (this.publisherPc) {
-                const senders = this.publisherPc.getSenders();
-                this.screenStream.getTracks().forEach(track => {
-                    const s = senders.find(x => x.track?.kind === track.kind);
-                    if (s) s.replaceTrack(track);
-                });
+                let needsRenegotiation = false;
+                for (const track of this.screenStream.getTracks()) {
+                    const s = this.findSenderByKind(this.publisherPc, track.kind);
+                    if (s) {
+                        await s.replaceTrack(track);
+                        this.log('screenshare', `Replaced ${track.kind} sender track with screen track`);
+                        // If transceiver was recvonly, switch to sendrecv so Janus sends it
+                        const t = this.publisherPc.getTransceivers().find(t => t.sender === s);
+                        if (t && t.direction === 'recvonly') {
+                            t.direction = 'sendrecv';
+                            needsRenegotiation = true;
+                            this.log('screenshare', `Changed transceiver direction to sendrecv`);
+                        }
+                    } else {
+                        this.log('screenshare', `No sender found for ${track.kind} track`);
+                    }
+                }
+
+                // Janus needs a new SDP offer when transceiver direction changes
+                if (needsRenegotiation) {
+                    await this.renegotiatePublisher('screenshare');
+                }
             }
 
             this.notifyDotNet('OnScreenShareChanged', true);
@@ -839,7 +1151,7 @@ window.webrtcManager = {
         }
     },
 
-    stopScreenShare() {
+    async stopScreenShare() {
         if (this.screenStream) {
             this.screenStream.getTracks().forEach(t => t.stop());
             this.screenStream = null;
@@ -852,12 +1164,46 @@ window.webrtcManager = {
         }
 
         // Restore local tracks in publisher PC
-        if (this.publisherPc && this.localStream) {
-            const senders = this.publisherPc.getSenders();
-            this.localStream.getTracks().forEach(track => {
-                const s = senders.find(x => x.track?.kind === track.kind);
-                if (s) s.replaceTrack(track);
-            });
+        let needsRenegotiation = false;
+        if (this.publisherPc) {
+            const hasLocalVideo = this.localStream && this.localStream.getVideoTracks().length > 0;
+            const hasLocalAudio = this.localStream && this.localStream.getAudioTracks().length > 0;
+
+            if (this.localStream) {
+                this.localStream.getTracks().forEach(track => {
+                    const s = this.findSenderByKind(this.publisherPc, track.kind);
+                    if (s) s.replaceTrack(track);
+                });
+            }
+
+            // If no local video, set the video transceiver back to recvonly
+            if (!hasLocalVideo) {
+                const vt = this.publisherPc.getTransceivers().find(t =>
+                    t.receiver?.track?.kind === 'video' || t.mid === '1'
+                );
+                if (vt && vt.direction === 'sendrecv') {
+                    await vt.sender.replaceTrack(null);
+                    vt.direction = 'recvonly';
+                    needsRenegotiation = true;
+                    this.log('screenshare', 'No local camera — switched video transceiver back to recvonly');
+                }
+            }
+            // Same for audio if no local audio
+            if (!hasLocalAudio) {
+                const at = this.publisherPc.getTransceivers().find(t =>
+                    t.receiver?.track?.kind === 'audio' || t.mid === '0'
+                );
+                if (at && at.direction === 'sendrecv') {
+                    await at.sender.replaceTrack(null);
+                    at.direction = 'recvonly';
+                    needsRenegotiation = true;
+                    this.log('screenshare', 'No local audio — switched audio transceiver back to recvonly');
+                }
+            }
+
+            if (needsRenegotiation) {
+                await this.renegotiatePublisher('screenshare-stop');
+            }
         }
 
         this.notifyDotNet('OnScreenShareChanged', false);
@@ -878,55 +1224,66 @@ window.webrtcManager = {
 
         this.pttEnabled = enabled;
         this.pttKey = key || 'Space';
+        this.pttBinding = this.parsePttBinding(this.pttKey);
         this.pttKeyDown = false;
+        this.pttPressedCodes.clear();
+        this.notifyHostPttConfig();
 
         if (enabled) {
             // Mute immediately when entering PTT mode
-            this.isMuted = true;
-            if (this.localStream) {
-                this.localStream.getAudioTracks().forEach(t => t.enabled = false);
-            }
-            this.notifyDotNet('OnMuteChanged', true);
+            this.applyPttPressedState(false);
 
             // Install global keyboard listeners
             this._pttKeyDownHandler = (e) => this.handlePttKeyDown(e);
             this._pttKeyUpHandler = (e) => this.handlePttKeyUp(e);
+            this._pttBlurHandler = () => this.handlePttFocusLost();
+            this._pttVisibilityHandler = () => this.handlePttVisibilityChanged();
             document.addEventListener('keydown', this._pttKeyDownHandler);
             document.addEventListener('keyup', this._pttKeyUpHandler);
+            window.addEventListener('blur', this._pttBlurHandler);
+            document.addEventListener('visibilitychange', this._pttVisibilityHandler);
 
             this.log('ptt', `PTT active — hold "${this.pttKey}" to talk`);
         } else {
-            // Exiting PTT mode — unmute
-            this.isMuted = false;
+            // Exiting PTT mode — keep current manual mute state.
             if (this.localStream) {
-                this.localStream.getAudioTracks().forEach(t => t.enabled = true);
+                this.localStream.getAudioTracks().forEach(t => t.enabled = !this.isMuted);
             }
-            this.notifyDotNet('OnMuteChanged', false);
-            this.log('ptt', 'PTT disabled — mic open');
+            this.notifyDotNet('OnMuteChanged', this.isMuted);
+            this.log('ptt', 'PTT disabled — manual mute state retained');
         }
     },
 
     handlePttKeyDown(e) {
         if (!this.pttEnabled) return;
-        if (this.matchesPttKey(e) && !this.pttKeyDown) {
+        this.pttPressedCodes.add(e.code);
+        if (this.matchesPttCombo() && !this.pttKeyDown) {
             e.preventDefault();
-            this.pttKeyDown = true;
-            // Unmute while key is held
+            this.applyPttPressedState(true);
+        }
+    },
+
+    handlePttKeyUp(e) {
+        if (!this.pttEnabled) return;
+        this.pttPressedCodes.delete(e.code);
+        if (this.pttKeyDown && !this.matchesPttCombo()) {
+            e.preventDefault();
+            this.applyPttPressedState(false);
+        }
+    },
+
+    applyPttPressedState(isPressed) {
+        if (!this.pttEnabled) return;
+
+        this.pttKeyDown = !!isPressed;
+        if (isPressed) {
             this.ensureAudioContextActive();
             this.isMuted = false;
             if (this.localStream) {
                 this.localStream.getAudioTracks().forEach(t => t.enabled = true);
             }
             this.notifyDotNet('OnMuteChanged', false);
-        }
-    },
-
-    handlePttKeyUp(e) {
-        if (!this.pttEnabled) return;
-        if (this.matchesPttKey(e) && this.pttKeyDown) {
-            e.preventDefault();
-            this.pttKeyDown = false;
-            // Re-mute when key is released
+        } else {
             this.isMuted = true;
             if (this.localStream) {
                 this.localStream.getAudioTracks().forEach(t => t.enabled = false);
@@ -936,12 +1293,85 @@ window.webrtcManager = {
     },
 
     /**
-     * Match keyboard event to the configured PTT key.
-     * Supports: 'Space', 'KeyV', 'KeyB', 'CapsLock', 'ControlLeft', etc.
-     * Uses event.code for layout-independent matching.
+     * Called by native Windows global keyboard hook.
      */
-    matchesPttKey(e) {
-        return e.code === this.pttKey;
+    nativeSetPttPressed(isPressed) {
+        if (!this.pttEnabled) return;
+        this.applyPttPressedState(!!isPressed);
+    },
+
+    /**
+     * Parse a shortcut binding string like:
+     *  - "Space"
+     *  - "Ctrl+KeyV"
+     *  - "Ctrl+Shift+KeyT"
+     */
+    parsePttBinding(binding) {
+        const result = { ctrl: false, alt: false, shift: false, meta: false, code: '' };
+        if (!binding || typeof binding !== 'string') {
+            result.code = 'Space';
+            return result;
+        }
+
+        const tokens = binding.split('+').map(x => x.trim()).filter(Boolean);
+        for (const token of tokens) {
+            const normalized = token.toLowerCase();
+            if (normalized === 'ctrl' || normalized === 'control' || normalized === 'controlleft' || normalized === 'controlright') {
+                result.ctrl = true;
+                continue;
+            }
+            if (normalized === 'alt' || normalized === 'altleft' || normalized === 'altright') {
+                result.alt = true;
+                continue;
+            }
+            if (normalized === 'shift' || normalized === 'shiftleft' || normalized === 'shiftright') {
+                result.shift = true;
+                continue;
+            }
+            if (normalized === 'meta' || normalized === 'metaleft' || normalized === 'metaright' || normalized === 'cmd' || normalized === 'win') {
+                result.meta = true;
+                continue;
+            }
+
+            result.code = token;
+        }
+
+        if (!result.code && !result.ctrl && !result.alt && !result.shift && !result.meta) {
+            result.code = 'Space';
+        }
+        return result;
+    },
+
+    isCtrlPressed() {
+        return this.pttPressedCodes.has('ControlLeft') || this.pttPressedCodes.has('ControlRight');
+    },
+
+    isAltPressed() {
+        return this.pttPressedCodes.has('AltLeft') || this.pttPressedCodes.has('AltRight');
+    },
+
+    isShiftPressed() {
+        return this.pttPressedCodes.has('ShiftLeft') || this.pttPressedCodes.has('ShiftRight');
+    },
+
+    isMetaPressed() {
+        return this.pttPressedCodes.has('MetaLeft') || this.pttPressedCodes.has('MetaRight');
+    },
+
+    matchesPttCombo() {
+        const binding = this.pttBinding || this.parsePttBinding(this.pttKey || 'Space');
+
+        if (binding.ctrl && !this.isCtrlPressed()) return false;
+        if (binding.alt && !this.isAltPressed()) return false;
+        if (binding.shift && !this.isShiftPressed()) return false;
+        if (binding.meta && !this.isMetaPressed()) return false;
+
+        if (binding.code) {
+            return this.pttPressedCodes.has(binding.code);
+        }
+
+        // Modifier-only combination.
+        return binding.ctrl || binding.alt || binding.shift || binding.meta;
     },
 
     removePttListeners() {
@@ -952,6 +1382,35 @@ window.webrtcManager = {
         if (this._pttKeyUpHandler) {
             document.removeEventListener('keyup', this._pttKeyUpHandler);
             this._pttKeyUpHandler = null;
+        }
+        if (this._pttBlurHandler) {
+            window.removeEventListener('blur', this._pttBlurHandler);
+            this._pttBlurHandler = null;
+        }
+        if (this._pttVisibilityHandler) {
+            document.removeEventListener('visibilitychange', this._pttVisibilityHandler);
+            this._pttVisibilityHandler = null;
+        }
+    },
+
+    handlePttFocusLost() {
+        // When app/window loses focus, keyup may never arrive.
+        // Force reset to safe muted state and clear pressed-key tracking.
+        if (!this.pttEnabled) return;
+        this.pttPressedCodes.clear();
+        if (this.pttKeyDown || !this.isMuted) {
+            this.pttKeyDown = false;
+            this.isMuted = true;
+            if (this.localStream) {
+                this.localStream.getAudioTracks().forEach(t => t.enabled = false);
+            }
+            this.notifyDotNet('OnMuteChanged', true);
+        }
+    },
+
+    handlePttVisibilityChanged() {
+        if (document.hidden) {
+            this.handlePttFocusLost();
         }
     },
 
@@ -967,7 +1426,10 @@ window.webrtcManager = {
         this.stopParticipantCheck();
         this.removePttListeners();
         this.pttEnabled = false;
+        this.pttBinding = null;
         this.pttKeyDown = false;
+        this.pttPressedCodes.clear();
+        this.notifyHostPttConfig();
 
         if (this.localStream) {
             this.localStream.getTracks().forEach(t => t.stop());
@@ -992,6 +1454,7 @@ window.webrtcManager = {
 
         Object.values(this.feeds).forEach(f => f.pc.close());
         this.feeds = {};
+        this.remoteFeedVolumes = {};
         this.pendingSubscribes = {};
 
         const localVideo = document.getElementById('localVideo');
@@ -1057,11 +1520,10 @@ window.webrtcManager = {
 
         // Replace tracks in publisher PeerConnection
         if (this.publisherPc && this.localStream) {
-            const senders = this.publisherPc.getSenders();
             const active = (this.isScreenSharing && this.screenStream)
                 ? this.screenStream : this.localStream;
             active.getTracks().forEach(track => {
-                const s = senders.find(x => x.track?.kind === track.kind);
+                const s = this.findSenderByKind(this.publisherPc, track.kind);
                 if (s) s.replaceTrack(track);
             });
         }

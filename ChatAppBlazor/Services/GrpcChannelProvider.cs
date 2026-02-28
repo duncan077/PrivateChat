@@ -10,7 +10,7 @@ public class GrpcChannelProvider : IDisposable
     private readonly object _lock = new();
     private GrpcChannel? _channel;
 
-    public string ServerUrl { get; set; } = "https://localhost:5001";
+    public string ServerUrl { get; set; } = "https://chat.duncan.com.ar";
 
     public GrpcChannelProvider(AuthStateProvider auth)
     {

@@ -57,6 +57,10 @@ public class DirectMessageStore : IDisposable
         {
             await _chat.MarkPrivateMessageReadAsync(contact.Id);
             var msgs = await _api.GetPrivateMessagesAsync(contact.Id);
+            foreach (var message in msgs)
+            {
+                _api.NormalizeAttachments(message.Attachments);
+            }
             Messages = msgs.Reverse().ToList();
             NotifyChanged();
         }
@@ -67,12 +71,16 @@ public class DirectMessageStore : IDisposable
         }
     }
 
-    public async Task SendMessageAsync(string content)
+    public async Task SendMessageAsync(string content, AttachmentInfo[]? attachments = null)
     {
-        if (string.IsNullOrWhiteSpace(content) || SelectedContactId == null) return;
+        if (SelectedContactId == null) return;
+        var hasText = !string.IsNullOrWhiteSpace(content);
+        var hasAttachments = attachments is { Length: > 0 };
+        if (!hasText && !hasAttachments) return;
+
         try
         {
-            await _chat.SendPrivateMessageAsync(SelectedContactId.Value, content);
+            await _chat.SendPrivateMessageAsync(SelectedContactId.Value, content.Trim(), attachments: attachments);
         }
         catch (Exception ex)
         {
@@ -91,6 +99,7 @@ public class DirectMessageStore : IDisposable
         var isToContact = message.RecipientId == SelectedContactId && message.SenderId == myId;
         if (isFromContact || isToContact)
         {
+            _api.NormalizeAttachments(message.Attachments);
             Messages.Add(message);
             NotifyChanged();
         }

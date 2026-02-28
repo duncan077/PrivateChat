@@ -4,12 +4,15 @@
 @inject ChatClientService Chat
 @inject NavigationManager Nav
 
-<MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Class="fill-screen">
-    <MudCard Style="width:420px;max-width:90vw" Elevation="4">
+<div class="auth-screen">
+    <MudCard Class="auth-card" Elevation="0">
         <MudCardHeader>
-            <MudText Typo="Typo.h5" Align="Align.Center" Style="width:100%;font-weight:600">Create Account</MudText>
+            <MudText Typo="Typo.h5" Align="Align.Center" Class="auth-title" Style="width:100%;font-weight:700">Create Account</MudText>
         </MudCardHeader>
         <MudCardContent>
+            <MudText Typo="Typo.body2" Class="auth-subtitle">
+                Set up your profile and join the conversation.
+            </MudText>
             @if (!string.IsNullOrEmpty(_error))
             {
                 <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
@@ -40,7 +43,7 @@
             </MudText>
         </MudCardActions>
     </MudCard>
-</MudStack>
+</div>
 
 @code {
     private string _userName = "";

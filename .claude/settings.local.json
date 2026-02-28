@@ -14,7 +14,9 @@
       "Bash(dotnet add package MudBlazor --version 8.5.0)",
       "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj)",
       "Bash(dotnet build ChatServer/ChatServer.csproj)",
-      "Bash(dotnet build)"
+      "Bash(dotnet build)",
+      "Bash(xargs grep -l \"stun\\\\|turn\\\\|nat\\\\|ice\")",
+      "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj --no-restore)"
     ]
   }
 }

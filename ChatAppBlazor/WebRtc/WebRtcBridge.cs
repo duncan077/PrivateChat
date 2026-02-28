@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.JSInterop;
+using ChatAppBlazor.Services;
 using ChatAppBlazor.State;
 
 namespace ChatAppBlazor.WebRtc;
@@ -15,14 +16,16 @@ public class WebRtcBridge : IAsyncDisposable
 {
     private readonly IJSRuntime _js;
     private readonly CallStore _callStore;
+    private readonly GrpcChannelProvider _channelProvider;
     private DotNetObjectReference<WebRtcBridge>? _dotNetRef;
     private string? _authToken;
     private string? _userId;
 
-    public WebRtcBridge(IJSRuntime js, CallStore callStore)
+    public WebRtcBridge(IJSRuntime js, CallStore callStore, GrpcChannelProvider channelProvider)
     {
         _js = js;
         _callStore = callStore;
+        _channelProvider = channelProvider;
 
         // Subscribe to Janus reconnection events from CallStore
         _callStore.OnJanusReconnect += HandleJanusReconnect;
@@ -40,6 +43,8 @@ public class WebRtcBridge : IAsyncDisposable
         string userId,
         string iceServers)
     {
+        var resolvedServerBaseUrl = ResolveServerBaseUrl(serverBaseUrl);
+
         _authToken = authToken;
         _userId = userId;
 
@@ -50,7 +55,7 @@ public class WebRtcBridge : IAsyncDisposable
             janusSessionId,
             janusHandleId,
             janusRoomId,
-            serverBaseUrl,
+            serverBaseUrl = resolvedServerBaseUrl,
             authToken,
             userId,
             iceServers,
@@ -196,6 +201,7 @@ public class WebRtcBridge : IAsyncDisposable
                 _userId ?? "",
                 session.IceServers
             );
+            await ApplyStoredSettingsAsync();
         }
         catch (Exception ex)
         {
@@ -219,6 +225,19 @@ public class WebRtcBridge : IAsyncDisposable
         await _js.InvokeVoidAsync("webrtcManager.setPushToTalk", enabled, key);
     }
 
+    public async Task ApplyStoredSettingsAsync()
+    {
+        await UpdateSettingsAsync(
+            _callStore.SelectedMicId,
+            _callStore.SelectedCameraId,
+            _callStore.SelectedResolution,
+            _callStore.SelectedFps,
+            _callStore.SelectedBitrate);
+
+        await SetVolumeAsync(_callStore.Volume);
+        await SetPushToTalkAsync(_callStore.PushToTalkEnabled, _callStore.PushToTalkKey);
+    }
+
     public async ValueTask DisposeAsync()
     {
         _callStore.OnJanusReconnect -= HandleJanusReconnect;
@@ -228,4 +247,48 @@ public class WebRtcBridge : IAsyncDisposable
         _dotNetRef?.Dispose();
         _dotNetRef = null;
     }
+
+    private string ResolveServerBaseUrl(string? serverBaseUrl)
+    {
+        var fallback = NormalizeBaseUrl(_channelProvider.ServerUrl);
+        var candidate = NormalizeBaseUrl(serverBaseUrl);
+
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return fallback;
+        }
+
+        if (!Uri.TryCreate(candidate, UriKind.Absolute, out var candidateUri))
+        {
+            return fallback;
+        }
+
+        if (!IsLoopbackHost(candidateUri.Host))
+        {
+            return candidate;
+        }
+
+        // Server returned localhost/127.0.0.1, which is not reachable from remote clients.
+        return fallback;
+    }
+
+    private static string NormalizeBaseUrl(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return "http://localhost:5000";
+        }
+
+        if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri))
+        {
+            return "http://localhost:5000";
+        }
+
+        return uri.GetLeftPart(UriPartial.Authority);
+    }
+
+    private static bool IsLoopbackHost(string host)
+        => host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+           || host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase)
+           || host.Equals("::1", StringComparison.OrdinalIgnoreCase);
 }

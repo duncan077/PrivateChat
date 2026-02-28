@@ -1,0 +1,32 @@
+.app-shell-bar {
+    border-bottom: 1px solid rgba(164, 182, 212, 0.18);
+    backdrop-filter: blur(14px);
+    background: linear-gradient(90deg, rgba(9, 16, 30, 0.92), rgba(12, 21, 38, 0.8)) !important;
+}
+
+.app-brand {
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+.app-shell-subtitle {
+    margin-left: 0.85rem;
+    color: rgba(209, 222, 242, 0.76);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 0.62rem;
+}
+
+.app-shell-drawer {
+    border-right: 1px solid rgba(164, 182, 212, 0.14);
+}
+
+.app-shell-main {
+    position: relative;
+}
+
+@media (max-width: 880px) {
+    .app-shell-subtitle {
+        display: none;
+    }
+}
