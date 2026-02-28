@@ -9,6 +9,8 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
 {
     private readonly GrpcChannelProvider _channelProvider;
     private IChatHub? _hub;
+    private bool _intentionalDisconnect;
+    private CancellationTokenSource? _reconnectCts;
 
     public event Action<ChatMessage>? OnMessageReceived;
     public event Action<Guid, Guid>? OnMessageDeleted;
@@ -25,6 +27,11 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
     public event Action<Guid, Guid>? OnUserJoinedVoiceVideo;
     public event Action<Guid, Guid>? OnUserLeftVoiceVideo;
 
+    /// <summary>
+    /// Fired when connection state changes. True = connected, False = disconnected/reconnecting.
+    /// </summary>
+    public event Action<bool>? OnConnectionStateChanged;
+
     public bool IsConnected => _hub != null;
 
     public ChatClientService(GrpcChannelProvider channelProvider)
@@ -36,17 +43,95 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
     {
         if (_hub != null) return;
 
+        _intentionalDisconnect = false;
+        _reconnectCts?.Cancel();
+        _reconnectCts = new CancellationTokenSource();
+
         var channel = _channelProvider.GetChannel();
         _hub = await StreamingHubClient.ConnectAsync<IChatHub, IChatHubReceiver>(
             channel, this);
+
+        OnConnectionStateChanged?.Invoke(true);
+
+        // Start watching for disconnection in the background
+        _ = WatchForDisconnect(_reconnectCts.Token);
     }
 
     public async Task DisconnectAsync()
     {
+        _intentionalDisconnect = true;
+        _reconnectCts?.Cancel();
+        _reconnectCts = null;
+
         if (_hub != null)
         {
             await _hub.DisposeAsync();
             _hub = null;
+        }
+
+        OnConnectionStateChanged?.Invoke(false);
+    }
+
+    /// <summary>
+    /// Monitors the hub connection and auto-reconnects on unexpected disconnection
+    /// with exponential backoff (1s → 2s → 4s → ... max 30s).
+    /// </summary>
+    private async Task WatchForDisconnect(CancellationToken ct)
+    {
+        try
+        {
+            if (_hub == null) return;
+
+            // Wait until the hub disconnects
+            await _hub.WaitForDisconnect();
+
+            // If we intentionally disconnected, don't reconnect
+            if (_intentionalDisconnect || ct.IsCancellationRequested) return;
+
+            Console.WriteLine("[ChatClient] Disconnected unexpectedly, starting reconnection...");
+            _hub = null;
+            OnConnectionStateChanged?.Invoke(false);
+
+            // Exponential backoff reconnection loop
+            int delayMs = 1000;
+            const int maxDelayMs = 30_000;
+
+            while (!ct.IsCancellationRequested && !_intentionalDisconnect)
+            {
+                try
+                {
+                    Console.WriteLine($"[ChatClient] Reconnecting in {delayMs}ms...");
+                    await Task.Delay(delayMs, ct);
+
+                    // Reset the gRPC channel to force a fresh connection
+                    _channelProvider.ResetChannel();
+
+                    var channel = _channelProvider.GetChannel();
+                    _hub = await StreamingHubClient.ConnectAsync<IChatHub, IChatHubReceiver>(
+                        channel, this);
+
+                    Console.WriteLine("[ChatClient] Reconnected successfully!");
+                    OnConnectionStateChanged?.Invoke(true);
+
+                    // Restart disconnect watcher for the new connection
+                    _ = WatchForDisconnect(ct);
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ChatClient] Reconnect failed: {ex.Message}");
+                    delayMs = Math.Min(delayMs * 2, maxDelayMs);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ChatClient] WatchForDisconnect error: {ex.Message}");
         }
     }
 

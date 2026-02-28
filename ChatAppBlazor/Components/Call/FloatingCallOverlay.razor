@@ -1,0 +1,103 @@
+@implements IDisposable
+@inject CallStore Store
+@inject WebRtcBridge WebRtc
+@inject NavigationManager Nav
+
+@* ─── Floating PiP overlay shown when in a call but NOT on the call room page ─── *@
+
+@if (Store.IsInCall && !_isOnCallRoom)
+{
+    <div class="floating-call-overlay @(_minimized ? "minimized" : "")">
+        <div class="float-header">
+            <MudText Typo="Typo.caption" Class="float-title">In Call</MudText>
+            <MudStack Row Spacing="0">
+                <MudIconButton Icon="@(_minimized ? Icons.Material.Filled.OpenInFull : Icons.Material.Filled.CloseFullscreen)"
+                               Size="Size.Small" Color="Color.Inherit"
+                               OnClick="ToggleMinimize" Title="@(_minimized ? "Expand" : "Minimize")" />
+                <MudIconButton Icon="Icons.Material.Filled.CallEnd"
+                               Size="Size.Small" Color="Color.Error"
+                               OnClick="LeaveCall" Title="Leave Call" />
+            </MudStack>
+        </div>
+
+        @if (!_minimized)
+        {
+            <div id="floatVideoContainer" class="float-video-area">
+                <video id="floatLocalVideo" autoplay muted playsinline></video>
+            </div>
+
+            <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.Center" Spacing="1" Class="float-controls">
+                <MudIconButton Icon="@(Store.IsMuted ? Icons.Material.Filled.MicOff : Icons.Material.Filled.Mic)"
+                               Size="Size.Small"
+                               Color="@(Store.IsMuted ? Color.Error : Color.Default)"
+                               OnClick="ToggleMute" />
+                <MudIconButton Icon="@(Store.IsCameraOff ? Icons.Material.Filled.VideocamOff : Icons.Material.Filled.Videocam)"
+                               Size="Size.Small"
+                               Color="@(Store.IsCameraOff ? Color.Error : Color.Default)"
+                               OnClick="ToggleCamera" />
+                <MudButton Size="Size.Small" Variant="Variant.Text" Color="Color.Primary"
+                           OnClick="GoToCall">Return</MudButton>
+            </MudStack>
+        }
+    </div>
+}
+
+@code {
+    private bool _minimized;
+    private bool _isOnCallRoom;
+
+    protected override void OnInitialized()
+    {
+        Store.OnChange += OnStoreChanged;
+        Nav.LocationChanged += OnLocationChanged;
+        CheckIfOnCallRoom();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (Store.IsInCall && !_isOnCallRoom)
+        {
+            try
+            {
+                await WebRtc.MoveVideoToFloatAsync("floatVideoContainer");
+            }
+            catch { }
+        }
+    }
+
+    private void CheckIfOnCallRoom()
+    {
+        var relative = Nav.ToBaseRelativePath(Nav.Uri);
+        // We're "on the call room" if we're on the rooms page and the selected room matches
+        _isOnCallRoom = string.IsNullOrEmpty(relative) || relative == "/";
+    }
+
+    private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e)
+    {
+        CheckIfOnCallRoom();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private async Task ToggleMute() => await WebRtc.ToggleMuteAsync();
+    private async Task ToggleCamera() => await WebRtc.ToggleCameraAsync();
+    private void ToggleMinimize() => _minimized = !_minimized;
+
+    private void GoToCall()
+    {
+        Nav.NavigateTo("/");
+    }
+
+    private async Task LeaveCall()
+    {
+        await WebRtc.StopAsync();
+        await Store.LeaveCallAsync();
+    }
+
+    private void OnStoreChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        Store.OnChange -= OnStoreChanged;
+        Nav.LocationChanged -= OnLocationChanged;
+    }
+}

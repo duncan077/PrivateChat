@@ -109,7 +109,7 @@ public class JanusService
                     room = roomId,
                     description = $"Room {roomId}",
                     publishers = 20,
-                    bitrate = 512000,
+                    bitrate = 0, // 0 = no server-side cap; per-publisher bitrate controlled by client
                     videocodec = "vp8",
                     audiocodec = "opus",
                     is_private = false,
@@ -118,15 +118,21 @@ public class JanusService
             });
 
             // Poll for the event confirming creation (or the "already exists" error).
+            // Match by transaction ID to avoid consuming unrelated events.
             var deadline = DateTime.UtcNow + EventTimeout;
             while (DateTime.UtcNow < deadline)
             {
                 var ev = await RawPollAsync(sessionId);
                 if (ev == null) continue;
 
-                if (ev.Value.TryGetProperty("janus", out var t) && t.GetString() is "event" or "error")
+                // Only process events matching our transaction or our admin handle
+                if (ev.Value.TryGetProperty("transaction", out var evTxn) && evTxn.GetString() == txn)
                 {
                     // 427 = room already exists — that's fine.
+                    break;
+                }
+                if (ev.Value.TryGetProperty("sender", out var sender) && sender.GetInt64() == adminHandle)
+                {
                     break;
                 }
             }
@@ -209,6 +215,63 @@ public class JanusService
         }
 
         throw new TimeoutException($"Janus did not respond to transaction {txn} within {EventTimeout.TotalSeconds}s");
+    }
+
+    /// <summary>
+    /// Sends a plugin message and returns immediately with the Janus ACK
+    /// (does NOT poll for the async event response). The caller is expected
+    /// to receive the real response via the long-poll event loop.
+    /// This avoids event-queue competition with the JS polling loop.
+    /// </summary>
+    public async Task<JsonElement> SendPluginMessageNoWaitAsync(
+        long sessionId,
+        long handleId,
+        object body,
+        object? jsep = null)
+    {
+        var txn = NewTxn();
+        var msg = new Dictionary<string, object>
+        {
+            ["janus"] = "message",
+            ["transaction"] = txn,
+            ["body"] = body
+        };
+        if (jsep != null)
+            msg["jsep"] = jsep;
+
+        _logger.LogDebug("Sending fire-and-forget message to session {Session}/handle {Handle}, txn={Txn}",
+            sessionId, handleId, txn);
+
+        return await PostAsync($"{_janusUrl}/{sessionId}/{handleId}", msg);
+    }
+
+    // ──────────────────────────────────────────────
+    // Room queries (uses a temporary session to avoid event queue competition)
+    // ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Queries the list of participants in a videoroom using a disposable
+    /// temporary session. This avoids competing with the client's long-poll
+    /// event queue on the user's main session.
+    /// Returns the raw Janus response (plugindata with participants array).
+    /// </summary>
+    public async Task<JsonElement> ListParticipantsAsync(long roomId)
+    {
+        var tempSession = await CreateSessionAsync();
+        try
+        {
+            var tempHandle = await AttachPluginAsync(tempSession);
+            var result = await SendPluginMessageAndWaitAsync(
+                tempSession,
+                tempHandle,
+                new { request = "listparticipants", room = roomId });
+            return result;
+        }
+        finally
+        {
+            // Best-effort cleanup — don't let it fail the request
+            try { await DestroySessionAsync(tempSession); } catch { }
+        }
     }
 
     // ──────────────────────────────────────────────

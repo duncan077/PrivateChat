@@ -3,49 +3,74 @@
 @inject DirectMessageStore Store
 @inject AuthStateProvider Auth
 
-<div class="dm-layout">
-    <aside class="contacts-list">
-        <div class="contacts-header">
-            <h4>Contacts</h4>
-        </div>
-        @foreach (var contact in Store.Contacts)
-        {
-            <div class="contact-item @(contact.Id == Store.SelectedContactId ? "active" : "")"
-                 @onclick="() => SelectContact(contact)">
-                <span class="contact-name">@contact.DisplayName</span>
-                <span class="contact-username">@@@contact.UserName</span>
-            </div>
-        }
+<div class="dm-page">
+    @* ─── Left: Contacts list ─── *@
+    <div class="dm-sidebar">
+        <MudStack Row AlignItems="AlignItems.Center" Class="pa-3">
+            <MudText Typo="Typo.subtitle1" Style="font-weight:600">Messages</MudText>
+        </MudStack>
 
         @if (Store.Contacts.Length == 0)
         {
-            <div class="empty-state">No conversations yet</div>
+            <MudText Typo="Typo.body2" Color="Color.Secondary" Class="pa-3">No conversations yet</MudText>
         }
-    </aside>
 
-    <section class="dm-chat-area">
+        <MudList T="Guid" Dense="true">
+            @foreach (var contact in Store.Contacts)
+            {
+                <MudListItem T="Guid" Value="contact.Id"
+                             OnClick="() => SelectContact(contact)"
+                             Class="@(contact.Id == Store.SelectedContactId ? "mud-selected-item" : "")">
+                    <div class="contact-entry">
+                        <MudAvatar Size="Size.Small" Color="Color.Secondary">
+                            @contact.DisplayName[0]
+                        </MudAvatar>
+                        <div class="ml-2">
+                            <MudText Typo="Typo.body2" Style="font-weight:500">@contact.DisplayName</MudText>
+                            <MudText Typo="Typo.caption" Color="Color.Secondary">@@@contact.UserName</MudText>
+                        </div>
+                    </div>
+                </MudListItem>
+            }
+        </MudList>
+    </div>
+
+    @* ─── Right: Chat area ─── *@
+    <div class="dm-main">
         @if (Store.SelectedContact != null)
         {
-            <div class="dm-header">
-                <h4>@Store.SelectedContact.DisplayName</h4>
-                <span class="dm-username">@@@Store.SelectedContact.UserName</span>
+            <div class="chat-toolbar">
+                <MudStack Row AlignItems="AlignItems.Center" Class="pa-2 px-3" Style="width:100%">
+                    <MudAvatar Size="Size.Small" Color="Color.Secondary">
+                        @Store.SelectedContact.DisplayName[0]
+                    </MudAvatar>
+                    <div class="ml-2">
+                        <MudText Typo="Typo.subtitle1" Style="font-weight:600">@Store.SelectedContact.DisplayName</MudText>
+                        <MudText Typo="Typo.caption" Color="Color.Secondary">@@@Store.SelectedContact.UserName</MudText>
+                    </div>
+                </MudStack>
             </div>
 
-            <div class="dm-messages">
+            <div class="chat-messages-area">
                 @foreach (var msg in Store.Messages)
                 {
-                    <div class="dm-message @(msg.SenderId == Auth.CurrentUser?.Id ? "own" : "")">
-                        <div class="dm-message-header">
-                            <span class="dm-sender">@msg.SenderName</span>
-                            <span class="dm-time">@msg.SentAt.ToLocalTime().ToString("HH:mm")</span>
+                    var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
+                    <div class="chat-msg @(isOwn ? "own" : "")">
+                        <div class="chat-msg-header">
+                            <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
+                                @msg.SenderName
+                            </MudText>
+                            <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                @msg.SentAt.ToLocalTime().ToString("HH:mm")
+                            </MudText>
                         </div>
-                        <div class="dm-content">@msg.Content</div>
+                        <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
                         @if (msg.Attachments.Length > 0)
                         {
-                            <div class="dm-attachments">
+                            <div class="chat-msg-attachments">
                                 @foreach (var att in msg.Attachments)
                                 {
-                                    <a href="@att.Url" target="_blank" class="dm-att-link">@att.FileName</a>
+                                    <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
                                 }
                             </div>
                         }
@@ -53,25 +78,30 @@
                 }
             </div>
 
-            <div class="dm-input">
-                <textarea @bind="_messageText" @onkeydown="HandleKeyDown"
-                          placeholder="Type a message..." rows="1"></textarea>
-                <button class="btn-primary" @onclick="SendMessage"
-                        disabled="@string.IsNullOrWhiteSpace(_messageText)">Send</button>
+            <div class="chat-input-area">
+                <MudTextField @bind-Value="_messageText" Placeholder="Type a message..."
+                              Variant="Variant.Outlined" Immediate="true" Dense="true"
+                              OnKeyDown="HandleKeyDown"
+                              Adornment="Adornment.End"
+                              AdornmentIcon="Icons.Material.Filled.Send"
+                              AdornmentColor="Color.Primary"
+                              OnAdornmentClick="SendMessage"
+                              Class="chat-input-field" />
             </div>
         }
         else
         {
-            <div class="no-contact-selected">
-                <p>Select a contact to start messaging</p>
-            </div>
+            <MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Class="fill-parent">
+                <MudIcon Icon="Icons.Material.Filled.Email" Size="Size.Large" Color="Color.Secondary" />
+                <MudText Typo="Typo.body1" Color="Color.Secondary">Select a contact to start messaging</MudText>
+            </MudStack>
         }
-    </section>
+    </div>
 </div>
 
 @if (!string.IsNullOrEmpty(Store.Error))
 {
-    <div class="toast-error">@Store.Error</div>
+    <MudSnackbar Severity="Severity.Error" Visible="true">@Store.Error</MudSnackbar>
 }
 
 @code {

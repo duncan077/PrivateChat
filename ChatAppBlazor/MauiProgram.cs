@@ -1,7 +1,8 @@
-﻿using ChatAppBlazor.Services;
+using ChatAppBlazor.Services;
 using ChatAppBlazor.State;
 using ChatAppBlazor.WebRtc;
 using Microsoft.Extensions.Logging;
+using MudBlazor.Services;
 
 namespace ChatAppBlazor
 {
@@ -18,6 +19,10 @@ namespace ChatAppBlazor
                 });
 
             builder.Services.AddMauiBlazorWebView();
+
+            // MudBlazor
+            builder.Services.AddMudServices();
+
             // Core services (singletons — shared across the app lifetime)
             builder.Services.AddSingleton<AuthStateProvider>();
             builder.Services.AddSingleton<GrpcChannelProvider>();
@@ -29,7 +34,10 @@ namespace ChatAppBlazor
             builder.Services.AddSingleton<DirectMessageStore>();
             builder.Services.AddSingleton<CallStore>();
 
-            // WebRTC bridge (scoped — one DotNetObjectReference per Blazor scope)
+            // WebRTC bridge (scoped — must match IJSRuntime's scoped lifetime).
+            // In MAUI Blazor Hybrid the single BlazorWebView creates one scope for the
+            // entire app lifetime, so scoped ≈ singleton here.  The call stays alive
+            // across page navigation because we don't tear it down in DisposeAsync.
             builder.Services.AddScoped<WebRtcBridge>();
 
 #if DEBUG

@@ -3,8 +3,10 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <title>ChatAppBlazor</title>
+    <title>PrivateChat</title>
     <base href="/" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <link href="_content/MudBlazor/MudBlazor.min.css" rel="stylesheet" />
     <link rel="stylesheet" href="css/app.css" />
     <link rel="stylesheet" href="ChatAppBlazor.styles.css" />
     <link rel="icon" href="data:,">
@@ -19,10 +21,12 @@
     <div id="blazor-error-ui">
         An unhandled error has occurred.
         <a href="" class="reload">Reload</a>
-        <a class="dismiss">🗙</a>
+        <a class="dismiss">&#x1F5D9;</a>
     </div>
 
     <script src="_framework/blazor.webview.js" autostart="false"></script>
+    <script src="_content/MudBlazor/MudBlazor.min.js"></script>
+    <script src="js/webrtc-manager.js"></script>
 
 </body>
 

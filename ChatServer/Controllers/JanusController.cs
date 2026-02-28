@@ -60,7 +60,7 @@ public class JanusController : ControllerBase
                 bodyEl,
                 jsepEl.HasValue ? jsepEl.Value : null);
 
-            return Ok(result);
+            return Content(result.GetRawText(), "application/json");
         }
         catch (TimeoutException ex)
         {
@@ -71,6 +71,41 @@ public class JanusController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Janus error for session {Session}/handle {Handle}",
+                sessionId, handleId);
+            return StatusCode(502, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Sends a plugin message and returns immediately (just the Janus ACK).
+    /// Does NOT poll for the async event response — the caller receives it
+    /// via the long-poll endpoint instead. This prevents event-queue
+    /// competition when subscribing to remote feeds.
+    /// </summary>
+    [HttpPost("session/{sessionId}/handle/{handleId}/message-nowait")]
+    public async Task<IActionResult> SendMessageNoWait(
+        long sessionId,
+        long handleId,
+        [FromBody] JsonElement message)
+    {
+        try
+        {
+            if (!message.TryGetProperty("body", out var bodyEl))
+                return BadRequest("Missing 'body' field");
+
+            JsonElement? jsepEl = message.TryGetProperty("jsep", out var j) ? j : null;
+
+            var ack = await _janus.SendPluginMessageNoWaitAsync(
+                sessionId,
+                handleId,
+                bodyEl,
+                jsepEl.HasValue ? jsepEl.Value : null);
+
+            return Content(ack.GetRawText(), "application/json");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Janus fire-and-forget error for session {Session}/handle {Handle}",
                 sessionId, handleId);
             return StatusCode(502, new { error = ex.Message });
         }
@@ -103,6 +138,8 @@ public class JanusController : ControllerBase
     /// <summary>
     /// Long-polls Janus for one event. The client calls this in a loop to
     /// receive async events (publishers joining/leaving, ICE renegotiation).
+    /// Returns the raw Janus JSON directly to avoid any re-serialization issues
+    /// with JsonElement → ASP.NET JSON → client.
     /// </summary>
     [HttpGet("session/{sessionId}/poll")]
     public async Task<IActionResult> LongPoll(long sessionId)
@@ -112,7 +149,14 @@ public class JanusController : ControllerBase
             var result = await _janus.LongPollAsync(sessionId);
             if (result == null)
                 return Ok(new { janus = "keepalive" });
-            return Ok(result);
+
+            // Pass through the raw Janus JSON without re-serialization
+            var rawJson = result.Value.GetRawText();
+
+            _logger.LogInformation("Poll session {Session}: {Event}", sessionId,
+                rawJson.Length > 300 ? rawJson[..300] + "..." : rawJson);
+
+            return Content(rawJson, "application/json");
         }
         catch (Exception ex)
         {
@@ -129,5 +173,31 @@ public class JanusController : ControllerBase
     {
         await _janus.SendKeepaliveAsync(sessionId);
         return Ok();
+    }
+
+    /// <summary>
+    /// Lists participants in a videoroom. Uses a temporary Janus session
+    /// to avoid competing with the client's long-poll event queue.
+    /// This is the fallback publisher-discovery mechanism: the client calls
+    /// this periodically to find publishers it may have missed.
+    /// </summary>
+    [HttpGet("room/{roomId}/participants")]
+    public async Task<IActionResult> ListParticipants(long roomId)
+    {
+        try
+        {
+            var result = await _janus.ListParticipantsAsync(roomId);
+            return Content(result.GetRawText(), "application/json");
+        }
+        catch (TimeoutException ex)
+        {
+            _logger.LogWarning("listparticipants timeout for room {Room}: {Error}", roomId, ex.Message);
+            return StatusCode(504, new { error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "listparticipants error for room {Room}", roomId);
+            return StatusCode(502, new { error = ex.Message });
+        }
     }
 }

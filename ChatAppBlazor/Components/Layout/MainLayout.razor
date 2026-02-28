@@ -5,13 +5,17 @@
 @inject GrpcChannelProvider Grpc
 @inject NavigationManager Nav
 
+<MudThemeProvider Theme="_theme" IsDarkMode="true" />
+<MudPopoverProvider />
+<MudDialogProvider />
+<MudSnackbarProvider />
 
 @if (!_initialized)
 {
-    <div class="loading-screen">
-        <div class="loading-spinner"></div>
-        <p>Initializing...</p>
-    </div>
+    <MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Class="fill-screen">
+        <MudProgressCircular Color="Color.Primary" Indeterminate="true" Size="Size.Large" />
+        <MudText Typo="Typo.body1">Initializing...</MudText>
+    </MudStack>
 }
 else if (!Auth.IsAuthenticated)
 {
@@ -27,67 +31,107 @@ else if (!Auth.IsAuthenticated)
             }
         </ChildContent>
         <ErrorContent Context="ex">
-            <div class="error-screen">
-                <strong>Auth error:</strong> @ex.Message
-            </div>
+            <MudAlert Severity="Severity.Error">Auth error: @ex.Message</MudAlert>
         </ErrorContent>
     </ErrorBoundary>
 }
 else
 {
-    <div class="app-layout">
-        <nav class="sidebar">
-            <div class="sidebar-header">
-                <h3>PrivateChat</h3>
-                <span class="user-badge">@Auth.CurrentUser?.DisplayName</span>
-            </div>
-            <div class="sidebar-nav">
-                <a class="nav-item @(IsActive("/"))" href="/">
-                    <span class="nav-icon">&#x1F4AC;</span> Rooms
-                </a>
-                <a class="nav-item @(IsActive("/dm"))" href="/dm">
-                    <span class="nav-icon">&#x2709;</span> Messages
-                </a>
-                <a class="nav-item @(IsActive("/voice"))" href="/voice">
-                    <span class="nav-icon">&#x1F3A4;</span> Voice/Video
-                </a>
-            </div>
-            <div class="sidebar-footer">
-                <button class="btn-logout" @onclick="Logout">Logout</button>
-            </div>
-        </nav>
-        <main class="main-content">
+    <MudLayout>
+        <MudAppBar Elevation="1" Dense="true" Color="Color.Surface">
+            <MudIconButton Icon="Icons.Material.Filled.Menu" Color="Color.Inherit" Edge="Edge.Start"
+                           OnClick="ToggleDrawer" />
+            <MudText Typo="Typo.h6" Class="ml-2">PrivateChat</MudText>
+            <MudSpacer />
+            @if (!Chat.IsConnected)
+            {
+                <MudChip T="string" Size="Size.Small" Color="Color.Warning" Variant="Variant.Filled">Reconnecting...</MudChip>
+            }
+            <MudChip T="string" Size="Size.Small" Color="Color.Primary" Variant="Variant.Text">
+                @Auth.CurrentUser?.DisplayName
+            </MudChip>
+            <MudIconButton Icon="Icons.Material.Filled.Logout" Color="Color.Inherit"
+                           OnClick="Logout" Title="Logout" />
+        </MudAppBar>
+
+        <MudDrawer @bind-Open="_drawerOpen" Elevation="2" ClipMode="DrawerClipMode.Always"
+                   Variant="DrawerVariant.Mini" OpenMiniOnHover="true">
+            <MudNavMenu>
+                <MudNavLink Href="/" Match="NavLinkMatch.All"
+                            Icon="Icons.Material.Filled.Forum">Rooms</MudNavLink>
+                <MudNavLink Href="/dm" Match="NavLinkMatch.Prefix"
+                            Icon="Icons.Material.Filled.Email">Messages</MudNavLink>
+            </MudNavMenu>
+        </MudDrawer>
+
+        <MudMainContent Class="main-content-area">
             <ErrorBoundary>
                 <ChildContent>
                     @Body
                 </ChildContent>
                 <ErrorContent Context="ex">
-                    <div class="error-screen">
-                        <strong>Error:</strong> @ex.Message
-                        <button class="btn-secondary" @onclick="() => Nav.NavigateTo(Nav.Uri, true)">Reload</button>
-                    </div>
+                    <MudContainer MaxWidth="MaxWidth.Small" Class="mt-8">
+                        <MudAlert Severity="Severity.Error">
+                            Error: @ex.Message
+                        </MudAlert>
+                        <MudButton Variant="Variant.Outlined" Color="Color.Primary" Class="mt-2"
+                                   OnClick="() => Nav.NavigateTo(Nav.Uri, true)">Reload</MudButton>
+                    </MudContainer>
                 </ErrorContent>
             </ErrorBoundary>
-        </main>
-    </div>
+        </MudMainContent>
+    </MudLayout>
+
+    @* Floating call overlay (PiP when navigating away from call room) *@
+    <FloatingCallOverlay />
 }
 
 @code {
     private bool _initialized;
     private bool _showRegister;
+    private bool _drawerOpen = true;
+
+    private MudTheme _theme = new()
+    {
+        PaletteLight = new PaletteLight(),
+        PaletteDark = new PaletteDark
+        {
+            Primary = "#7c4dff",
+            Secondary = "#448aff",
+            Surface = "#1e1e2e",
+            Background = "#141420",
+            AppbarBackground = "#1e1e2e",
+            DrawerBackground = "#1a1a28",
+            DrawerText = "#ffffffcc",
+            TextPrimary = "#ffffffde",
+            TextSecondary = "#ffffff99",
+            ActionDefault = "#ffffffb3",
+            Error = "#ef5350",
+            Success = "#66bb6a",
+            Warning = "#ffa726",
+            Info = "#42a5f5"
+        },
+        Typography = new Typography
+        {
+            Default = new DefaultTypography
+            {
+                FontFamily = ["Inter", "Segoe UI", "Helvetica Neue", "Arial", "sans-serif"]
+            }
+        }
+    };
 
     protected override void OnInitialized()
     {
         Auth.OnAuthStateChanged += OnAuthChanged;
         Nav.LocationChanged += OnLocationChanged;
+        Chat.OnConnectionStateChanged += OnConnectionChanged;
         _showRegister = IsRegisterPage();
         _initialized = true;
     }
 
-    private void OnAuthChanged()
-    {
-        InvokeAsync(StateHasChanged);
-    }
+    private void OnAuthChanged() => InvokeAsync(StateHasChanged);
+
+    private void OnConnectionChanged(bool connected) => InvokeAsync(StateHasChanged);
 
     private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e)
     {
@@ -98,20 +142,11 @@ else
     private bool IsRegisterPage() =>
         Nav.ToBaseRelativePath(Nav.Uri).StartsWith("register", StringComparison.OrdinalIgnoreCase);
 
-    private string IsActive(string path)
-    {
-        var relative = Nav.ToBaseRelativePath(Nav.Uri);
-        if (path == "/") return string.IsNullOrEmpty(relative) ? "active" : "";
-        return relative.StartsWith(path.TrimStart('/'), StringComparison.OrdinalIgnoreCase) ? "active" : "";
-    }
+    private void ToggleDrawer() => _drawerOpen = !_drawerOpen;
 
     private async Task Logout()
     {
-        try
-        {
-            await Chat.DisconnectAsync();
-        }
-        catch { }
+        try { await Chat.DisconnectAsync(); } catch { }
         Grpc.ResetChannel();
         Auth.ClearAuth();
     }
@@ -120,5 +155,6 @@ else
     {
         Auth.OnAuthStateChanged -= OnAuthChanged;
         Nav.LocationChanged -= OnLocationChanged;
+        Chat.OnConnectionStateChanged -= OnConnectionChanged;
     }
 }

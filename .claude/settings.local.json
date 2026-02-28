@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs grep -l \"WebRtcBridge\\\\|localVideo\\\\|videoGrid\")",
+      "Bash(xargs grep -l \"voice\\\\|video\\\\|grid\")",
+      "Bash(xargs ls -la)",
+      "Bash(grep -r \"\\\\.js\\\\|script\\\\|InvokeAsync\" /c/Users/halod/source/repos/PrivateChat/ChatAppBlazor/Components -not -path \"*/bin/*\" -not -path \"*/obj/*\")",
+      "Bash(dotnet build -f net9.0-windows10.0.19041.0 --no-restore)",
+      "Bash(dotnet build --no-restore)",
+      "Bash(dotnet build ChatServer/ChatServer.csproj --no-restore)",
+      "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj --no-restore -f net9.0-windows10.0.19041.0)",
+      "Bash(dotnet build ChatServer/ChatServer.csproj --no-restore --no-incremental)",
+      "Bash(xargs grep -l \"GrpcChannelProvider\\\\|Reconnect\\\\|Disconnect\")",
+      "Bash(dotnet add package MudBlazor --version 8.5.0)",
+      "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj)",
+      "Bash(dotnet build ChatServer/ChatServer.csproj)",
+      "Bash(dotnet build)"
+    ]
+  }
+}

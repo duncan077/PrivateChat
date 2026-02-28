@@ -1,0 +1,168 @@
+@inject IDialogService DialogService
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">
+            <MudIcon Icon="Icons.Material.Filled.Settings" Class="mr-2" /> Call Settings
+        </MudText>
+    </TitleContent>
+    <DialogContent>
+        <MudStack Spacing="3">
+            <MudSelect T="string" @bind-Value="_selectedMicId" Label="Microphone" Variant="Variant.Outlined" Dense="true">
+                <MudSelectItem T="string" Value="@("")">Default</MudSelectItem>
+                @foreach (var mic in Store.Microphones)
+                {
+                    <MudSelectItem T="string" Value="@mic.DeviceId">@mic.Label</MudSelectItem>
+                }
+            </MudSelect>
+
+            <MudSelect T="string" @bind-Value="_selectedCameraId" Label="Camera" Variant="Variant.Outlined" Dense="true">
+                <MudSelectItem T="string" Value="@("")">Default</MudSelectItem>
+                @foreach (var cam in Store.Cameras)
+                {
+                    <MudSelectItem T="string" Value="@cam.DeviceId">@cam.Label</MudSelectItem>
+                }
+            </MudSelect>
+
+            <MudSelect T="string" @bind-Value="_selectedResolution" Label="Resolution" Variant="Variant.Outlined" Dense="true">
+                <MudSelectItem T="string" Value="@("1920x1080")">1080p (1920x1080)</MudSelectItem>
+                <MudSelectItem T="string" Value="@("1280x720")">720p (1280x720)</MudSelectItem>
+                <MudSelectItem T="string" Value="@("640x480")">480p (640x480)</MudSelectItem>
+                <MudSelectItem T="string" Value="@("480x360")">360p (480x360)</MudSelectItem>
+            </MudSelect>
+
+            <MudSelect T="int" @bind-Value="_selectedFps" Label="Frame Rate" Variant="Variant.Outlined" Dense="true">
+                <MudSelectItem T="int" Value="15">15 fps</MudSelectItem>
+                <MudSelectItem T="int" Value="24">24 fps</MudSelectItem>
+                <MudSelectItem T="int" Value="30">30 fps</MudSelectItem>
+                <MudSelectItem T="int" Value="60">60 fps</MudSelectItem>
+            </MudSelect>
+
+            <MudSelect T="int" @bind-Value="_selectedBitrate" Label="Bitrate" Variant="Variant.Outlined" Dense="true">
+                <MudSelectItem T="int" Value="500">500 kbps (Low)</MudSelectItem>
+                <MudSelectItem T="int" Value="1000">1 Mbps</MudSelectItem>
+                <MudSelectItem T="int" Value="2000">2 Mbps (Default)</MudSelectItem>
+                <MudSelectItem T="int" Value="4000">4 Mbps</MudSelectItem>
+                <MudSelectItem T="int" Value="6000">6 Mbps</MudSelectItem>
+                <MudSelectItem T="int" Value="8000">8 Mbps (High)</MudSelectItem>
+            </MudSelect>
+
+            <div>
+                <MudText Typo="Typo.body2" Class="mb-1">Mic Volume: @($"{_volume:P0}")</MudText>
+                <MudSlider T="double" Value="_volume" Min="0" Max="2" Step="0.1"
+                           Color="Color.Primary" ValueChanged="OnVolumeChanged" />
+            </div>
+
+            <MudDivider Class="my-1" />
+
+            @* Push-to-talk *@
+            <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween">
+                <MudText Typo="Typo.body2">Push to Talk</MudText>
+                <MudSwitch T="bool" Value="_pttEnabled" Color="Color.Primary"
+                           ValueChanged="OnPttToggled" />
+            </MudStack>
+
+            @if (_pttEnabled)
+            {
+                <MudStack Spacing="2">
+                    <MudSelect T="string" @bind-Value="_pttKey" Label="PTT Key" Variant="Variant.Outlined" Dense="true">
+                        <MudSelectItem T="string" Value="@("Space")">Space</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("KeyV")">V</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("KeyB")">B</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("KeyT")">T</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("CapsLock")">Caps Lock</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("ControlLeft")">Left Ctrl</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("AltLeft")">Left Alt</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("ShiftLeft")">Left Shift</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("Backquote")">` (Backtick)</MudSelectItem>
+                    </MudSelect>
+                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                        Hold the key to unmute. Release to mute.
+                    </MudText>
+                </MudStack>
+            }
+
+            <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="RefreshDevices"
+                       StartIcon="Icons.Material.Filled.Refresh" FullWidth="true" Size="Size.Small">
+                Refresh Devices
+            </MudButton>
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="Cancel">Cancel</MudButton>
+        <MudButton Color="Color.Primary" Variant="Variant.Filled" OnClick="Apply">Apply</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter] private IMudDialogInstance MudDialog { get; set; } = null!;
+    [Parameter] public CallStore Store { get; set; } = null!;
+    [Parameter] public WebRtcBridge WebRtc { get; set; } = null!;
+
+    private string _selectedMicId = "";
+    private string _selectedCameraId = "";
+    private string _selectedResolution = "1280x720";
+    private int _selectedFps = 30;
+    private int _selectedBitrate = 2000;
+    private double _volume = 1.0;
+    private bool _pttEnabled;
+    private string _pttKey = "Space";
+
+    protected override void OnInitialized()
+    {
+        _selectedMicId = Store.SelectedMicId ?? "";
+        _selectedCameraId = Store.SelectedCameraId ?? "";
+        _selectedResolution = Store.SelectedResolution;
+        _selectedFps = Store.SelectedFps;
+        _selectedBitrate = Store.SelectedBitrate;
+        _volume = Store.Volume;
+        _pttEnabled = Store.PushToTalkEnabled;
+        _pttKey = Store.PushToTalkKey;
+    }
+
+    private async Task Apply()
+    {
+        Store.SelectedMicId = _selectedMicId;
+        Store.SelectedCameraId = _selectedCameraId;
+        Store.SelectedResolution = _selectedResolution;
+        Store.SelectedFps = _selectedFps;
+        Store.SelectedBitrate = _selectedBitrate;
+        Store.PushToTalkEnabled = _pttEnabled;
+        Store.PushToTalkKey = _pttKey;
+
+        await WebRtc.UpdateSettingsAsync(
+            string.IsNullOrEmpty(_selectedMicId) ? null : _selectedMicId,
+            string.IsNullOrEmpty(_selectedCameraId) ? null : _selectedCameraId,
+            _selectedResolution,
+            _selectedFps,
+            _selectedBitrate
+        );
+
+        // Apply push-to-talk setting
+        await WebRtc.SetPushToTalkAsync(_pttEnabled, _pttKey);
+
+        MudDialog.Close(DialogResult.Ok(true));
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private async Task RefreshDevices()
+    {
+        await WebRtc.EnumerateDevicesAsync();
+    }
+
+    private async Task OnVolumeChanged(double vol)
+    {
+        _volume = vol;
+        Store.Volume = vol;
+        await WebRtc.SetVolumeAsync(vol);
+    }
+
+    private async Task OnPttToggled(bool enabled)
+    {
+        _pttEnabled = enabled;
+        Store.PushToTalkEnabled = enabled;
+        Store.PushToTalkKey = _pttKey;
+        await WebRtc.SetPushToTalkAsync(enabled, _pttKey);
+    }
+}

@@ -4,42 +4,43 @@
 @inject ChatClientService Chat
 @inject NavigationManager Nav
 
-<div class="auth-container">
-    <div class="auth-card">
-        <h2>Create Account</h2>
+<MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Class="fill-screen">
+    <MudCard Style="width:420px;max-width:90vw" Elevation="4">
+        <MudCardHeader>
+            <MudText Typo="Typo.h5" Align="Align.Center" Style="width:100%;font-weight:600">Create Account</MudText>
+        </MudCardHeader>
+        <MudCardContent>
+            @if (!string.IsNullOrEmpty(_error))
+            {
+                <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
+            }
 
-        @if (!string.IsNullOrEmpty(_error))
-        {
-            <div class="error-text">@_error</div>
-        }
+            <MudStack Spacing="3">
+                <MudTextField @bind-Value="_userName" Label="Username" Variant="Variant.Outlined"
+                              Immediate="true" Disabled="_loading" />
 
-        <div class="form-group">
-            <label>Username</label>
-            <input @bind="_userName" placeholder="Choose a username" />
-        </div>
-        <div class="form-group">
-            <label>Display Name</label>
-            <input @bind="_displayName" placeholder="Your display name" />
-        </div>
-        <div class="form-group">
-            <label>Password</label>
-            <input type="password" @bind="_password" placeholder="Choose a password" />
-        </div>
-        <div class="form-group">
-            <label>Confirm Password</label>
-            <input type="password" @bind="_confirmPassword"
-                   @onkeydown="HandleKeyDown" placeholder="Confirm password" />
-        </div>
+                <MudTextField @bind-Value="_displayName" Label="Display Name" Variant="Variant.Outlined"
+                              Immediate="true" Disabled="_loading" />
 
-        <button class="btn-primary full-width" @onclick="HandleRegister" disabled="@_loading">
-            @(_loading ? "Creating account..." : "Register")
-        </button>
+                <MudTextField @bind-Value="_password" Label="Password" Variant="Variant.Outlined"
+                              InputType="InputType.Password" Immediate="true" Disabled="_loading" />
 
-        <p class="auth-switch">
-            Already have an account? <a href="/login">Sign In</a>
-        </p>
-    </div>
-</div>
+                <MudTextField @bind-Value="_confirmPassword" Label="Confirm Password" Variant="Variant.Outlined"
+                              InputType="InputType.Password" Immediate="true" Disabled="_loading"
+                              OnKeyDown="HandleKeyDown" />
+            </MudStack>
+        </MudCardContent>
+        <MudCardActions Class="d-flex flex-column px-4 pb-4">
+            <MudButton Variant="Variant.Filled" Color="Color.Primary" FullWidth="true"
+                       OnClick="HandleRegister" Disabled="_loading">
+                @(_loading ? "Creating account..." : "Register")
+            </MudButton>
+            <MudText Typo="Typo.body2" Align="Align.Center" Class="mt-3">
+                Already have an account? <MudLink Href="/login">Sign In</MudLink>
+            </MudText>
+        </MudCardActions>
+    </MudCard>
+</MudStack>
 
 @code {
     private string _userName = "";
