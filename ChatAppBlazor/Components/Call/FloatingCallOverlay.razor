@@ -1,14 +1,16 @@
 @implements IDisposable
 @inject CallStore Store
+@inject ChatRoomStore Rooms
 @inject WebRtcBridge WebRtc
 @inject NavigationManager Nav
+@inject IJSRuntime JS
 
 @* ─── Floating PiP overlay shown when in a call but NOT on the call room page ─── *@
 
-@if (Store.IsInCall && !_isOnCallRoom)
+@if (Store.IsInCall && (!_isOnCallRoom || Store.UseFloatingOverlayInActiveRoom))
 {
-    <div class="floating-call-overlay @(_minimized ? "minimized" : "")">
-        <div class="float-header">
+    <div id="floatingCallOverlay" class="floating-call-overlay @(_minimized ? "minimized" : "")">
+        <div id="floatingCallOverlayHeader" class="float-header">
             <MudText Typo="Typo.caption" Class="float-title">In Call</MudText>
             <MudStack Row Spacing="0">
                 <MudIconButton Icon="@(_minimized ? Icons.Material.Filled.OpenInFull : Icons.Material.Filled.CloseFullscreen)"
@@ -45,34 +47,60 @@
 @code {
     private bool _minimized;
     private bool _isOnCallRoom;
+    private bool? _lastFloatVideoVisible;
 
     protected override void OnInitialized()
     {
         Store.OnChange += OnStoreChanged;
+        Rooms.OnChange += OnRoomsChanged;
         Nav.LocationChanged += OnLocationChanged;
         CheckIfOnCallRoom();
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (Store.IsInCall && !_isOnCallRoom)
+        var shouldShowFloatVideo = Store.IsInCall
+            && (!_isOnCallRoom || Store.UseFloatingOverlayInActiveRoom)
+            && !_minimized;
+        if (!firstRender && _lastFloatVideoVisible == shouldShowFloatVideo)
+        {
+            return;
+        }
+
+        _lastFloatVideoVisible = shouldShowFloatVideo;
+        if (shouldShowFloatVideo)
         {
             try
             {
+                await JS.InvokeVoidAsync("overlayDrag.initFloatingCallDrag", "floatingCallOverlay", "floatingCallOverlayHeader");
                 await WebRtc.MoveVideoToFloatAsync("floatVideoContainer");
             }
             catch { }
+            return;
         }
+
+        try
+        {
+            await WebRtc.ClearFloatVideoAsync("floatVideoContainer");
+        }
+        catch { }
     }
 
     private void CheckIfOnCallRoom()
     {
         var relative = Nav.ToBaseRelativePath(Nav.Uri);
-        // We're "on the call room" if we're on the rooms page and the selected room matches
-        _isOnCallRoom = string.IsNullOrEmpty(relative) || relative == "/";
+        var pathOnly = relative.Split('?', '#')[0].Trim('/');
+        var isRoomsRoute = string.IsNullOrEmpty(pathOnly);
+        _isOnCallRoom = isRoomsRoute && Store.IsInCall && Rooms.SelectedRoomId == Store.ActiveRoomId;
     }
 
     private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e)
+    {
+        CheckIfOnCallRoom();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnRoomsChanged()
     {
         CheckIfOnCallRoom();
         InvokeAsync(StateHasChanged);
@@ -82,9 +110,26 @@
     private async Task ToggleCamera() => await WebRtc.ToggleCameraAsync();
     private void ToggleMinimize() => _minimized = !_minimized;
 
-    private void GoToCall()
+    private async Task GoToCall()
     {
-        Nav.NavigateTo("/");
+        var activeRoomId = Store.ActiveRoomId;
+        if (activeRoomId == null || activeRoomId == Guid.Empty)
+        {
+            Nav.NavigateTo("/");
+            return;
+        }
+
+        try
+        {
+            Store.SetUseFloatingOverlayInActiveRoom(false);
+            await Rooms.SelectRoomAsync(activeRoomId.Value, keepPreviousRoomSubscription: true);
+        }
+        catch
+        {
+            // Navigation still ensures ChatRooms attempts opening the call room from query.
+        }
+
+        Nav.NavigateTo($"/?roomId={Uri.EscapeDataString(activeRoomId.Value.ToString())}");
     }
 
     private async Task LeaveCall()
@@ -93,11 +138,16 @@
         await Store.LeaveCallAsync();
     }
 
-    private void OnStoreChanged() => InvokeAsync(StateHasChanged);
+    private void OnStoreChanged()
+    {
+        CheckIfOnCallRoom();
+        InvokeAsync(StateHasChanged);
+    }
 
     public void Dispose()
     {
         Store.OnChange -= OnStoreChanged;
+        Rooms.OnChange -= OnRoomsChanged;
         Nav.LocationChanged -= OnLocationChanged;
     }
 }

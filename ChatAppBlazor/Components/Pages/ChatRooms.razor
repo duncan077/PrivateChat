@@ -8,192 +8,158 @@
 @inject ApiClientService Api
 @inject IDialogService Dialogs
 @inject IJSRuntime JS
+@inject MembersPanelStore MembersPanel
 
 <div class="rooms-page">
-    @* ─── Left: Room list ─── *@
-    <div class="rooms-sidebar">
-        <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Class="pa-3">
-            <MudText Typo="Typo.subtitle1" Style="font-weight:600">Chat Rooms</MudText>
-            <MudButton Size="Size.Small" Variant="Variant.Outlined" Color="Color.Primary"
-                       StartIcon="@Icons.Material.Filled.Add" OnClick="() => _showCreateRoom = true">
-                New Room
-            </MudButton>
-        </MudStack>
+   
 
-        @if (_showCreateRoom)
-        {
-            <MudPaper Class="pa-3 mx-3 mb-2" Elevation="0" Style="background:var(--mud-palette-surface)">
-                <MudStack Spacing="2">
-                    <MudTextField @bind-Value="_newRoomName" Label="Room name" Variant="Variant.Outlined"
-                                  Dense="true" Immediate="true" />
-                    <MudTextField @bind-Value="_newRoomDesc" Label="Description" Variant="Variant.Outlined"
-                                  Dense="true" />
-                    <MudStack Row Spacing="2">
-                        <MudCheckBox @bind-Value="_newRoomVoice" Label="Voice" Dense="true" Size="Size.Small" Color="Color.Primary" />
-                        <MudCheckBox @bind-Value="_newRoomVideo" Label="Video" Dense="true" Size="Size.Small" Color="Color.Primary" />
-                    </MudStack>
-                    <MudStack Row Spacing="2" Justify="Justify.FlexEnd">
-                        <MudButton Size="Size.Small" OnClick="() => _showCreateRoom = false">Cancel</MudButton>
-                        <MudButton Size="Size.Small" Variant="Variant.Filled" Color="Color.Primary"
-                                   OnClick="CreateRoom" Disabled="@string.IsNullOrWhiteSpace(_newRoomName)">Create</MudButton>
-                    </MudStack>
-                </MudStack>
-            </MudPaper>
-        }
-
-        <MudList T="Guid" Dense="true" Class="room-list-items">
-            @foreach (var room in Store.Rooms)
-            {
-                <MudListItem T="Guid" Value="room.Id"
-                             OnClick="() => SelectRoom(room.Id)"
-                             Class="@(room.Id == Store.SelectedRoomId ? "mud-selected-item" : "")">
-                    <div class="room-list-entry">
-                        <MudIcon Icon="@(room.IsVideoEnabled ? Icons.Material.Filled.Videocam : room.IsVoiceEnabled ? Icons.Material.Filled.Mic : Icons.Material.Filled.Tag)"
-                                 Size="Size.Small" Class="mr-2" />
-                        <div class="room-list-text">
-                            <MudText Typo="Typo.body2" Style="font-weight:500">@room.Name</MudText>
-                            <MudText Typo="Typo.caption" Color="Color.Secondary">@room.MemberCount members</MudText>
-                        </div>
-                    </div>
-                </MudListItem>
-            }
-        </MudList>
-    </div>
-
-    @* ─── Center: Chat + Call ─── *@
+    @* Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Center: Chat + Call Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ *@
     <div class="rooms-main">
         @if (Store.SelectedRoomId != null)
         {
             @* Chat header *@
             <div class="chat-toolbar">
-                <MudStack Row AlignItems="AlignItems.Center" Class="pa-2 px-3" Style="width:100%">
-                    <MudText Typo="Typo.subtitle1" Style="font-weight:600">@Store.SelectedRoom?.Name</MudText>
-                    <MudSpacer />
-                    @if ((Store.SelectedRoom?.IsVoiceEnabled == true || Store.SelectedRoom?.IsVideoEnabled == true))
-                    {
-                        @if (_joining)
+                <div class="chat-toolbar-content">
+                    <div class="chat-toolbar-title-wrap">
+                        <MudText Typo="Typo.subtitle1" Style="font-weight:600">@Store.SelectedRoom?.Name</MudText>
+                    </div>
+
+                    <MudStack Row Wrap="Wrap.Wrap" AlignItems="AlignItems.Center" Spacing="1" Class="chat-toolbar-actions">
+                        @if ((Store.SelectedRoom?.IsVoiceEnabled == true || Store.SelectedRoom?.IsVideoEnabled == true))
                         {
-                            <MudButton StartIcon="@Icons.Material.Filled.HourglassTop" Size="Size.Small"
-                                       Variant="Variant.Filled" Color="Color.Warning"
-                                       Disabled="true">Joining...</MudButton>
+                            @if (_joining)
+                            {
+                                <MudButton StartIcon="@Icons.Material.Filled.HourglassTop" Size="Size.Small"
+                                           Variant="Variant.Filled" Color="Color.Warning"
+                                           Disabled="true">Joining...</MudButton>
+                            }
+                            else if (Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId)
+                            {
+                                <MudChip T="string" Size="Size.Small" Color="Color.Success" Variant="Variant.Filled">In Call</MudChip>
+                            }
+                            else
+                            {
+                                <MudButton StartIcon="@Icons.Material.Filled.Call" Size="Size.Small"
+                                           Variant="Variant.Filled" Color="Color.Success"
+                                           OnClick="JoinCall">Join Call</MudButton>
+                            }
                         }
-                        else if (Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId)
+                        @if (IsCallActiveForSelectedRoom)
                         {
-                            <MudChip T="string" Size="Size.Small" Color="Color.Success" Variant="Variant.Filled">In Call</MudChip>
+                            <MudIconButton Icon="@(Call.UseFloatingOverlayInActiveRoom ? Icons.Material.Filled.VideoCall : Icons.Material.Filled.Chat)"
+                                           Size="Size.Small"
+                                           Color="Color.Default"
+                                           title="@(Call.UseFloatingOverlayInActiveRoom ? "Show full call" : "Open chat and float call")"
+                                           OnClick="ToggleChatCallLayout" />
                         }
-                        else
+                        @if (Store.SelectedRoom?.OwnerId == Auth.CurrentUser?.Id)
                         {
-                            <MudButton StartIcon="@Icons.Material.Filled.Call" Size="Size.Small"
-                                       Variant="Variant.Filled" Color="Color.Success"
-                                       OnClick="JoinCall">Join Call</MudButton>
+                            <MudButton StartIcon="@Icons.Material.Filled.DeleteForever" Size="Size.Small"
+                                       Variant="Variant.Text" Color="Color.Error"
+                                       OnClick="DeleteSelectedRoom">Delete Room</MudButton>
                         }
-                    }
-                    @if (Store.SelectedRoom?.OwnerId == Auth.CurrentUser?.Id)
-                    {
-                        <MudButton StartIcon="@Icons.Material.Filled.DeleteForever" Size="Size.Small"
-                                   Variant="Variant.Text" Color="Color.Error"
-                                   OnClick="DeleteSelectedRoom">Delete Room</MudButton>
-                    }
-                    <MudIconButton Icon="@Icons.Material.Filled.People" Size="Size.Small"
-                                   OnClick="ToggleMembers" title="Members" />
-                </MudStack>
+                    </MudStack>
+                </div>
             </div>
 
             @* Active call panel (if in call for this room) *@
-            @if (Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId)
+            @if (IsInlineCallVisible)
             {
                 <ActiveCallPanel RoomId="Store.SelectedRoomId.Value" RoomName="@(Store.SelectedRoom?.Name ?? "")" />
             }
 
             @* Messages *@
-            <div class="chat-messages-area">
-                @foreach (var msg in Store.Messages)
-                {
-                    var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
-                    <div class="chat-msg @(isOwn ? "own" : "") @(msg.IsDeleted ? "deleted" : "")">
-                        <div class="chat-msg-header">
-                            <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
-                                @msg.SenderName
-                            </MudText>
-                            <MudText Typo="Typo.caption" Color="Color.Secondary">
-                                @msg.SentAt.ToLocalTime().ToString("HH:mm")
-                            </MudText>
-                            @if (isOwn || Store.CurrentUserRole >= UserRole.Moderator)
+            @if (IsChatVisible)
+            {
+                <div class="chat-messages-area @(IsInlineCallVisible ? "call-active" : "")">
+                    @foreach (var msg in Store.Messages)
+                    {
+                        var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
+                        <div class="chat-msg @(isOwn ? "own" : "") @(msg.IsDeleted ? "deleted" : "")">
+                            <div class="chat-msg-header">
+                                <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
+                                    @msg.SenderName
+                                </MudText>
+                                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                    @msg.SentAt.ToLocalTime().ToString("HH:mm")
+                                </MudText>
+                                @if (isOwn || Store.CurrentUserRole >= UserRole.Moderator)
+                                {
+                                    <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                                                   Color="Color.Error" OnClick="() => DeleteMessage(msg.Id)"
+                                                   Style="padding:2px" title="Delete" />
+                                }
+                            </div>
+                            @if (!msg.IsDeleted)
                             {
-                                <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
-                                               Color="Color.Error" OnClick="() => DeleteMessage(msg.Id)"
-                                               Style="padding:2px" title="Delete" />
+                                <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
+                                @if (msg.Attachments.Length > 0)
+                                {
+                                    <div class="chat-msg-attachments">
+                                        @foreach (var att in msg.Attachments)
+                                        {
+                                            <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
+                                        }
+                                    </div>
+                                }
+                            }
+                            else
+                            {
+                                <MudText Typo="Typo.body2" Color="Color.Secondary" Style="font-style:italic">
+                                    Message deleted
+                                </MudText>
                             }
                         </div>
-                        @if (!msg.IsDeleted)
-                        {
-                            <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
-                            @if (msg.Attachments.Length > 0)
+                    }
+                </div>
+
+                @* Input *@
+                <div class="chat-input-area @(IsInlineCallVisible ? "call-active" : "")">
+                    @if (_pendingAttachments.Count > 0)
+                    {
+                        <MudStack Row Wrap="Wrap.Wrap" Spacing="1" Class="mb-2">
+                            @foreach (var attachment in _pendingAttachments)
                             {
-                                <div class="chat-msg-attachments">
-                                    @foreach (var att in msg.Attachments)
-                                    {
-                                        <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
-                                    }
-                                </div>
+                                <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="pending-attachment-pill">
+                                    <MudChip T="string" Color="Color.Primary" Variant="Variant.Outlined">
+                                        @attachment.FileName
+                                    </MudChip>
+                                    <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                                                   Color="Color.Default" OnClick="() => RemovePendingAttachment(attachment.Id)" />
+                                </MudStack>
                             }
-                        }
-                        else
-                        {
-                            <MudText Typo="Typo.body2" Color="Color.Secondary" Style="font-style:italic">
-                                Message deleted
-                            </MudText>
-                        }
-                    </div>
-                }
-            </div>
+                        </MudStack>
+                    }
 
-            @* Input *@
-            <div class="chat-input-area">
-                @if (_pendingAttachments.Count > 0)
-                {
-                    <MudStack Row Wrap="Wrap.Wrap" Spacing="1" Class="mb-2">
-                        @foreach (var attachment in _pendingAttachments)
-                        {
-                            <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="pending-attachment-pill">
-                                <MudChip T="string" Color="Color.Primary" Variant="Variant.Outlined">
-                                    @attachment.FileName
-                                </MudChip>
-                                <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
-                                               Color="Color.Default" OnClick="() => RemovePendingAttachment(attachment.Id)" />
-                            </MudStack>
-                        }
-                    </MudStack>
-                }
+                    @if (!string.IsNullOrWhiteSpace(_uploadError))
+                    {
+                        <MudText Typo="Typo.caption" Color="Color.Error" Class="mb-2">@_uploadError</MudText>
+                    }
 
-                @if (!string.IsNullOrWhiteSpace(_uploadError))
-                {
-                    <MudText Typo="Typo.caption" Color="Color.Error" Class="mb-2">@_uploadError</MudText>
-                }
+                    <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-composer-row">
+                        <div class="file-picker-wrapper">
+                            <MudButton Variant="Variant.Text" Size="Size.Small" Class="file-picker-button"
+                                       Disabled="_uploading"
+                                       OnClick="TriggerFilePicker">
+                                <MudIcon Icon="@Icons.Material.Filled.AttachFile" Size="Size.Small" />
+                                <span class="ml-1">@(_uploading ? "Uploading..." : "Attach")</span>
+                            </MudButton>
+                            <InputFile @ref="_fileInput" OnChange="HandleAttachmentSelected" multiple
+                                       style="display:none" id="chatFileInput" />
+                        </div>
 
-                <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-composer-row">
-                    <div class="file-picker-wrapper">
-                        <MudButton Variant="Variant.Text" Size="Size.Small" Class="file-picker-button"
-                                   Disabled="_uploading"
-                                   OnClick="TriggerFilePicker">
-                            <MudIcon Icon="@Icons.Material.Filled.AttachFile" Size="Size.Small" />
-                            <span class="ml-1">@(_uploading ? "Uploading..." : "Attach")</span>
+                        <MudTextField @bind-Value="_messageText" Placeholder="Type a message..."
+                                      Variant="Variant.Outlined" Immediate="true" Dense="true"
+                                      OnKeyDown="HandleKeyDown"
+                                      Class="chat-input-field" />
+
+                        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SendMessage"
+                                   Disabled="@(_uploading || (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0))">
+                            Send
                         </MudButton>
-                        <InputFile @ref="_fileInput" OnChange="HandleAttachmentSelected" multiple
-                                   style="display:none" id="chatFileInput" />
-                    </div>
-
-                    <MudTextField @bind-Value="_messageText" Placeholder="Type a message..."
-                                  Variant="Variant.Outlined" Immediate="true" Dense="true"
-                                  OnKeyDown="HandleKeyDown"
-                                  Class="chat-input-field" />
-
-                    <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SendMessage"
-                               Disabled="@(_uploading || (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0))">
-                        Send
-                    </MudButton>
-                </MudStack>
-            </div>
+                    </MudStack>
+                </div>
+            }
         }
         else
         {
@@ -204,53 +170,101 @@
         }
     </div>
 
-    @* ─── Right: Members panel ─── *@
-    @if (_showMembers && Store.SelectedRoomId != null)
+    @* Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Right: Members panel Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ *@
+    @if (MembersPanel.IsVisible)
     {
-        <div class="members-sidebar">
-            <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Class="pa-3">
-                <MudText Typo="Typo.subtitle2" Style="font-weight:600">Members</MudText>
-                <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
-                               OnClick="ToggleMembers" />
+    <div class="members-sidebar">
+            <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Class="pa-3 members-sidebar-header">
+                <MudStack Spacing="0">
+                    <MudText Typo="Typo.subtitle2" Style="font-weight:600">Server Members</MudText>
+                    @if (Store.SelectedRoomId != null)
+                    {
+                        <MudText Typo="Typo.caption" Color="Color.Secondary">
+                            Room context: @Store.SelectedRoom?.Name
+                        </MudText>
+                    }
+                    else
+                    {
+                        <MudText Typo="Typo.caption" Color="Color.Secondary">
+                            Select a room to move users or kick from chat.
+                        </MudText>
+                    }
+                </MudStack>
+
             </MudStack>
 
-            <MudList T="Guid" Dense="true">
-                @foreach (var member in Store.Members)
+            @if (Call.IsInCall)
+            {
+                <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Class="px-3 pb-2 members-sidebar-filter">
+                    <MudText Typo="Typo.caption" Color="Color.Secondary">In-call filter</MudText>
+                    <MudSwitch T="bool"
+                               Value="_showAllMembersDuringCall"
+                               ValueChanged="OnShowAllMembersDuringCallChanged"
+                               Color="Color.Primary">
+                        Show all
+                    </MudSwitch>
+                </MudStack>
+            }
+            <MudList T="Guid" Dense="true" Class="members-list">
+                @foreach (var member in GetVisibleMembers())
                 {
-                    <MudListItem T="Guid" Value="member.UserId">
-                        <div class="member-entry">
-                            <MudStack Row AlignItems="AlignItems.Center" Spacing="2">
+                    var roomMember = Store.GetSelectedRoomMember(member.UserId);
+                    var isCurrentUser = member.UserId == Auth.CurrentUser?.Id;
+                    var canModerateTarget = CanModerateTarget(member.UserId);
+
+                    <MudListItem T="Guid" Value="member.UserId" Class="member-list-item">
+                        <div class="member-entry member-entry-clickable"
+                             title="Double-click to send a private message"
+                             @ondblclick="() => OpenPrivateMessage(member)">
+                            <MudStack Row AlignItems="AlignItems.Center" Spacing="2" Class="member-entry-main">
                                 <MudAvatar Size="Size.Small" Color="Color.Primary">
-                                    @member.DisplayName[0]
+                                    @GetMemberInitial(member.DisplayName, member.UserName)
                                 </MudAvatar>
-                                <div>
-                                    <MudText Typo="Typo.body2">
-                                        @member.DisplayName
+                                <div class="member-entry-text">
+                                    <MudText Typo="Typo.body2" Class="member-name-row">
+                                        <span class="member-name-label">@member.DisplayName</span>
                                         @if (member.IsOnline)
                                         {
-                                            <MudIcon Icon="@Icons.Material.Filled.Circle" Size="Size.Small"
-                                                     Color="Color.Success" Style="font-size:8px;vertical-align:middle;margin-left:4px" />
+                                            <MudIcon Icon="@Icons.Material.Filled.Circle"
+                                                     Size="Size.Small"
+                                                     Color="Color.Success"
+                                                     title="Online"
+                                                     Class="member-status-dot" />
+                                        }
+                                        @if (IsMemberConnectedToActiveCall(member.UserId))
+                                        {
+                                            <MudIcon Icon="@Icons.Material.Filled.Videocam"
+                                                     Size="Size.Small"
+                                                     Color="Color.Info"
+                                                     title="Connected to call"
+                                                     Class="member-status-call" />
                                         }
                                     </MudText>
-                                    <MudText Typo="Typo.caption" Color="Color.Secondary">@member.Role</MudText>
+                                    <MudText Typo="Typo.caption" Color="Color.Secondary" Class="member-meta-row">
+                                        <span>Global role: @member.Role</span>
+                                        @if (Store.SelectedRoomId != null)
+                                        {
+                                            <span> Â· @(roomMember != null ? "In selected room" : "Not in selected room")</span>
+                                        }
+                                    </MudText>
                                 </div>
                             </MudStack>
 
-                            @if (Store.CurrentUserRole >= UserRole.Moderator && member.UserId != Auth.CurrentUser?.Id)
+                            @if (!isCurrentUser)
                             {
-                                <MudStack Row Spacing="1">
-                                    <MudButton Size="Size.Small" Variant="Variant.Text" Color="Color.Error"
-                                               OnClick="() => KickUser(member.UserId)">Kick</MudButton>
-                                    @if (Store.CurrentUserRole >= UserRole.Admin)
+                                <MudStack Row AlignItems="AlignItems.Center" Spacing="0" Class="member-entry-actions">
+                                    <MudIconButton Icon="@Icons.Material.Filled.MarkChatUnread"
+                                                   Size="Size.Small"
+                                                   Color="Color.Primary"
+                                                   title="Send private message"
+                                                   OnClick="() => OpenPrivateMessage(member)" />
+                                    @if (canModerateTarget)
                                     {
-                                        <MudSelect T="UserRole" Value="member.Role" Dense="true"
-                                                   Variant="Variant.Text" Style="width:90px;font-size:0.75rem"
-                                                   ValueChanged="(role) => ChangeRole(member.UserId, role)">
-                                            @foreach (var role in Enum.GetValues<UserRole>())
-                                            {
-                                                <MudSelectItem T="UserRole" Value="role">@role</MudSelectItem>
-                                            }
-                                        </MudSelect>
+                                        <MudIconButton Icon="@Icons.Material.Filled.AdminPanelSettings"
+                                                       Size="Size.Small"
+                                                       Color="Color.Secondary"
+                                                       title="Moderation settings"
+                                                       OnClick="() => OpenModerationPopup(member.UserId)" />
                                     }
                                 </MudStack>
                             }
@@ -258,6 +272,153 @@
                     </MudListItem>
                 }
             </MudList>
+    </div>
+    }
+
+    @if (_showCreateRoom)
+    {
+        <div class="create-room-overlay" @onclick="CancelCreateRoom">
+            <MudPaper Class="create-room-sheet" Elevation="8" @onclick:stopPropagation="true">
+                <MudText Typo="Typo.h6">Create Room</MudText>
+                <MudText Typo="Typo.caption" Color="Color.Secondary">Set up a room for your team.</MudText>
+
+                <MudStack Spacing="2" Class="mt-3">
+                    <MudTextField @bind-Value="_newRoomName"
+                                  Label="Room Name"
+                                  Variant="Variant.Outlined"
+                                  Immediate="true"
+                                  Required="true" />
+
+                    <MudTextField @bind-Value="_newRoomDesc"
+                                  Label="Description (optional)"
+                                  Variant="Variant.Outlined"
+                                  Lines="2" />
+
+                    <MudSwitch T="bool" @bind-Value="_newRoomVoice" Color="Color.Primary">
+                        Enable Voice
+                    </MudSwitch>
+
+                    <MudSwitch T="bool" @bind-Value="_newRoomVideo" Color="Color.Primary">
+                        Enable Video
+                    </MudSwitch>
+
+                    @if (!string.IsNullOrWhiteSpace(Store.Error))
+                    {
+                        <MudAlert Severity="Severity.Error" Dense="true">@Store.Error</MudAlert>
+                    }
+
+                    <MudStack Row Justify="Justify.FlexEnd" Spacing="1" Class="mt-1">
+                        <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="CancelCreateRoom">Cancel</MudButton>
+                        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="CreateRoom"
+                                   Disabled="string.IsNullOrWhiteSpace(_newRoomName)">
+                            Create
+                        </MudButton>
+                    </MudStack>
+                </MudStack>
+            </MudPaper>
+        </div>
+    }
+
+    @if (GetModerationTarget() is { } moderationTarget)
+    {
+        var canModerateTarget = CanModerateTarget(moderationTarget.UserId);
+        var canManageRoles = CanManageRoles(moderationTarget.UserId);
+        var canKickFromChat = CanKickFromChat(moderationTarget.UserId);
+        var canKickFromCall = CanKickFromCall(moderationTarget.UserId);
+        var moveTargets = GetMoveTargetRooms(moderationTarget.UserId);
+
+        <div class="moderation-popup-overlay" @onclick="CloseModerationPopup">
+            <MudPaper Class="moderation-popup-sheet" Elevation="10" @onclick:stopPropagation="true">
+                <div class="moderation-popup-header">
+                    <MudStack Spacing="0">
+                        <MudText Typo="Typo.h6">Moderation</MudText>
+                        <MudText Typo="Typo.caption" Color="Color.Secondary">
+                            @moderationTarget.DisplayName (@moderationTarget.Role)
+                        </MudText>
+                    </MudStack>
+                    <MudIconButton Icon="@Icons.Material.Filled.Close"
+                                   Color="Color.Default"
+                                   Size="Size.Small"
+                                   OnClick="CloseModerationPopup" />
+                </div>
+
+                @if (!canModerateTarget)
+                {
+                    <MudAlert Severity="Severity.Warning" Dense="true">
+                        You can no longer moderate this user.
+                    </MudAlert>
+                }
+                else
+                {
+                    <MudStack Spacing="2">
+                        <MudStack Row Wrap="Wrap.Wrap" Spacing="1">
+                            @if (canKickFromCall)
+                            {
+                                <MudButton Size="Size.Small"
+                                           Variant="Variant.Outlined"
+                                           Color="Color.Warning"
+                                           OnClick="() => KickUserFromCallAndClose(moderationTarget.UserId)">
+                                    Kick From Call
+                                </MudButton>
+                            }
+
+                            @if (canKickFromChat)
+                            {
+                                <MudButton Size="Size.Small"
+                                           Variant="Variant.Outlined"
+                                           Color="Color.Error"
+                                           OnClick="() => KickUserFromChatAndClose(moderationTarget.UserId)">
+                                    Kick From Chat
+                                </MudButton>
+                            }
+                        </MudStack>
+
+                        @if (canManageRoles)
+                        {
+                            <MudStack Spacing="1">
+                                <MudText Typo="Typo.caption" Color="Color.Secondary">Global role</MudText>
+                                <MudSelect T="UserRole"
+                                           Value="moderationTarget.Role"
+                                           Dense="true"
+                                           Variant="Variant.Outlined"
+                                           ValueChanged="(role) => ChangeRole(moderationTarget.UserId, role)">
+                                    @foreach (var role in GetAssignableRoles())
+                                    {
+                                        <MudSelectItem T="UserRole" Value="role">@role</MudSelectItem>
+                                    }
+                                </MudSelect>
+                            </MudStack>
+                        }
+
+                        @if (moveTargets.Count > 0)
+                        {
+                            <MudStack Spacing="1">
+                                <MudText Typo="Typo.caption" Color="Color.Secondary">Move to room</MudText>
+                                <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Wrap="Wrap.Wrap">
+                                    <MudSelect T="Guid"
+                                               Dense="true"
+                                               Variant="Variant.Outlined"
+                                               Value="GetMoveTargetRoomId(moderationTarget.UserId)"
+                                               ValueChanged="(target) => SetMoveTargetRoom(moderationTarget.UserId, target)"
+                                               Style="min-width:160px">
+                                        @foreach (var targetRoom in moveTargets)
+                                        {
+                                            <MudSelectItem T="Guid" Value="targetRoom.Id">@targetRoom.Name</MudSelectItem>
+                                        }
+                                    </MudSelect>
+
+                                    <MudButton Size="Size.Small"
+                                               Variant="Variant.Filled"
+                                               Color="Color.Primary"
+                                               OnClick="() => MoveUserAndClose(moderationTarget.UserId)">
+                                        Move User
+                                    </MudButton>
+                                </MudStack>
+                            </MudStack>
+                        }
+                    </MudStack>
+                }
+            </MudPaper>
         </div>
     }
 </div>
@@ -265,8 +426,9 @@
 @code {
     private string _messageText = "";
     private bool _showCreateRoom;
-    private bool _showMembers;
     private bool _joining;
+    private bool _showAllMembersDuringCall = true;
+    private bool _lastIsInAnyCall;
     private string _newRoomName = "";
     private string? _newRoomDesc;
     private bool _newRoomVoice;
@@ -274,11 +436,26 @@
     private bool _uploading;
     private string? _uploadError;
     private readonly List<AttachmentInfo> _pendingAttachments = [];
+    private readonly Dictionary<Guid, Guid> _moveTargetsByUserId = [];
+    private Guid? _moderationTargetUserId;
     private const long MaxUploadBytes = 50L * 1024 * 1024;
     private InputFile? _fileInput;
 
     // Track call state to avoid re-rendering on every mute/PTT/camera change
     private bool _lastCallActive;
+    private bool _lastUseFloatingOverlayInActiveRoom;
+    private string _lastParticipantDirectorySignature = string.Empty;
+    private string _lastCallParticipantsSignature = string.Empty;
+    private bool IsCallActiveForSelectedRoom => Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId;
+    private bool IsInlineCallVisible => IsCallActiveForSelectedRoom && !Call.UseFloatingOverlayInActiveRoom;
+    private bool IsChatVisible => Store.SelectedRoomId != null && (!IsCallActiveForSelectedRoom || Call.UseFloatingOverlayInActiveRoom);
+    private Guid? _lastAutoOpenedRoomId;
+
+    [SupplyParameterFromQuery(Name = "roomId")]
+    public Guid? RequestedRoomId { get; set; }
+
+    [SupplyParameterFromQuery(Name = "createRoom")]
+    public int? RequestedCreateRoom { get; set; }
 
     protected override async Task OnInitializedAsync()
     {
@@ -286,10 +463,36 @@
 
         Store.OnChange += OnStoreChanged;
         Call.OnChange += OnCallChanged;
+        MembersPanel.OnChange += OnMembersPanelChanged;
+        _lastIsInAnyCall = Call.IsInCall;
         await Store.LoadRoomsAsync();
+        await Store.LoadServerMembersAsync();
+        await TryOpenRequestedRoomAsync();
     }
 
-    private async Task SelectRoom(Guid roomId) => await Store.SelectRoomAsync(roomId);
+    protected override async Task OnParametersSetAsync()
+    {
+        await TryOpenRequestedRoomAsync();
+
+        if (RequestedCreateRoom == 1)
+        {
+            OpenCreateRoomDialogFromQuery();
+        }
+    }
+
+    private async Task SelectRoom(Guid roomId)
+    {
+        if (Store.SelectedRoomId == roomId) return;
+
+        var previousRoomId = Store.SelectedRoomId;
+        var keepPreviousRoomSubscription =
+            previousRoomId != null &&
+            Call.IsInCall &&
+            Call.ActiveRoomId == previousRoomId;
+
+        await Store.SelectRoomAsync(roomId, keepPreviousRoomSubscription);
+        await Call.RefreshRoomParticipantsAsync(roomId);
+    }
 
     private async Task SendMessage()
     {
@@ -304,6 +507,13 @@
     private async Task DeleteMessage(Guid messageId) => await Store.DeleteMessageAsync(messageId);
 
     private async Task KickUser(Guid userId) => await Store.KickUserAsync(userId);
+    private async Task KickUserFromCall(Guid userId) => await Store.KickUserFromCurrentCallAsync(userId);
+    private async Task MoveUser(Guid userId)
+    {
+        var targetRoomId = GetMoveTargetRoomId(userId);
+        if (targetRoomId == Guid.Empty) return;
+        await Store.MoveUserAsync(userId, targetRoomId);
+    }
 
     private async Task ChangeRole(Guid userId, UserRole role)
     {
@@ -314,11 +524,38 @@
     {
         if (string.IsNullOrWhiteSpace(_newRoomName)) return;
         await Store.CreateRoomAsync(_newRoomName, _newRoomDesc, _newRoomVoice, _newRoomVideo);
+
+        if (!string.IsNullOrWhiteSpace(Store.Error))
+            return;
+
+        CancelCreateRoom();
+    }
+
+    private void CancelCreateRoom()
+    {
         _showCreateRoom = false;
         _newRoomName = "";
         _newRoomDesc = null;
         _newRoomVoice = false;
         _newRoomVideo = false;
+    }
+
+    private void OpenCreateRoomDialogFromQuery()
+    {
+        _showCreateRoom = true;
+        ClearCreateRoomQuery();
+    }
+
+    private void ClearCreateRoomQuery()
+    {
+        var uri = Nav.ToAbsoluteUri(Nav.Uri);
+        if (!uri.AbsolutePath.Equals("/", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (!uri.Query.Contains("createRoom=", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        Nav.NavigateTo("/", replace: true);
     }
 
     private async Task JoinCall()
@@ -330,8 +567,22 @@
 
         try
         {
+            var selectedRoomId = Store.SelectedRoomId.Value;
+            var isSwitchingRooms = Call.IsInCall && Call.ActiveRoomId != selectedRoomId;
+            if (isSwitchingRooms)
+            {
+                try
+                {
+                    await WebRtc.StopAsync();
+                }
+                catch
+                {
+                    // Continue and let JoinCallAsync replace server-side call state.
+                }
+            }
+
             // 1. Get Janus session from server
-            var session = await Call.JoinCallAsync(Store.SelectedRoomId.Value);
+            var session = await Call.JoinCallAsync(selectedRoomId);
             if (session == null)
             {
                 _joining = false;
@@ -346,11 +597,17 @@
                 session.ServerBaseUrl,
                 Auth.Token!,
                 Auth.CurrentUser!.Id.ToString(),
+                !string.IsNullOrWhiteSpace(Auth.CurrentUser.DisplayName)
+                    ? Auth.CurrentUser.DisplayName
+                    : Auth.CurrentUser.UserName,
+                BuildParticipantDirectory(),
                 session.IceServers
             );
 
             // Re-apply persisted call preferences after each fresh init.
             await WebRtc.ApplyStoredSettingsAsync();
+            await SyncParticipantDirectoryAsync(force: true);
+            Call.SetUseFloatingOverlayInActiveRoom(false);
         }
         catch (Exception ex)
         {
@@ -362,13 +619,115 @@
         }
     }
 
-    private void ToggleMembers() => _showMembers = !_showMembers;
+    private void ToggleChatCallLayout()
+    {
+        if (!IsCallActiveForSelectedRoom) return;
+        Call.SetUseFloatingOverlayInActiveRoom(!Call.UseFloatingOverlayInActiveRoom);
+    }
+
+    private void OnShowAllMembersDuringCallChanged(bool showAllMembers)
+    {
+        _showAllMembersDuringCall = showAllMembers;
+    }
+
+    private IEnumerable<ServerMemberInfo> GetVisibleMembers()
+    {
+        var members = Store.ServerMembers.AsEnumerable();
+        if (Call.IsInCall && !_showAllMembersDuringCall)
+        {
+            members = members.Where(m => IsMemberConnectedToActiveCall(m.UserId));
+        }
+
+        return members
+            .OrderBy(m => m.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(m => m.UserName, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private ServerMemberInfo? GetModerationTarget()
+    {
+        if (_moderationTargetUserId == null)
+        {
+            return null;
+        }
+
+        return Store.ServerMembers.FirstOrDefault(member => member.UserId == _moderationTargetUserId.Value);
+    }
+
+    private void OpenModerationPopup(Guid userId)
+    {
+        _moderationTargetUserId = userId;
+        _ = GetMoveTargetRoomId(userId);
+    }
+
+    private void CloseModerationPopup()
+    {
+        _moderationTargetUserId = null;
+    }
+
+    private bool CanModerateTarget(Guid userId)
+    {
+        if (userId == Guid.Empty || userId == Auth.CurrentUser?.Id)
+        {
+            return false;
+        }
+
+        if (Store.CurrentUserRole < UserRole.Moderator)
+        {
+            return false;
+        }
+
+        var targetMember = Store.ServerMembers.FirstOrDefault(member => member.UserId == userId);
+        return targetMember != null && targetMember.Role < Store.CurrentUserRole;
+    }
+
+    private bool CanManageRoles(Guid userId)
+        => CanModerateTarget(userId) && Store.CurrentUserRole >= UserRole.Admin;
+
+    private bool CanKickFromChat(Guid userId)
+        => CanModerateTarget(userId) && Store.SelectedRoomId != null && Store.IsUserInSelectedRoom(userId);
+
+    private bool CanKickFromCall(Guid userId)
+        => CanModerateTarget(userId) && IsMemberConnectedToRoomCall(userId);
+
+    private async Task KickUserFromChatAndClose(Guid userId)
+    {
+        await KickUser(userId);
+        CloseModerationPopup();
+    }
+
+    private async Task KickUserFromCallAndClose(Guid userId)
+    {
+        await KickUserFromCall(userId);
+        CloseModerationPopup();
+    }
+
+    private async Task MoveUserAndClose(Guid userId)
+    {
+        await MoveUser(userId);
+        CloseModerationPopup();
+    }
+
+    private Task OpenPrivateMessage(ServerMemberInfo member)
+    {
+        if (member.UserId == Guid.Empty || member.UserId == Auth.CurrentUser?.Id) return Task.CompletedTask;
+
+        var userName = string.IsNullOrWhiteSpace(member.UserName)
+            ? $"user_{member.UserId.ToString()[..8]}"
+            : member.UserName.Trim();
+        var displayName = string.IsNullOrWhiteSpace(member.DisplayName)
+            ? userName
+            : member.DisplayName.Trim();
+
+        var dmTarget = $"/dm?userId={member.UserId:D}&userName={Uri.EscapeDataString(userName)}&displayName={Uri.EscapeDataString(displayName)}";
+        Nav.NavigateTo(dmTarget);
+        return Task.CompletedTask;
+    }
 
     private async Task TriggerFilePicker()
     {
         try
         {
-            // Use JS to click the hidden file input — more reliable in MAUI Hybrid WebView2
+            // Use JS to click the hidden file input; this is more reliable in MAUI Hybrid WebView2.
             await JS.InvokeVoidAsync("eval", "document.getElementById('chatFileInput')?.click()");
         }
         catch (Exception ex)
@@ -452,28 +811,254 @@
         _pendingAttachments.RemoveAll(a => a.Id == attachmentId);
     }
 
-    private void OnStoreChanged() => InvokeAsync(StateHasChanged);
+    private void OnStoreChanged()
+    {
+        if (_moderationTargetUserId != null && !Store.ServerMembers.Any(member => member.UserId == _moderationTargetUserId.Value))
+        {
+            _moderationTargetUserId = null;
+        }
+
+        _ = SyncParticipantDirectoryAsync();
+        InvokeAsync(StateHasChanged);
+    }
 
     /// <summary>
-    /// Only re-render ChatRooms when the call active state actually changes
-    /// (join/leave call). Ignore mute/PTT/camera/screenshare changes — those
-    /// are handled by ActiveCallPanel's own subscription. This prevents the
-    /// frequent re-renders from disrupting the MudTextField input binding.
+    /// Re-render ChatRooms when call active state changes OR when the selected room's
+    /// connected call participants change. Ignore mute/PTT/camera/screenshare toggles.
     /// </summary>
     private void OnCallChanged()
     {
+        var wasInAnyCall = _lastIsInAnyCall;
+        _lastIsInAnyCall = Call.IsInCall;
+
+        if (!wasInAnyCall && Call.IsInCall)
+        {
+            _showAllMembersDuringCall = false;
+        }
+
+        if (wasInAnyCall && !Call.IsInCall)
+        {
+            _ = StopWebRtcSilentlyAsync();
+        }
+
         var isActive = Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId;
-        if (isActive != _lastCallActive)
+        var floatingModeChanged = _lastUseFloatingOverlayInActiveRoom != Call.UseFloatingOverlayInActiveRoom;
+        if (floatingModeChanged)
+        {
+            _lastUseFloatingOverlayInActiveRoom = Call.UseFloatingOverlayInActiveRoom;
+        }
+        var participantsSignature = BuildCallParticipantsSignature();
+        var participantsChanged = !string.Equals(_lastCallParticipantsSignature, participantsSignature, StringComparison.Ordinal);
+
+        if (participantsChanged)
+        {
+            _lastCallParticipantsSignature = participantsSignature;
+        }
+
+        if (isActive != _lastCallActive || participantsChanged || floatingModeChanged)
         {
             _lastCallActive = isActive;
+            if (!isActive)
+            {
+                _lastParticipantDirectorySignature = string.Empty;
+                _lastUseFloatingOverlayInActiveRoom = false;
+            }
+            _ = SyncParticipantDirectoryAsync(force: true);
             InvokeAsync(StateHasChanged);
         }
+    }
+
+    private async Task StopWebRtcSilentlyAsync()
+    {
+        try
+        {
+            await WebRtc.StopAsync();
+        }
+        catch
+        {
+            // Ignore teardown races when call state changes remotely.
+        }
+    }
+
+    private string BuildCallParticipantsSignature()
+    {
+        if (Store.SelectedRoomId == null)
+        {
+            return string.Empty;
+        }
+
+        var roomId = Store.SelectedRoomId.Value;
+        var ids = Call.GetRoomParticipants(roomId)
+            .Where(id => id != Guid.Empty)
+            .Distinct()
+            .OrderBy(id => id)
+            .Select(id => id.ToString("D"));
+
+        return string.Join("|", ids);
+    }
+
+    private bool IsMemberConnectedToActiveCall(Guid userId)
+    {
+        if (!Call.IsInCall || Call.ActiveRoomId == null) return false;
+        if (userId == Guid.Empty) return false;
+
+        var roomId = Call.ActiveRoomId.Value;
+        if (userId == Auth.CurrentUser?.Id)
+        {
+            return true;
+        }
+
+        return Call.IsUserConnectedInRoom(roomId, userId);
+    }
+
+    private bool IsMemberConnectedToRoomCall(Guid userId)
+    {
+        if (Store.SelectedRoomId == null) return false;
+        if (userId == Guid.Empty) return false;
+
+        var roomId = Store.SelectedRoomId.Value;
+        if (userId == Auth.CurrentUser?.Id)
+        {
+            return (Call.IsInCall && Call.ActiveRoomId == roomId) || Call.IsUserConnectedInRoom(roomId, userId);
+        }
+
+        return Call.IsUserConnectedInRoom(roomId, userId);
+    }
+
+    private string GetMemberInitial(string? displayName, string? userName)
+    {
+        if (!string.IsNullOrWhiteSpace(displayName))
+            return displayName.Trim()[0].ToString().ToUpperInvariant();
+        if (!string.IsNullOrWhiteSpace(userName))
+            return userName.Trim()[0].ToString().ToUpperInvariant();
+        return "?";
+    }
+
+    private IReadOnlyList<UserRole> GetAssignableRoles()
+    {
+        return Enum.GetValues<UserRole>()
+            .Where(role => role != UserRole.Owner && role < Store.CurrentUserRole)
+            .ToArray();
+    }
+
+    private List<ChatRoomInfo> GetMoveTargetRooms(Guid userId)
+    {
+        if (Store.SelectedRoomId == null) return [];
+        if (!Store.IsUserInSelectedRoom(userId)) return [];
+
+        return Store.Rooms
+            .Where(room => room.Id != Store.SelectedRoomId.Value)
+            .OrderBy(room => room.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private Guid GetMoveTargetRoomId(Guid userId)
+    {
+        var moveTargets = GetMoveTargetRooms(userId);
+        if (moveTargets.Count == 0)
+        {
+            return Guid.Empty;
+        }
+
+        if (_moveTargetsByUserId.TryGetValue(userId, out var selectedTarget)
+            && moveTargets.Any(room => room.Id == selectedTarget))
+        {
+            return selectedTarget;
+        }
+
+        var defaultTarget = moveTargets[0].Id;
+        _moveTargetsByUserId[userId] = defaultTarget;
+        return defaultTarget;
+    }
+
+    private void SetMoveTargetRoom(Guid userId, Guid targetRoomId)
+    {
+        _moveTargetsByUserId[userId] = targetRoomId;
+    }
+
+    private Dictionary<string, string> BuildParticipantDirectory()
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var member in Store.ServerMembers)
+        {
+            if (member.UserId == Guid.Empty) continue;
+            var name = ResolveMemberDisplayName(member.DisplayName, member.UserName, member.UserId);
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            map[member.UserId.ToString()] = name;
+        }
+
+        if (Auth.CurrentUser != null)
+        {
+            var selfName = ResolveMemberDisplayName(
+                Auth.CurrentUser.DisplayName,
+                Auth.CurrentUser.UserName,
+                Auth.CurrentUser.Id);
+            if (!string.IsNullOrWhiteSpace(selfName))
+            {
+                map[Auth.CurrentUser.Id.ToString()] = selfName;
+            }
+        }
+
+        return map;
+    }
+
+    private static string ResolveMemberDisplayName(string? displayName, string? userName, Guid userId)
+    {
+        if (!string.IsNullOrWhiteSpace(displayName)) return displayName.Trim();
+        if (!string.IsNullOrWhiteSpace(userName)) return userName.Trim();
+        return $"User {userId.ToString()[..8]}";
+    }
+
+    private async Task SyncParticipantDirectoryAsync(bool force = false)
+    {
+        if (!(Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId))
+            return;
+
+        var map = BuildParticipantDirectory();
+        var signature = string.Join("|", map
+            .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => $"{x.Key}:{x.Value}"));
+
+        if (!force && signature == _lastParticipantDirectorySignature)
+            return;
+
+        _lastParticipantDirectorySignature = signature;
+        try
+        {
+            await WebRtc.UpdateParticipantDirectoryAsync(map);
+        }
+        catch
+        {
+            // Ignore transient JS interop errors during navigation/render transitions.
+        }
+    }
+
+    private async Task TryOpenRequestedRoomAsync()
+    {
+        if (RequestedRoomId == null || RequestedRoomId == Guid.Empty) return;
+        if (Store.SelectedRoomId == RequestedRoomId && _lastAutoOpenedRoomId == RequestedRoomId) return;
+
+        var targetRoomId = RequestedRoomId.Value;
+        if (Store.Rooms.Length == 0)
+        {
+            await Store.LoadRoomsAsync();
+        }
+
+        if (!Store.Rooms.Any(r => r.Id == targetRoomId))
+            return;
+
+        await SelectRoom(targetRoomId);
+        _lastAutoOpenedRoomId = targetRoomId;
     }
 
     public void Dispose()
     {
         Store.OnChange -= OnStoreChanged;
         Call.OnChange -= OnCallChanged;
+        MembersPanel.OnChange -= OnMembersPanelChanged;
     }
+
+    private void OnMembersPanelChanged() => InvokeAsync(StateHasChanged);
 }
 

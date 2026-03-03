@@ -53,12 +53,14 @@ public class JanusController : ControllerBase
                 return BadRequest("Missing 'body' field");
 
             JsonElement? jsepEl = message.TryGetProperty("jsep", out var j) ? j : null;
+            var requireJsep = jsepEl.HasValue;
 
             var result = await _janus.SendPluginMessageAndWaitAsync(
                 sessionId,
                 handleId,
                 bodyEl,
-                jsepEl.HasValue ? jsepEl.Value : null);
+                jsepEl.HasValue ? jsepEl.Value : null,
+                requireJsep: requireJsep);
 
             return Content(result.GetRawText(), "application/json");
         }
@@ -157,6 +159,11 @@ public class JanusController : ControllerBase
                 rawJson.Length > 300 ? rawJson[..300] + "..." : rawJson);
 
             return Content(rawJson, "application/json");
+        }
+        catch (JanusService.JanusSessionNotFoundException ex)
+        {
+            _logger.LogWarning("Poll session {Session} not found in Janus", ex.SessionId);
+            return NotFound(new { error = $"Janus session {ex.SessionId} not found (458)" });
         }
         catch (Exception ex)
         {

@@ -1,6 +1,5 @@
 @implements IAsyncDisposable
 @inject CallStore Store
-@inject AuthStateProvider Auth
 @inject WebRtcBridge WebRtc
 @inject IDialogService DialogService
 
@@ -51,6 +50,7 @@
                        Variant="Variant.Filled"
                        OnClick="LeaveCall" />
     </MudStack>
+
 </div>
 
 @code {
@@ -61,6 +61,23 @@
     {
         Store.OnChange += OnStoreChanged;
         Store.OnWebRtcSignal += OnWebRtcSignal;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+        {
+            return;
+        }
+
+        try
+        {
+            await WebRtc.RebindVideoElementsAsync();
+        }
+        catch
+        {
+            // Ignore transient JS interop errors while navigating.
+        }
     }
 
     private async Task LeaveCall()

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Linq;
 using Microsoft.JSInterop;
 using ChatAppBlazor.Services;
 using ChatAppBlazor.State;
@@ -20,8 +21,13 @@ public class WebRtcBridge : IAsyncDisposable
     private DotNetObjectReference<WebRtcBridge>? _dotNetRef;
     private string? _authToken;
     private string? _userId;
+    private string? _userDisplayName;
+    private Dictionary<string, string> _participantDirectory = new(StringComparer.OrdinalIgnoreCase);
 
-    public WebRtcBridge(IJSRuntime js, CallStore callStore, GrpcChannelProvider channelProvider)
+    public WebRtcBridge(
+        IJSRuntime js,
+        CallStore callStore,
+        GrpcChannelProvider channelProvider)
     {
         _js = js;
         _callStore = callStore;
@@ -41,12 +47,16 @@ public class WebRtcBridge : IAsyncDisposable
         string serverBaseUrl,
         string authToken,
         string userId,
+        string userDisplayName,
+        IReadOnlyDictionary<string, string>? participantDirectory,
         string iceServers)
     {
         var resolvedServerBaseUrl = ResolveServerBaseUrl(serverBaseUrl);
 
         _authToken = authToken;
         _userId = userId;
+        _userDisplayName = userDisplayName;
+        _participantDirectory = NormalizeParticipantDirectory(participantDirectory);
 
         _dotNetRef?.Dispose();
         _dotNetRef = DotNetObjectReference.Create(this);
@@ -58,6 +68,8 @@ public class WebRtcBridge : IAsyncDisposable
             serverBaseUrl = resolvedServerBaseUrl,
             authToken,
             userId,
+            userDisplayName,
+            participantDirectory = _participantDirectory,
             iceServers,
             dotNetRef = _dotNetRef
         });
@@ -98,7 +110,14 @@ public class WebRtcBridge : IAsyncDisposable
             fromUserId.ToString(), signalType, payload);
     }
 
-    public async Task UpdateSettingsAsync(string? micDeviceId, string? cameraDeviceId, string? resolution, int fps = 30, int bitrateKbps = 2000)
+    public async Task UpdateSettingsAsync(
+        string? micDeviceId,
+        string? cameraDeviceId,
+        string? resolution,
+        int fps = 30,
+        int bitrateKbps = 2000,
+        string? preferredVideoCodec = "h264",
+        bool screenShareAudioEnabled = true)
     {
         await _js.InvokeVoidAsync("webrtcManager.updateSettings", new
         {
@@ -106,7 +125,9 @@ public class WebRtcBridge : IAsyncDisposable
             cameraDeviceId,
             resolution,
             fps,
-            bitrateKbps
+            bitrateKbps,
+            preferredVideoCodec,
+            screenShareAudioEnabled
         });
     }
 
@@ -121,6 +142,11 @@ public class WebRtcBridge : IAsyncDisposable
     public async Task ClearFloatVideoAsync(string containerId)
     {
         await _js.InvokeVoidAsync("webrtcManager.clearFloatVideo", containerId);
+    }
+
+    public async Task RebindVideoElementsAsync()
+    {
+        await _js.InvokeVoidAsync("webrtcManager.rebindVideoElements");
     }
 
     // ─── JS → C# callbacks ─────────────────────────────────────────────────────
@@ -171,10 +197,25 @@ public class WebRtcBridge : IAsyncDisposable
         }
     }
 
+    [JSInvokable]
+    public void OnRemoteParticipantSeen(string userId)
+    {
+        if (!Guid.TryParse(userId, out var participantId))
+            return;
+
+        _callStore.EnsureRemoteParticipant(participantId);
+    }
+
     /// <summary>
     /// Called from JS when keepalive failures or polling detect session loss.
     /// Triggers CallStore to re-join and get new Janus credentials.
     /// </summary>
+    [JSInvokable]
+    public void OnMusicBotStateChanged(bool isPlaying, string? title)
+    {
+        // Music bot feature removed; keep callback to avoid JS interop errors on older scripts.
+    }
+
     [JSInvokable]
     public void OnJanusSessionLost()
     {
@@ -199,9 +240,12 @@ public class WebRtcBridge : IAsyncDisposable
                 session.ServerBaseUrl,
                 _authToken ?? "",
                 _userId ?? "",
+                _userDisplayName ?? _userId ?? "",
+                _participantDirectory,
                 session.IceServers
             );
             await ApplyStoredSettingsAsync();
+            await UpdateParticipantDirectoryAsync(_participantDirectory);
         }
         catch (Exception ex)
         {
@@ -220,9 +264,45 @@ public class WebRtcBridge : IAsyncDisposable
         await _js.InvokeVoidAsync("webrtcManager.setVolume", level);
     }
 
+    public async Task SetStreamVolumeAsync(double level)
+    {
+        await _js.InvokeVoidAsync("webrtcManager.setStreamVolume", level);
+    }
+
     public async Task SetPushToTalkAsync(bool enabled, string key)
     {
         await _js.InvokeVoidAsync("webrtcManager.setPushToTalk", enabled, key);
+    }
+
+    public async Task SetPushToTalkSoundEnabledAsync(bool enabled)
+    {
+        await _js.InvokeVoidAsync("webrtcManager.setPushToTalkSoundEnabled", enabled);
+    }
+
+    public async Task<IReadOnlyList<string>> GetSupportedVideoCodecsAsync()
+    {
+        try
+        {
+            var codecs = await _js.InvokeAsync<string[]>("webrtcManager.getSupportedVideoCodecs");
+            if (codecs == null || codecs.Length == 0)
+                return [];
+
+            return codecs
+                .Select(static c => (c ?? string.Empty).Trim().ToLowerInvariant())
+                .Where(static c => c is "h264" or "h265" or "vp8" or "vp9")
+                .Distinct()
+                .ToArray();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    public async Task UpdateParticipantDirectoryAsync(IReadOnlyDictionary<string, string>? participantDirectory)
+    {
+        _participantDirectory = NormalizeParticipantDirectory(participantDirectory);
+        await _js.InvokeVoidAsync("webrtcManager.updateParticipantNames", _participantDirectory);
     }
 
     public async Task ApplyStoredSettingsAsync()
@@ -232,10 +312,14 @@ public class WebRtcBridge : IAsyncDisposable
             _callStore.SelectedCameraId,
             _callStore.SelectedResolution,
             _callStore.SelectedFps,
-            _callStore.SelectedBitrate);
+            _callStore.SelectedBitrate,
+            _callStore.SelectedVideoCodec,
+            _callStore.ScreenShareAudioEnabled);
 
         await SetVolumeAsync(_callStore.Volume);
+        await SetStreamVolumeAsync(_callStore.StreamVolume);
         await SetPushToTalkAsync(_callStore.PushToTalkEnabled, _callStore.PushToTalkKey);
+        await SetPushToTalkSoundEnabledAsync(_callStore.PushToTalkSoundEnabled);
     }
 
     public async ValueTask DisposeAsync()
@@ -291,4 +375,20 @@ public class WebRtcBridge : IAsyncDisposable
         => host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
            || host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase)
            || host.Equals("::1", StringComparison.OrdinalIgnoreCase);
+
+    private static Dictionary<string, string> NormalizeParticipantDirectory(IReadOnlyDictionary<string, string>? participantDirectory)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (participantDirectory == null) return result;
+
+        foreach (var (key, value) in participantDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(value))
+                continue;
+
+            result[key.Trim()] = value.Trim();
+        }
+
+        return result;
+    }
 }

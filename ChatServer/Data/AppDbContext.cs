@@ -2,6 +2,7 @@ using ChatServer.Data.Entities;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
+using Shared.Models;
 
 namespace ChatServer.Data;
 
@@ -25,6 +26,13 @@ public class AppDbContext : IdentityDbContext<AppUser, IdentityRole<Guid>, Guid>
             e.HasOne(r => r.Owner).WithMany().HasForeignKey(r => r.OwnerId).OnDelete(DeleteBehavior.Restrict);
             e.HasMany(r => r.Members).WithOne(m => m.Room).HasForeignKey(m => m.RoomId).OnDelete(DeleteBehavior.Cascade);
             e.HasMany(r => r.Messages).WithOne(m => m.Room).HasForeignKey(m => m.RoomId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        builder.Entity<AppUser>(e =>
+        {
+            e.Property(u => u.GlobalRole)
+                .HasConversion<int>()
+                .HasDefaultValue(UserRole.Member);
         });
 
         builder.Entity<ChatRoomMember>(e =>

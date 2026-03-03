@@ -18,6 +18,7 @@ public class ChatRoomStore : IDisposable
     public ChatRoomInfo? SelectedRoom { get; private set; }
     public List<ChatMessage> Messages { get; private set; } = [];
     public ChatMemberInfo[] Members { get; private set; } = [];
+    public ServerMemberInfo[] ServerMembers { get; private set; } = [];
     public UserRole CurrentUserRole { get; private set; } = UserRole.Member;
     public string? Error { get; private set; }
 
@@ -35,7 +36,9 @@ public class ChatRoomStore : IDisposable
         _chat.OnUserLeftRoom += HandleUserLeft;
         _chat.OnRoomDeleted += HandleRoomDeleted;
         _chat.OnUserKicked += HandleUserKicked;
+        _chat.OnUserMoved += HandleUserMoved;
         _chat.OnUserRoleChanged += HandleUserRoleChanged;
+        _chat.OnUserOnlineStatusChanged += HandleUserOnlineStatusChanged;
         _chat.OnConnectionStateChanged += HandleConnectionStateChanged;
     }
 
@@ -44,7 +47,15 @@ public class ChatRoomStore : IDisposable
         try
         {
             Error = null;
-            Rooms = await _api.GetRoomsAsync();
+            await RefreshRoomsSnapshotAsync();
+            if (ServerMembers.Length == 0)
+            {
+                await RefreshServerMembersAsync();
+            }
+            else
+            {
+                CurrentUserRole = GetCurrentUserGlobalRole();
+            }
             NotifyChanged();
         }
         catch (Exception ex)
@@ -54,12 +65,20 @@ public class ChatRoomStore : IDisposable
         }
     }
 
-    public async Task SelectRoomAsync(Guid roomId)
+    public async Task LoadServerMembersAsync() => await RefreshServerMembersAsync();
+
+    public ChatMemberInfo? GetSelectedRoomMember(Guid userId)
+        => Members.FirstOrDefault(m => m.UserId == userId);
+
+    public bool IsUserInSelectedRoom(Guid userId)
+        => GetSelectedRoomMember(userId) != null;
+
+    public async Task SelectRoomAsync(Guid roomId, bool keepPreviousRoomSubscription = false)
     {
         if (SelectedRoomId == roomId) return;
 
         // Leave previous room
-        if (SelectedRoomId != null)
+        if (SelectedRoomId != null && !keepPreviousRoomSubscription)
         {
             try { await _chat.LeaveRoomAsync(SelectedRoomId.Value); } catch { }
         }
@@ -67,6 +86,8 @@ public class ChatRoomStore : IDisposable
         SelectedRoomId = roomId;
         SelectedRoom = Rooms.FirstOrDefault(r => r.Id == roomId);
         Messages.Clear();
+        Members = [];
+        CurrentUserRole = GetCurrentUserGlobalRole();
         Error = null;
         NotifyChanged();
 
@@ -78,9 +99,10 @@ public class ChatRoomStore : IDisposable
             {
                 _api.NormalizeAttachments(message.Attachments);
             }
+
             Messages = msgs.Reverse().ToList();
-            Members = await _api.GetRoomMembersAsync(roomId);
-            CurrentUserRole = Members.FirstOrDefault(m => m.UserId == _auth.CurrentUser?.Id)?.Role ?? UserRole.Member;
+            await RefreshSelectedRoomMembersAsync(roomId);
+            await RefreshServerMembersAsync();
             NotifyChanged();
         }
         catch (Exception ex)
@@ -128,6 +150,7 @@ public class ChatRoomStore : IDisposable
         {
             await _api.CreateRoomAsync(name, description, voiceEnabled, videoEnabled);
             await LoadRoomsAsync();
+            await RefreshServerMembersAsync();
         }
         catch (Exception ex)
         {
@@ -142,6 +165,7 @@ public class ChatRoomStore : IDisposable
         {
             await _chat.DeleteRoomAsync(roomId);
             await LoadRoomsAsync();
+            await RefreshServerMembersAsync();
             HandleRoomDeleted(roomId);
         }
         catch (Exception ex)
@@ -157,7 +181,8 @@ public class ChatRoomStore : IDisposable
         try
         {
             await _chat.KickUserAsync(SelectedRoomId.Value, userId);
-            Members = await _api.GetRoomMembersAsync(SelectedRoomId.Value);
+            await RefreshSelectedRoomMembersAsync(SelectedRoomId.Value);
+            await RefreshServerMembersAsync();
             NotifyChanged();
         }
         catch (Exception ex)
@@ -167,13 +192,50 @@ public class ChatRoomStore : IDisposable
         }
     }
 
-    public async Task SetUserRoleAsync(Guid userId, UserRole role)
+    public async Task KickUserFromCurrentCallAsync(Guid userId, string reason = "Kicked from call by moderator")
     {
         if (SelectedRoomId == null) return;
         try
         {
-            await _chat.SetUserRoleAsync(SelectedRoomId.Value, userId, role);
-            Members = await _api.GetRoomMembersAsync(SelectedRoomId.Value);
+            await _chat.KickUserFromVoiceVideoAsync(SelectedRoomId.Value, userId, reason);
+        }
+        catch (Exception ex)
+        {
+            Error = $"Failed to kick user from call: {ex.Message}";
+            NotifyChanged();
+        }
+    }
+
+    public async Task MoveUserAsync(Guid userId, Guid targetRoomId)
+    {
+        if (SelectedRoomId == null) return;
+        if (targetRoomId == SelectedRoomId.Value) return;
+
+        try
+        {
+            await _chat.MoveUserAsync(SelectedRoomId.Value, targetRoomId, userId);
+            await LoadRoomsAsync();
+            await RefreshSelectedRoomMembersAsync(SelectedRoomId.Value);
+            await RefreshServerMembersAsync();
+            NotifyChanged();
+        }
+        catch (Exception ex)
+        {
+            Error = $"Failed to move user: {ex.Message}";
+            NotifyChanged();
+        }
+    }
+
+    public async Task SetUserRoleAsync(Guid userId, UserRole role)
+    {
+        try
+        {
+            await _chat.SetUserRoleAsync(SelectedRoomId ?? Guid.Empty, userId, role);
+            await RefreshServerMembersAsync();
+            if (SelectedRoomId != null)
+            {
+                await RefreshSelectedRoomMembersAsync(SelectedRoomId.Value);
+            }
             NotifyChanged();
         }
         catch (Exception ex)
@@ -203,12 +265,15 @@ public class ChatRoomStore : IDisposable
         }
     }
 
-    private async void HandleUserJoined(Guid roomId, ChatMemberInfo member)
+    private async void HandleUserJoined(Guid roomId, ChatMemberInfo _)
     {
         if (roomId != SelectedRoomId) return;
+
         try
         {
-            Members = await _api.GetRoomMembersAsync(roomId);
+            await RefreshRoomsSnapshotAsync();
+            await RefreshSelectedRoomMembersAsync(roomId);
+            await RefreshServerMembersAsync();
             NotifyChanged();
         }
         catch (Exception ex)
@@ -217,12 +282,15 @@ public class ChatRoomStore : IDisposable
         }
     }
 
-    private async void HandleUserLeft(Guid roomId, Guid userId)
+    private async void HandleUserLeft(Guid roomId, Guid _)
     {
         if (roomId != SelectedRoomId) return;
+
         try
         {
-            Members = await _api.GetRoomMembersAsync(roomId);
+            await RefreshRoomsSnapshotAsync();
+            await RefreshSelectedRoomMembersAsync(roomId);
+            await RefreshServerMembersAsync();
             NotifyChanged();
         }
         catch (Exception ex)
@@ -240,11 +308,13 @@ public class ChatRoomStore : IDisposable
             SelectedRoom = null;
             Messages.Clear();
             Members = [];
+            CurrentUserRole = UserRole.Member;
         }
+
         NotifyChanged();
     }
 
-    private void HandleUserKicked(Guid roomId, Guid userId, string reason)
+    private async void HandleUserKicked(Guid roomId, Guid userId, string reason)
     {
         if (roomId == SelectedRoomId && userId == _auth.CurrentUser?.Id)
         {
@@ -252,18 +322,86 @@ public class ChatRoomStore : IDisposable
             SelectedRoom = null;
             Messages.Clear();
             Members = [];
+            CurrentUserRole = UserRole.Member;
             Error = $"You were kicked: {reason}";
         }
+
+        try
+        {
+            await RefreshRoomsSnapshotAsync();
+            await RefreshServerMembersAsync();
+        }
+        catch { }
+
         NotifyChanged();
     }
 
-    private void HandleUserRoleChanged(Guid roomId, Guid userId, UserRole newRole)
+    private async void HandleUserMoved(Guid sourceRoomId, Guid targetRoomId, Guid userId)
     {
-        if (roomId == SelectedRoomId && userId == _auth.CurrentUser?.Id)
+        var affectedSelectedRoom = SelectedRoomId == sourceRoomId || SelectedRoomId == targetRoomId;
+        if (!affectedSelectedRoom && userId != _auth.CurrentUser?.Id)
         {
-            CurrentUserRole = newRole;
+            try
+            {
+                await RefreshRoomsSnapshotAsync();
+                await RefreshServerMembersAsync();
+            }
+            catch { }
+            NotifyChanged();
+            return;
+        }
+
+        try
+        {
+            await RefreshRoomsSnapshotAsync();
+
+            if (SelectedRoomId == sourceRoomId || SelectedRoomId == targetRoomId)
+            {
+                await RefreshSelectedRoomMembersAsync(SelectedRoomId!.Value);
+            }
+
+            await RefreshServerMembersAsync();
+
+            if (userId == _auth.CurrentUser?.Id && SelectedRoomId == sourceRoomId)
+            {
+                await SelectRoomAsync(targetRoomId);
+            }
+            else
+            {
+                NotifyChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[ChatRoomStore] HandleUserMoved error: {ex.Message}");
+        }
+    }
+
+    private async void HandleUserRoleChanged(Guid roomId, Guid userId, UserRole newRole)
+    {
+        try
+        {
+            await RefreshServerMembersAsync();
+            if (SelectedRoomId != null)
+            {
+                await RefreshSelectedRoomMembersAsync(SelectedRoomId.Value);
+            }
             NotifyChanged();
         }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[ChatRoomStore] HandleUserRoleChanged error: {ex.Message}");
+        }
+    }
+
+    private void HandleUserOnlineStatusChanged(Guid userId, bool isOnline)
+    {
+        var member = ServerMembers.FirstOrDefault(m => m.UserId == userId);
+        if (member == null) return;
+        if (member.IsOnline == isOnline) return;
+
+        member.IsOnline = isOnline;
+        NotifyChanged();
     }
 
     /// <summary>
@@ -278,7 +416,7 @@ public class ChatRoomStore : IDisposable
         var roomId = SelectedRoomId.Value;
         try
         {
-            System.Diagnostics.Debug.WriteLine($"[ChatRoomStore] Reconnected — re-joining room {roomId}");
+            System.Diagnostics.Debug.WriteLine($"[ChatRoomStore] Reconnected - re-joining room {roomId}");
             await _chat.JoinRoomAsync(roomId);
 
             // Reload messages that may have arrived while disconnected
@@ -287,7 +425,11 @@ public class ChatRoomStore : IDisposable
             {
                 _api.NormalizeAttachments(message.Attachments);
             }
+
             Messages = msgs.Reverse().ToList();
+            await RefreshRoomsSnapshotAsync();
+            await RefreshSelectedRoomMembersAsync(roomId);
+            await RefreshServerMembersAsync();
             NotifyChanged();
         }
         catch (Exception ex)
@@ -295,6 +437,28 @@ public class ChatRoomStore : IDisposable
             System.Diagnostics.Debug.WriteLine($"[ChatRoomStore] Re-join after reconnect failed: {ex.Message}");
         }
     }
+
+    private async Task RefreshSelectedRoomMembersAsync(Guid roomId)
+    {
+        Members = await _api.GetRoomMembersAsync(roomId);
+    }
+
+    private async Task RefreshRoomsSnapshotAsync()
+    {
+        Rooms = await _api.GetRoomsAsync();
+        SelectedRoom = SelectedRoomId == null
+            ? null
+            : Rooms.FirstOrDefault(r => r.Id == SelectedRoomId.Value);
+    }
+
+    private async Task RefreshServerMembersAsync()
+    {
+        ServerMembers = await _api.GetServerMembersAsync();
+        CurrentUserRole = GetCurrentUserGlobalRole();
+    }
+
+    private UserRole GetCurrentUserGlobalRole()
+        => ServerMembers.FirstOrDefault(m => m.UserId == _auth.CurrentUser?.Id)?.Role ?? UserRole.Member;
 
     private void NotifyChanged() => OnChange?.Invoke();
 
@@ -306,7 +470,9 @@ public class ChatRoomStore : IDisposable
         _chat.OnUserLeftRoom -= HandleUserLeft;
         _chat.OnRoomDeleted -= HandleRoomDeleted;
         _chat.OnUserKicked -= HandleUserKicked;
+        _chat.OnUserMoved -= HandleUserMoved;
         _chat.OnUserRoleChanged -= HandleUserRoleChanged;
+        _chat.OnUserOnlineStatusChanged -= HandleUserOnlineStatusChanged;
         _chat.OnConnectionStateChanged -= HandleConnectionStateChanged;
     }
 }

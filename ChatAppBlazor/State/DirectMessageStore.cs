@@ -71,6 +71,19 @@ public class DirectMessageStore : IDisposable
         }
     }
 
+    public async Task OpenConversationAsync(UserInfo contact)
+    {
+        var existing = Contacts.FirstOrDefault(c => c.Id == contact.Id);
+        if (existing == null)
+        {
+            Contacts = [contact, ..Contacts];
+            existing = contact;
+            NotifyChanged();
+        }
+
+        await SelectContactAsync(existing);
+    }
+
     public async Task SendMessageAsync(string content, AttachmentInfo[]? attachments = null)
     {
         if (SelectedContactId == null) return;

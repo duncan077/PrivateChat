@@ -53,12 +53,15 @@ public class AuthServiceImpl : ServiceBase<IAuthService>, IAuthService
             return new AuthResponse { Success = false, Error = "Username already taken" };
         }
 
+        var isFirstUser = !await _db.Users.AnyAsync();
+
         var user = new AppUser
         {
             Id = Guid.NewGuid(),
             UserName = request.UserName,
             NormalizedUserName = request.UserName.ToUpperInvariant(),
             DisplayName = request.DisplayName,
+            GlobalRole = isFirstUser ? UserRole.Owner : UserRole.Member,
             PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password),
             SecurityStamp = Guid.NewGuid().ToString()
         };

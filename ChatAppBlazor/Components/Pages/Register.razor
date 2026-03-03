@@ -9,39 +9,40 @@
         <MudCardHeader>
             <MudText Typo="Typo.h5" Align="Align.Center" Class="auth-title" Style="width:100%;font-weight:700">Create Account</MudText>
         </MudCardHeader>
-        <MudCardContent>
-            <MudText Typo="Typo.body2" Class="auth-subtitle">
-                Set up your profile and join the conversation.
-            </MudText>
-            @if (!string.IsNullOrEmpty(_error))
-            {
-                <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
-            }
+        <form @onsubmit="HandleRegister" @onsubmit:preventDefault="true">
+            <MudCardContent>
+                <MudText Typo="Typo.body2" Class="auth-subtitle">
+                    Set up your profile and join the conversation.
+                </MudText>
+                @if (!string.IsNullOrEmpty(_error))
+                {
+                    <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
+                }
 
-            <MudStack Spacing="3">
-                <MudTextField @bind-Value="_userName" Label="Username" Variant="Variant.Outlined"
-                              Immediate="true" Disabled="_loading" />
+                <MudStack Spacing="3">
+                    <MudTextField @bind-Value="_userName" Label="Username" Variant="Variant.Outlined"
+                                  Immediate="true" Disabled="_loading" />
 
-                <MudTextField @bind-Value="_displayName" Label="Display Name" Variant="Variant.Outlined"
-                              Immediate="true" Disabled="_loading" />
+                    <MudTextField @bind-Value="_displayName" Label="Display Name" Variant="Variant.Outlined"
+                                  Immediate="true" Disabled="_loading" />
 
-                <MudTextField @bind-Value="_password" Label="Password" Variant="Variant.Outlined"
-                              InputType="InputType.Password" Immediate="true" Disabled="_loading" />
+                    <MudTextField @bind-Value="_password" Label="Password" Variant="Variant.Outlined"
+                                  InputType="InputType.Password" Immediate="true" Disabled="_loading" />
 
-                <MudTextField @bind-Value="_confirmPassword" Label="Confirm Password" Variant="Variant.Outlined"
-                              InputType="InputType.Password" Immediate="true" Disabled="_loading"
-                              OnKeyDown="HandleKeyDown" />
-            </MudStack>
-        </MudCardContent>
-        <MudCardActions Class="d-flex flex-column px-4 pb-4">
-            <MudButton Variant="Variant.Filled" Color="Color.Primary" FullWidth="true"
-                       OnClick="HandleRegister" Disabled="_loading">
-                @(_loading ? "Creating account..." : "Register")
-            </MudButton>
-            <MudText Typo="Typo.body2" Align="Align.Center" Class="mt-3">
-                Already have an account? <MudLink Href="/login">Sign In</MudLink>
-            </MudText>
-        </MudCardActions>
+                    <MudTextField @bind-Value="_confirmPassword" Label="Confirm Password" Variant="Variant.Outlined"
+                                  InputType="InputType.Password" Immediate="true" Disabled="_loading" />
+                </MudStack>
+            </MudCardContent>
+            <MudCardActions Class="d-flex flex-column px-4 pb-4">
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" FullWidth="true"
+                           ButtonType="ButtonType.Submit" Disabled="_loading">
+                    @(_loading ? "Creating account..." : "Register")
+                </MudButton>
+                <MudText Typo="Typo.body2" Align="Align.Center" Class="mt-3">
+                    Already have an account? <MudLink Href="/login">Sign In</MudLink>
+                </MudText>
+            </MudCardActions>
+        </form>
     </MudCard>
 </div>
 
@@ -52,11 +53,6 @@
     private string _confirmPassword = "";
     private string? _error;
     private bool _loading;
-
-    private async Task HandleKeyDown(KeyboardEventArgs e)
-    {
-        if (e.Key == "Enter") await HandleRegister();
-    }
 
     private async Task HandleRegister()
     {

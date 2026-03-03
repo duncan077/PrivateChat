@@ -1,4 +1,5 @@
 @inject IDialogService DialogService
+@inject ISnackbar Snackbar
 
 <MudDialog>
     <TitleContent>
@@ -25,6 +26,8 @@
             </MudSelect>
 
             <MudSelect T="string" @bind-Value="_selectedResolution" Label="Resolution" Variant="Variant.Outlined" Dense="true">
+                <MudSelectItem T="string" Value="@("3840x2160")">4k (3840x2160)</MudSelectItem>
+                <MudSelectItem T="string" Value="@("2560x1440")">2k (2560x1440)</MudSelectItem>
                 <MudSelectItem T="string" Value="@("1920x1080")">1080p (1920x1080)</MudSelectItem>
                 <MudSelectItem T="string" Value="@("1280x720")">720p (1280x720)</MudSelectItem>
                 <MudSelectItem T="string" Value="@("640x480")">480p (640x480)</MudSelectItem>
@@ -39,18 +42,51 @@
             </MudSelect>
 
             <MudSelect T="int" @bind-Value="_selectedBitrate" Label="Bitrate" Variant="Variant.Outlined" Dense="true">
-                <MudSelectItem T="int" Value="500">500 kbps (Low)</MudSelectItem>
-                <MudSelectItem T="int" Value="1000">1 Mbps</MudSelectItem>
                 <MudSelectItem T="int" Value="2000">2 Mbps (Default)</MudSelectItem>
                 <MudSelectItem T="int" Value="4000">4 Mbps</MudSelectItem>
                 <MudSelectItem T="int" Value="6000">6 Mbps</MudSelectItem>
                 <MudSelectItem T="int" Value="8000">8 Mbps (High)</MudSelectItem>
+                <MudSelectItem T="int" Value="12000">12 Mbps (High)</MudSelectItem>
             </MudSelect>
 
+            <MudSelect T="string" @bind-Value="_selectedVideoCodec" Label="Video Codec" Variant="Variant.Outlined" Dense="true">
+                @foreach (var codec in _videoCodecOptions)
+                {
+                    <MudSelectItem T="string" Value="@codec.Value">@codec.Label</MudSelectItem>
+                }
+            </MudSelect>
+            <MudText Typo="Typo.caption" Color="Color.Secondary">
+                Showing only video encoders supported by this device.
+            </MudText>
+
+            <MudSwitch T="bool" @bind-Value="_screenShareAudioEnabled" Color="Color.Primary">
+                Capture Screen Share Audio
+            </MudSwitch>
+
+            @if (OperatingSystem.IsWindows())
+            {
+                <MudDivider Class="my-1" />
+                <MudText Typo="Typo.subtitle2">Windows Video Acceleration</MudText>
+
+                <MudSwitch T="bool" @bind-Value="_gpuAccelerationEnabled" Color="Color.Primary">
+                    Enable GPU Acceleration
+                </MudSwitch>
+
+                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                    Applies on next app launch (WebView2 startup flag).
+                </MudText>
+            }
+
             <div>
-                <MudText Typo="Typo.body2" Class="mb-1">Mic Volume: @($"{_volume:P0}")</MudText>
-                <MudSlider T="double" Value="_volume" Min="0" Max="2" Step="0.1"
-                           Color="Color.Primary" ValueChanged="OnVolumeChanged" />
+                <MudText Typo="Typo.body2" Class="mb-1">Mic Volume: @($"{_micVolume:P0}")</MudText>
+                <MudSlider T="double" Value="_micVolume" Min="0" Max="2" Step="0.1"
+                           Color="Color.Primary" ValueChanged="OnMicVolumeChanged" />
+            </div>
+
+            <div>
+                <MudText Typo="Typo.body2" Class="mb-1">Stream Volume: @($"{_streamVolume:P0}")</MudText>
+                <MudSlider T="double" Value="_streamVolume" Min="0" Max="2" Step="0.1"
+                           Color="Color.Primary" ValueChanged="OnStreamVolumeChanged" />
             </div>
 
             <MudDivider Class="my-1" />
@@ -61,6 +97,12 @@
                 <MudSwitch T="bool" Value="_pttEnabled" Color="Color.Primary"
                            ValueChanged="OnPttToggled" />
             </MudStack>
+
+            <MudSwitch T="bool" Value="_pttSoundEnabled" Color="Color.Primary"
+                       Disabled="@(!_pttEnabled)"
+                       ValueChanged="OnPttSoundToggled">
+                Play PTT Press/Release Sound
+            </MudSwitch>
 
             @if (_pttEnabled)
             {
@@ -123,40 +165,92 @@
     private string _selectedResolution = "1280x720";
     private int _selectedFps = 30;
     private int _selectedBitrate = 2000;
-    private double _volume = 1.0;
+    private string _selectedVideoCodec = "h264";
+    private bool _screenShareAudioEnabled = true;
+    private bool _gpuAccelerationEnabled = true;
+    private bool _forcePlatformHevcEncoderSupport = true;
+    private bool _enableWebRtcH265SendFeature = true;
+    private double _micVolume = 1.0;
+    private double _streamVolume = 1.0;
     private bool _pttEnabled;
     private string _pttKey = "Space";
+    private bool _pttSoundEnabled = true;
     private bool _capturingPtt;
     private ElementReference _pttCaptureBox;
     private readonly HashSet<string> _captureModifiers = [];
+    private List<VideoCodecOption> _videoCodecOptions = [];
+    private static readonly string[] CodecPreferenceOrder = ["h264", "h265", "vp9", "vp8"];
+    private sealed record VideoCodecOption(string Value, string Label);
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         _selectedMicId = Store.SelectedMicId ?? "";
         _selectedCameraId = Store.SelectedCameraId ?? "";
         _selectedResolution = Store.SelectedResolution;
         _selectedFps = Store.SelectedFps;
-        _selectedBitrate = Store.SelectedBitrate;
-        _volume = Store.Volume;
+        // UI only exposes 2 Mbps+ options, while runtime enforces a 1 Mbps hard floor.
+        _selectedBitrate = Math.Max(2000, Store.SelectedBitrate);
+        _selectedVideoCodec = Store.SelectedVideoCodec;
+        _screenShareAudioEnabled = Store.ScreenShareAudioEnabled;
+        _gpuAccelerationEnabled = Store.GpuAccelerationEnabled;
+        _forcePlatformHevcEncoderSupport = Store.ForcePlatformHevcEncoderSupport;
+        _enableWebRtcH265SendFeature = Store.EnableWebRtcH265SendFeature;
+        _micVolume = Store.Volume;
+        _streamVolume = Store.StreamVolume;
         _pttEnabled = Store.PushToTalkEnabled;
         _pttKey = string.IsNullOrWhiteSpace(Store.PushToTalkKey) ? "Space" : Store.PushToTalkKey;
+        _pttSoundEnabled = Store.PushToTalkSoundEnabled;
+
+        await LoadSupportedVideoCodecOptionsAsync();
     }
 
     private async Task Apply()
     {
-        Store.ApplyCallSettings(_selectedMicId, _selectedCameraId, _selectedResolution, _selectedFps, _selectedBitrate);
+        _selectedBitrate = Math.Max(1000, _selectedBitrate);
+        if (!_videoCodecOptions.Any(x => x.Value == _selectedVideoCodec))
+        {
+            _selectedVideoCodec = _videoCodecOptions.FirstOrDefault(x => x.Value == "h264")?.Value ?? "h264";
+        }
+
+        var runtimeFlagsChanged =
+            _gpuAccelerationEnabled != Store.GpuAccelerationEnabled ||
+            _forcePlatformHevcEncoderSupport != Store.ForcePlatformHevcEncoderSupport ||
+            _enableWebRtcH265SendFeature != Store.EnableWebRtcH265SendFeature;
+
+        Store.ApplyCallSettings(
+            _selectedMicId,
+            _selectedCameraId,
+            _selectedResolution,
+            _selectedFps,
+            _selectedBitrate,
+            _selectedVideoCodec,
+            _screenShareAudioEnabled,
+            _gpuAccelerationEnabled,
+            _forcePlatformHevcEncoderSupport,
+            _enableWebRtcH265SendFeature);
         Store.SetPushToTalkPreference(_pttEnabled, _pttKey);
+        Store.SetPushToTalkSoundPreference(_pttSoundEnabled);
 
         await WebRtc.UpdateSettingsAsync(
             string.IsNullOrEmpty(_selectedMicId) ? null : _selectedMicId,
             string.IsNullOrEmpty(_selectedCameraId) ? null : _selectedCameraId,
             _selectedResolution,
             _selectedFps,
-            _selectedBitrate
+            _selectedBitrate,
+            _selectedVideoCodec,
+            _screenShareAudioEnabled
         );
 
         // Apply push-to-talk setting
         await WebRtc.SetPushToTalkAsync(_pttEnabled, _pttKey);
+        await WebRtc.SetPushToTalkSoundEnabledAsync(_pttSoundEnabled);
+
+        if (OperatingSystem.IsWindows() && runtimeFlagsChanged)
+        {
+            Snackbar.Add(
+                "Windows video acceleration settings will apply after restarting the app.",
+                Severity.Info);
+        }
 
         MudDialog.Close(DialogResult.Ok(true));
     }
@@ -166,13 +260,21 @@
     private async Task RefreshDevices()
     {
         await WebRtc.EnumerateDevicesAsync();
+        await LoadSupportedVideoCodecOptionsAsync();
     }
 
-    private async Task OnVolumeChanged(double vol)
+    private async Task OnMicVolumeChanged(double vol)
     {
-        _volume = vol;
+        _micVolume = vol;
         Store.SetVolumePreference(vol);
         await WebRtc.SetVolumeAsync(vol);
+    }
+
+    private async Task OnStreamVolumeChanged(double vol)
+    {
+        _streamVolume = vol;
+        Store.SetStreamVolumePreference(vol);
+        await WebRtc.SetStreamVolumeAsync(vol);
     }
 
     private async Task OnPttToggled(bool enabled)
@@ -181,6 +283,13 @@
         if (!enabled) _capturingPtt = false;
         Store.SetPushToTalkPreference(enabled, _pttKey);
         await WebRtc.SetPushToTalkAsync(enabled, _pttKey);
+    }
+
+    private async Task OnPttSoundToggled(bool enabled)
+    {
+        _pttSoundEnabled = enabled;
+        Store.SetPushToTalkSoundPreference(enabled);
+        await WebRtc.SetPushToTalkSoundEnabledAsync(enabled);
     }
 
     private async Task StartPttCapture()
@@ -267,6 +376,56 @@
         Store.SetPushToTalkPreference(_pttEnabled, _pttKey);
         await WebRtc.SetPushToTalkAsync(_pttEnabled, _pttKey);
     }
+
+    private async Task LoadSupportedVideoCodecOptionsAsync()
+    {
+        IReadOnlyList<string> supported = [];
+        try
+        {
+            supported = await WebRtc.GetSupportedVideoCodecsAsync();
+        }
+        catch
+        {
+            // Ignore transient JS interop failures while dialog is opening.
+        }
+
+        var supportedSet = new HashSet<string>(
+            supported
+                .Select(static codec => (codec ?? string.Empty).Trim().ToLowerInvariant())
+                .Where(static codec => codec is "h264" or "h265" or "vp8" or "vp9"),
+            StringComparer.Ordinal);
+
+        if (supportedSet.Count == 0)
+        {
+            supportedSet.Add("h264");
+            supportedSet.Add("vp8");
+        }
+
+        _videoCodecOptions = CodecPreferenceOrder
+            .Where(supportedSet.Contains)
+            .Select(codec => new VideoCodecOption(codec, GetCodecLabel(codec)))
+            .ToList();
+
+        if (_videoCodecOptions.Count == 0)
+        {
+            _videoCodecOptions = [new VideoCodecOption("h264", GetCodecLabel("h264"))];
+        }
+
+        if (!_videoCodecOptions.Any(x => x.Value == _selectedVideoCodec))
+        {
+            _selectedVideoCodec = _videoCodecOptions.FirstOrDefault(x => x.Value == "h264")?.Value
+                ?? _videoCodecOptions[0].Value;
+        }
+    }
+
+    private static string GetCodecLabel(string codec) => codec switch
+    {
+        "h264" => "H.264 (Recommended)",
+        "h265" => "H.265 (HEVC)",
+        "vp9" => "VP9",
+        "vp8" => "VP8",
+        _ => codec.ToUpperInvariant()
+    };
 
     private static string FormatShortcut(string binding)
     {

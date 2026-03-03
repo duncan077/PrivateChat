@@ -3,6 +3,7 @@ using ChatAppBlazor.State;
 using ChatAppBlazor.WebRtc;
 using Microsoft.Extensions.Logging;
 using MudBlazor.Services;
+using System.Reflection;
 
 namespace ChatAppBlazor
 {
@@ -33,6 +34,7 @@ namespace ChatAppBlazor
             builder.Services.AddSingleton<ChatRoomStore>();
             builder.Services.AddSingleton<DirectMessageStore>();
             builder.Services.AddSingleton<CallStore>();
+            builder.Services.AddSingleton<MembersPanelStore>();
 
             // WebRTC bridge (scoped — must match IJSRuntime's scoped lifetime).
             // In MAUI Blazor Hybrid the single BlazorWebView creates one scope for the
@@ -44,8 +46,17 @@ namespace ChatAppBlazor
             builder.Services.AddBlazorWebViewDeveloperTools();
     		builder.Logging.AddDebug();
 #endif
+            builder.Services.AddSingleton<UpdateService>();
 
-            return builder.Build();
+            var app = builder.Build();
+
+            var updateService = app.Services.GetRequiredService<UpdateService>();
+            var assemblyVersion = Assembly.GetExecutingAssembly().GetName().Version;
+            if (assemblyVersion != null)
+                updateService.CurrentVersion = assemblyVersion.ToString(3);
+            updateService.StartPolling();
+
+            return app;
         }
     }
 }

@@ -16,7 +16,19 @@
       "Bash(dotnet build ChatServer/ChatServer.csproj)",
       "Bash(dotnet build)",
       "Bash(xargs grep -l \"stun\\\\|turn\\\\|nat\\\\|ice\")",
-      "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj --no-restore)"
+      "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj --no-restore)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.nuget.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(dotnet restore ChatAppBlazor/ChatAppBlazor.csproj)",
+      "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj -f net9.0-windows10.0.19041.0 --no-restore)",
+      "Bash(dotnet msbuild ChatAppBlazor/ChatAppBlazor.csproj -t:ResolveAssemblyReferences -f net9.0-windows10.0.19041.0)",
+      "WebFetch(domain:sipsorcery-org.github.io)",
+      "WebFetch(domain:deepwiki.com)",
+      "Bash(dotnet-ildasm \"C:/Users/halod/.nuget/packages/sipsorcery/6.2.4/lib/net8.0/SIPSorcery.dll\")",
+      "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj -f net9.0-windows10.0.19041.0)",
+      "Bash(powershell -Command \"[System.Reflection.Assembly]::LoadFrom\\(''C:\\\\Users\\\\halod\\\\.nuget\\\\packages\\\\sipsorcerymedia.windows\\\\8.0.7\\\\lib\\\\net8.0-windows10.0.17763\\\\SIPSorceryMedia.Windows.dll''\\) | % { $_.GetTypes\\(\\) | Where-Object { $_.IsPublic } | % { Write-Host $_.FullName } }\")",
+      "Bash(dotnet add package SkiaSharp)"
     ]
   }
 }

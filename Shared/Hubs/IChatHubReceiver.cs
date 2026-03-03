@@ -10,6 +10,7 @@ public interface IChatHubReceiver
     void OnUserJoinedRoom(Guid roomId, ChatMemberInfo member);
     void OnUserLeftRoom(Guid roomId, Guid userId);
     void OnUserKicked(Guid roomId, Guid userId, string reason);
+    void OnUserKickedFromVoiceVideo(Guid roomId, Guid userId, string reason);
     void OnUserMoved(Guid sourceRoomId, Guid targetRoomId, Guid userId);
     void OnUserRoleChanged(Guid roomId, Guid userId, UserRole newRole);
     void OnPrivateMessageReceived(PrivateMessage message);

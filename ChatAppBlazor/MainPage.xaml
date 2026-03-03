@@ -6,6 +6,7 @@
              x:Class="ChatAppBlazor.MainPage">
 
     <BlazorWebView x:Name="blazorWebView" HostPage="wwwroot/index.html"
+                   BlazorWebViewInitializing="BlazorWebView_BlazorWebViewInitializing"
                    BlazorWebViewInitialized="OnBlazorWebViewInitialized">
         <BlazorWebView.RootComponents>
             <RootComponent Selector="#app" ComponentType="{x:Type components:Routes}" />

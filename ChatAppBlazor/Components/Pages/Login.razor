@@ -9,33 +9,36 @@
         <MudCardHeader>
             <MudText Typo="Typo.h5" Align="Align.Center" Class="auth-title" Style="width:100%;font-weight:700">Sign In</MudText>
         </MudCardHeader>
-        <MudCardContent>
-            <MudText Typo="Typo.body2" Class="auth-subtitle">
-                Continue to your secure workspace.
-            </MudText>
-            @if (!string.IsNullOrEmpty(_error))
-            {
-                <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
-            }
+        <form @onsubmit="HandleLogin" @onsubmit:preventDefault="true">
+            <MudCardContent>
+                <MudText Typo="Typo.body2" Class="auth-subtitle">
+                    Continue to your secure workspace.
+                </MudText>
+                @if (!string.IsNullOrEmpty(_error))
+                {
+                    <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
+                }
 
-            <MudStack Spacing="3">
-                <MudTextField @bind-Value="_userName" Label="Username" Variant="Variant.Outlined"
-                              Immediate="true" Disabled="_loading" />
+                <MudStack Spacing="3">
+                    <MudTextField @bind-Value="_userName" Label="Username" Variant="Variant.Outlined"
+                                  Immediate="true" Disabled="_loading" />
 
-                <MudTextField @bind-Value="_password" Label="Password" Variant="Variant.Outlined"
-                              InputType="InputType.Password" Immediate="true" Disabled="_loading"
-                              OnKeyDown="HandleKeyDown" />
-            </MudStack>
-        </MudCardContent>
-        <MudCardActions Class="d-flex flex-column px-4 pb-4">
-            <MudButton Variant="Variant.Filled" Color="Color.Primary" FullWidth="true"
-                       OnClick="HandleLogin" Disabled="_loading">
-                @(_loading ? "Signing in..." : "Sign In")
-            </MudButton>
-            <MudText Typo="Typo.body2" Align="Align.Center" Class="mt-3">
-                Don't have an account? <MudLink Href="/register">Register</MudLink>
-            </MudText>
-        </MudCardActions>
+                    <MudTextField @bind-Value="_password" Label="Password" Variant="Variant.Outlined"
+                                  InputType="InputType.Password" Immediate="true" Disabled="_loading" />
+                    <MudCheckBox @bind-Value="_rememberMe" Disabled="_loading">Remember me</MudCheckBox>
+                    
+                </MudStack>
+            </MudCardContent>
+            <MudCardActions Class="d-flex flex-column px-4 pb-4">
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" FullWidth="true"
+                           ButtonType="ButtonType.Submit" Disabled="_loading">
+                    @(_loading ? "Signing in..." : "Sign In")
+                </MudButton>
+                <MudText Typo="Typo.body2" Align="Align.Center" Class="mt-3">
+                    Don't have an account? <MudLink Href="/register">Register</MudLink>
+                </MudText>
+            </MudCardActions>
+        </form>
     </MudCard>
 </div>
 
@@ -44,20 +47,13 @@
     private string _password = "";
     private string? _error;
     private bool _loading;
+    private bool _rememberMe;
 
     protected override void OnAfterRender(bool firstRender)
     {
         if (firstRender && Auth.IsAuthenticated)
         {
             Nav.NavigateTo("/");
-        }
-    }
-
-    private async Task HandleKeyDown(KeyboardEventArgs e)
-    {
-        if (e.Key == "Enter")
-        {
-            await HandleLogin();
         }
     }
 
@@ -71,7 +67,7 @@
             var response = await Api.LoginAsync(_userName, _password);
             if (response.Success)
             {
-                Auth.SetAuth(response.Token!, response.User!);
+                await Auth.SetAuthAsync(response.Token!, response.User!, _rememberMe);
                 await Chat.ConnectAsync();
                 Nav.NavigateTo("/");
             }

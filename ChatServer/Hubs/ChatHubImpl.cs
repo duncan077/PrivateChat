@@ -30,6 +30,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
     private Guid _userId;
     private string _userName = string.Empty;
     private readonly HashSet<Guid> _joinedRooms = [];
+    private bool _becameOnlineOnConnect;
 
     public ChatHubImpl(AppDbContext db, IDistributedCache cache, JwtTokenService jwt, JanusService janus, IConfiguration config)
     {
@@ -38,6 +39,19 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
         _jwt = jwt;
         _janus = janus;
         _config = config;
+    }
+
+    public static bool IsUserOnline(Guid userId)
+    {
+        if (!_onlineUsers.TryGetValue(userId, out var connections))
+        {
+            return false;
+        }
+
+        lock (connections)
+        {
+            return connections.Count > 0;
+        }
     }
 
     protected override async ValueTask OnConnecting()
@@ -51,9 +65,40 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
         _userId = Context.GetUserId();
         _userName = Context.GetUserName();
 
+        _becameOnlineOnConnect = false;
         _onlineUsers.AddOrUpdate(_userId,
-            _ => [ConnectionId],
-            (_, set) => { lock (set) { set.Add(ConnectionId); } return set; });
+            _ =>
+            {
+                _becameOnlineOnConnect = true;
+                return [ConnectionId];
+            },
+            (_, set) =>
+            {
+                lock (set)
+                {
+                    if (set.Count == 0)
+                    {
+                        _becameOnlineOnConnect = true;
+                    }
+                    set.Add(ConnectionId);
+                }
+                return set;
+            });
+
+        // Join a global group used for cross-room events like global role updates.
+        await Group.AddAsync("global");
+
+    }
+
+    protected override async ValueTask OnConnected()
+    {
+        // Do not broadcast from OnConnecting; broadcasting there can start the
+        // duplex stream body before MagicOnion writes required response headers.
+        if (_becameOnlineOnConnect)
+        {
+            var globalGroup = await Group.AddAsync("global");
+            globalGroup.All.OnUserOnlineStatusChanged(_userId, true);
+        }
     }
 
     protected override async ValueTask OnDisconnected()
@@ -63,6 +108,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
             await RemoveFromRoomGroupAsync(roomId);
         }
 
+        var becameOffline = false;
         if (_onlineUsers.TryGetValue(_userId, out var connections))
         {
             lock (connections)
@@ -71,6 +117,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
                 if (connections.Count == 0)
                 {
                     _onlineUsers.TryRemove(_userId, out _);
+                    becameOffline = true;
                 }
             }
         }
@@ -84,6 +131,12 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
                     voiceUsers.Remove(_userId);
                 }
             }
+        }
+
+        if (becameOffline)
+        {
+            var globalGroup = await Group.AddAsync("global");
+            globalGroup.All.OnUserOnlineStatusChanged(_userId, false);
         }
     }
 
@@ -120,7 +173,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
             UserName = _userName,
             DisplayName = user?.DisplayName ?? _userName,
             AvatarUrl = user?.AvatarUrl,
-            Role = existingMembership?.Role ?? UserRole.Member,
+            Role = user?.GlobalRole ?? UserRole.Member,
             JoinedAt = existingMembership?.JoinedAt ?? DateTime.UtcNow,
             IsOnline = true
         };
@@ -202,11 +255,12 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
     public async ValueTask DeleteMessageAsync(Guid roomId, Guid messageId)
     {
-        var membership = await GetMembershipOrThrowAsync(roomId);
+        await GetMembershipOrThrowAsync(roomId);
+        var actorRole = await GetUserGlobalRoleAsync(_userId);
         var message = await _db.Messages.FindAsync(messageId)
             ?? throw new ReturnStatusException(Grpc.Core.StatusCode.NotFound, "Message not found");
 
-        if (message.SenderId != _userId && membership.Role < UserRole.Moderator)
+        if (message.SenderId != _userId && actorRole < UserRole.Moderator)
         {
             throw new ReturnStatusException(Grpc.Core.StatusCode.PermissionDenied, "Insufficient permissions");
         }
@@ -222,8 +276,9 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
     public async ValueTask KickUserAsync(Guid roomId, Guid userId)
     {
-        var membership = await GetMembershipOrThrowAsync(roomId);
-        if (membership.Role < UserRole.Moderator)
+        await GetMembershipOrThrowAsync(roomId);
+        var actorRole = await GetUserGlobalRoleAsync(_userId);
+        if (actorRole < UserRole.Moderator)
         {
             throw new ReturnStatusException(Grpc.Core.StatusCode.PermissionDenied, "Insufficient permissions");
         }
@@ -232,10 +287,13 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
             .FirstOrDefaultAsync(m => m.RoomId == roomId && m.UserId == userId)
             ?? throw new ReturnStatusException(Grpc.Core.StatusCode.NotFound, "User not in room");
 
-        if (targetMembership.Role >= membership.Role)
+        var targetRole = await GetUserGlobalRoleAsync(userId);
+        if (targetRole >= actorRole)
         {
             throw new ReturnStatusException(Grpc.Core.StatusCode.PermissionDenied, "Cannot kick user with equal or higher role");
         }
+
+        RemoveVoiceParticipant(roomId, userId);
 
         _db.ChatRoomMembers.Remove(targetMembership);
         await _db.SaveChangesAsync();
@@ -243,12 +301,50 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
         var group = await Group.AddAsync($"room:{roomId}");
         group.All.OnUserKicked(roomId, userId, "Kicked by moderator");
+        group.All.OnUserLeftVoiceVideo(roomId, userId);
+        group.All.OnUserKickedFromVoiceVideo(roomId, userId, "Kicked from call by moderator");
+    }
+
+    public async ValueTask KickUserFromVoiceVideoAsync(Guid roomId, Guid userId, string reason)
+    {
+        await GetMembershipOrThrowAsync(roomId);
+        var actorRole = await GetUserGlobalRoleAsync(_userId);
+        if (actorRole < UserRole.Moderator)
+        {
+            throw new ReturnStatusException(StatusCode.PermissionDenied, "Insufficient permissions");
+        }
+
+        var targetMembership = await _db.ChatRoomMembers
+            .FirstOrDefaultAsync(m => m.RoomId == roomId && m.UserId == userId)
+            ?? throw new ReturnStatusException(StatusCode.NotFound, "User not in room");
+
+        var targetRole = await GetUserGlobalRoleAsync(userId);
+        if (targetRole >= actorRole)
+        {
+            throw new ReturnStatusException(StatusCode.PermissionDenied, "Cannot moderate user with equal or higher role");
+        }
+
+        if (!RemoveVoiceParticipant(roomId, userId))
+        {
+            throw new ReturnStatusException(StatusCode.NotFound, "User is not in the current call");
+        }
+
+        var group = await Group.AddAsync($"room:{roomId}");
+        group.All.OnUserLeftVoiceVideo(roomId, userId);
+        group.All.OnUserKickedFromVoiceVideo(roomId, userId,
+            string.IsNullOrWhiteSpace(reason) ? "Kicked from call by moderator" : reason.Trim());
     }
 
     public async ValueTask MoveUserAsync(Guid sourceRoomId, Guid targetRoomId, Guid userId)
     {
-        var membership = await GetMembershipOrThrowAsync(sourceRoomId);
-        if (membership.Role < UserRole.Moderator)
+        if (sourceRoomId == targetRoomId)
+        {
+            throw new ReturnStatusException(StatusCode.InvalidArgument, "Source and target room cannot be the same");
+        }
+
+        await GetMembershipOrThrowAsync(sourceRoomId);
+        var actorRole = await GetUserGlobalRoleAsync(_userId);
+        if (actorRole < UserRole.Moderator)
         {
             throw new ReturnStatusException(Grpc.Core.StatusCode.PermissionDenied, "Insufficient permissions");
         }
@@ -260,7 +356,14 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
             .FirstOrDefaultAsync(m => m.RoomId == sourceRoomId && m.UserId == userId)
             ?? throw new ReturnStatusException(Grpc.Core.StatusCode.NotFound, "User not in source room");
 
+        var targetRole = await GetUserGlobalRoleAsync(userId);
+        if (targetRole >= actorRole)
+        {
+            throw new ReturnStatusException(StatusCode.PermissionDenied, "Cannot move user with equal or higher role");
+        }
+
         _db.ChatRoomMembers.Remove(sourceMembership);
+        RemoveVoiceParticipant(sourceRoomId, userId);
 
         var existingTarget = await _db.ChatRoomMembers
             .FirstOrDefaultAsync(m => m.RoomId == targetRoomId && m.UserId == userId);
@@ -282,6 +385,8 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
         var sourceGroup = await Group.AddAsync($"room:{sourceRoomId}");
         sourceGroup.All.OnUserMoved(sourceRoomId, targetRoomId, userId);
+        sourceGroup.All.OnUserLeftVoiceVideo(sourceRoomId, userId);
+        sourceGroup.All.OnUserKickedFromVoiceVideo(sourceRoomId, userId, "Moved to another room");
 
         var targetGroup = await Group.AddAsync($"room:{targetRoomId}");
         var user = await _db.Users.FindAsync(userId);
@@ -293,7 +398,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
                 UserName = user.UserName!,
                 DisplayName = user.DisplayName,
                 AvatarUrl = user.AvatarUrl,
-                Role = UserRole.Member,
+                Role = user.GlobalRole,
                 JoinedAt = DateTime.UtcNow,
                 IsOnline = _onlineUsers.ContainsKey(userId)
             });
@@ -302,25 +407,29 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
     public async ValueTask SetUserRoleAsync(Guid roomId, Guid userId, UserRole role)
     {
-        var membership = await GetMembershipOrThrowAsync(roomId);
-        if (membership.Role < UserRole.Admin)
+        var actorRole = await GetUserGlobalRoleAsync(_userId);
+        if (actorRole < UserRole.Admin)
         {
             throw new ReturnStatusException(Grpc.Core.StatusCode.PermissionDenied, "Only admins and owners can change roles");
         }
 
-        var targetMembership = await _db.ChatRoomMembers
-            .FirstOrDefaultAsync(m => m.RoomId == roomId && m.UserId == userId)
-            ?? throw new ReturnStatusException(Grpc.Core.StatusCode.NotFound, "User not in room");
+        var targetUser = await _db.Users.FindAsync(userId)
+            ?? throw new ReturnStatusException(Grpc.Core.StatusCode.NotFound, "User not found");
 
-        if (role >= membership.Role)
+        if (targetUser.GlobalRole >= actorRole)
+        {
+            throw new ReturnStatusException(StatusCode.PermissionDenied, "Cannot change role for user with equal or higher role");
+        }
+
+        if (role >= actorRole || role == UserRole.Owner)
         {
             throw new ReturnStatusException(Grpc.Core.StatusCode.PermissionDenied, "Cannot assign a role equal to or higher than your own");
         }
 
-        targetMembership.Role = role;
+        targetUser.GlobalRole = role;
         await _db.SaveChangesAsync();
 
-        var group = await Group.AddAsync($"room:{roomId}");
+        var group = await Group.AddAsync("global");
         group.All.OnUserRoleChanged(roomId, userId, role);
     }
 
@@ -423,7 +532,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
             RoomId = roomId,
             JanusSessionId = sessionId,
             JanusHandleId = handleId,
-            JanusUrl = _config["Janus:Url"] ?? "http://localhost:8088/janus",
+            JanusUrl = _config["Janus:Url"] ?? "ws://localhost:8188",
             IceServers = iceServersJson,
             ServerBaseUrl = serverBase,
             JanusRoomId = janusRoomId
@@ -442,6 +551,22 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
         var group = await Group.AddAsync($"room:{roomId}");
         group.All.OnUserLeftVoiceVideo(roomId, _userId);
+    }
+
+    public ValueTask<Guid[]> GetVoiceVideoParticipantsAsync(Guid roomId)
+    {
+        if (!_joinedRooms.Contains(roomId))
+            throw new ReturnStatusException(StatusCode.FailedPrecondition, "Not in this room");
+
+        if (_voiceVideoUsers.TryGetValue(roomId, out var users))
+        {
+            lock (users)
+            {
+                return ValueTask.FromResult(users.ToArray());
+            }
+        }
+
+        return ValueTask.FromResult(Array.Empty<Guid>());
     }
 
     public async ValueTask SendWebRtcSignalAsync(Guid roomId, Guid targetUserId, string signalType, string payload)
@@ -472,6 +597,16 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
             ?? throw new ReturnStatusException(Grpc.Core.StatusCode.PermissionDenied, "Not a member of this room");
     }
 
+    private async Task<UserRole> GetUserGlobalRoleAsync(Guid userId)
+    {
+        var role = await _db.Users
+            .Where(u => u.Id == userId)
+            .Select(u => (UserRole?)u.GlobalRole)
+            .FirstOrDefaultAsync();
+
+        return role ?? UserRole.Member;
+    }
+
     private async Task RemoveFromRoomGroupAsync(Guid roomId)
     {
         var group = await Group.AddAsync($"room:{roomId}");
@@ -482,6 +617,25 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
     private async Task InvalidateMessageCache(Guid roomId)
     {
         await _cache.RemoveAsync($"messages:{roomId}:50:"); 
+    }
+
+    private static bool RemoveVoiceParticipant(Guid roomId, Guid userId)
+    {
+        if (!_voiceVideoUsers.TryGetValue(roomId, out var users))
+        {
+            return false;
+        }
+
+        lock (users)
+        {
+            var removed = users.Remove(userId);
+            if (users.Count == 0)
+            {
+                _voiceVideoUsers.TryRemove(roomId, out _);
+            }
+
+            return removed;
+        }
     }
 
     private static string GetDmKey(Guid a, Guid b) =>

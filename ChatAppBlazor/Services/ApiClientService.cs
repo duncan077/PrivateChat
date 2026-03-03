@@ -77,6 +77,13 @@ public class ApiClientService
         return await client.DeleteRoomAsync(roomId);
     }
 
+    public async Task<ServerMemberInfo[]> GetServerMembersAsync()
+    {
+        var client = MagicOnionClient.Create<IChatRoomService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.GetServerMembersAsync();
+    }
+
     public async Task<ChatMemberInfo[]> GetRoomMembersAsync(Guid roomId)
     {
         var client = MagicOnionClient.Create<IChatRoomService>(
@@ -199,4 +206,5 @@ public class ApiClientService
         [JsonPropertyName("url")]
         public string Url { get; set; } = string.Empty;
     }
+
 }

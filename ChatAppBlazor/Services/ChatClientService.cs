@@ -18,6 +18,7 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
     public event Action<Guid, ChatMemberInfo>? OnUserJoinedRoom;
     public event Action<Guid, Guid>? OnUserLeftRoom;
     public event Action<Guid, Guid, string>? OnUserKicked;
+    public event Action<Guid, Guid, string>? OnUserKickedFromVoiceVideo;
     public event Action<Guid, Guid, Guid>? OnUserMoved;
     public event Action<Guid, Guid, UserRole>? OnUserRoleChanged;
     public event Action<PrivateMessage>? OnPrivateMessageReceived;
@@ -176,6 +177,12 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
         await _hub!.KickUserAsync(roomId, userId);
     }
 
+    public async Task KickUserFromVoiceVideoAsync(Guid roomId, Guid userId, string reason)
+    {
+        EnsureConnected();
+        await _hub!.KickUserFromVoiceVideoAsync(roomId, userId, reason);
+    }
+
     public async Task MoveUserAsync(Guid sourceRoomId, Guid targetRoomId, Guid userId)
     {
         EnsureConnected();
@@ -217,6 +224,12 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
         await _hub!.LeaveVoiceVideoAsync(roomId);
     }
 
+    public async Task<Guid[]> GetVoiceVideoParticipantsAsync(Guid roomId)
+    {
+        EnsureConnected();
+        return await _hub!.GetVoiceVideoParticipantsAsync(roomId);
+    }
+
     public async Task SendWebRtcSignalAsync(Guid roomId, Guid targetUserId, string signalType, string payload)
     {
         EnsureConnected();
@@ -229,6 +242,7 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
     void IChatHubReceiver.OnUserJoinedRoom(Guid roomId, ChatMemberInfo member) => OnUserJoinedRoom?.Invoke(roomId, member);
     void IChatHubReceiver.OnUserLeftRoom(Guid roomId, Guid userId) => OnUserLeftRoom?.Invoke(roomId, userId);
     void IChatHubReceiver.OnUserKicked(Guid roomId, Guid userId, string reason) => OnUserKicked?.Invoke(roomId, userId, reason);
+    void IChatHubReceiver.OnUserKickedFromVoiceVideo(Guid roomId, Guid userId, string reason) => OnUserKickedFromVoiceVideo?.Invoke(roomId, userId, reason);
     void IChatHubReceiver.OnUserMoved(Guid sourceRoomId, Guid targetRoomId, Guid userId) => OnUserMoved?.Invoke(sourceRoomId, targetRoomId, userId);
     void IChatHubReceiver.OnUserRoleChanged(Guid roomId, Guid userId, UserRole newRole) => OnUserRoleChanged?.Invoke(roomId, userId, newRole);
     void IChatHubReceiver.OnPrivateMessageReceived(PrivateMessage message) => OnPrivateMessageReceived?.Invoke(message);
@@ -248,4 +262,5 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
     {
         await DisconnectAsync();
     }
+
 }

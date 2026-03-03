@@ -93,7 +93,7 @@ public class ChatRoomServiceImpl : ServiceBase<IChatRoomService>, IChatRoomServi
             Id = Guid.NewGuid(),
             RoomId = room.Id,
             UserId = userId,
-            Role = UserRole.Owner,
+            Role = UserRole.Member,
             JoinedAt = DateTime.UtcNow
         };
 
@@ -132,6 +132,47 @@ public class ChatRoomServiceImpl : ServiceBase<IChatRoomService>, IChatRoomServi
         return true;
     }
 
+    public async UnaryResult<ServerMemberInfo[]> GetServerMembersAsync()
+    {
+        var users = await _db.Users
+            .AsNoTracking()
+            .Select(u => new
+            {
+                u.Id,
+                UserName = u.UserName!,
+                u.DisplayName,
+                u.AvatarUrl,
+                u.GlobalRole
+            })
+            .ToArrayAsync();
+
+        var memberships = await _db.ChatRoomMembers
+            .AsNoTracking()
+            .Select(m => new { m.UserId, m.RoomId })
+            .ToArrayAsync();
+
+        var roomIdsByUser = memberships
+            .GroupBy(m => m.UserId)
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(x => x.RoomId).Distinct().ToArray());
+
+        return users
+            .Select(u => new ServerMemberInfo
+            {
+                UserId = u.Id,
+                UserName = u.UserName,
+                DisplayName = u.DisplayName,
+                AvatarUrl = u.AvatarUrl,
+                IsOnline = Hubs.ChatHubImpl.IsUserOnline(u.Id),
+                RoomIds = roomIdsByUser.TryGetValue(u.Id, out var roomIds) ? roomIds : [],
+                Role = u.GlobalRole
+            })
+            .OrderBy(m => m.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(m => m.UserName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     public async UnaryResult<ChatMemberInfo[]> GetRoomMembersAsync(Guid roomId)
     {
         return await _db.ChatRoomMembers
@@ -143,7 +184,7 @@ public class ChatRoomServiceImpl : ServiceBase<IChatRoomService>, IChatRoomServi
                 UserName = m.User.UserName!,
                 DisplayName = m.User.DisplayName,
                 AvatarUrl = m.User.AvatarUrl,
-                Role = m.Role,
+                Role = m.User.GlobalRole,
                 JoinedAt = m.JoinedAt
             })
             .ToArrayAsync();

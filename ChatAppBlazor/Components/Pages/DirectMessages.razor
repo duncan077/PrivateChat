@@ -6,51 +6,26 @@
 @inject IJSRuntime JS
 
 <div class="dm-page">
-    @* ─── Left: Contacts list ─── *@
-    <div class="dm-sidebar">
-        <MudStack Row AlignItems="AlignItems.Center" Class="pa-3">
-            <MudText Typo="Typo.subtitle1" Style="font-weight:600">Messages</MudText>
-        </MudStack>
 
-        @if (Store.Contacts.Length == 0)
-        {
-            <MudText Typo="Typo.body2" Color="Color.Secondary" Class="pa-3">No conversations yet</MudText>
-        }
-
-        <MudList T="Guid" Dense="true">
-            @foreach (var contact in Store.Contacts)
-            {
-                <MudListItem T="Guid" Value="contact.Id"
-                             OnClick="() => SelectContact(contact)"
-                             Class="@(contact.Id == Store.SelectedContactId ? "mud-selected-item" : "")">
-                    <div class="contact-entry">
-                        <MudAvatar Size="Size.Small" Color="Color.Secondary">
-                            @contact.DisplayName[0]
-                        </MudAvatar>
-                        <div class="ml-2">
-                            <MudText Typo="Typo.body2" Style="font-weight:500">@contact.DisplayName</MudText>
-                            <MudText Typo="Typo.caption" Color="Color.Secondary">@@@contact.UserName</MudText>
-                        </div>
-                    </div>
-                </MudListItem>
-            }
-        </MudList>
-    </div>
 
     @* ─── Right: Chat area ─── *@
     <div class="dm-main">
         @if (Store.SelectedContact != null)
         {
             <div class="chat-toolbar">
-                <MudStack Row AlignItems="AlignItems.Center" Class="pa-2 px-3" Style="width:100%">
-                    <MudAvatar Size="Size.Small" Color="Color.Secondary">
-                        @Store.SelectedContact.DisplayName[0]
-                    </MudAvatar>
-                    <div class="ml-2">
-                        <MudText Typo="Typo.subtitle1" Style="font-weight:600">@Store.SelectedContact.DisplayName</MudText>
-                        <MudText Typo="Typo.caption" Color="Color.Secondary">@@@Store.SelectedContact.UserName</MudText>
+                <div class="chat-toolbar-content">
+                    <div class="chat-toolbar-title-wrap">
+                        <MudStack Row AlignItems="AlignItems.Center" Spacing="1">
+                            <MudAvatar Size="Size.Small" Color="Color.Secondary">
+                                @Store.SelectedContact.DisplayName[0]
+                            </MudAvatar>
+                            <div>
+                                <MudText Typo="Typo.subtitle1" Style="font-weight:600">@Store.SelectedContact.DisplayName</MudText>
+                                <MudText Typo="Typo.caption" Color="Color.Secondary">@@@Store.SelectedContact.UserName</MudText>
+                            </div>
+                        </MudStack>
                     </div>
-                </MudStack>
+                </div>
             </div>
 
             <div class="chat-messages-area">
@@ -148,11 +123,27 @@
     private readonly List<AttachmentInfo> _pendingAttachments = [];
     private const long MaxUploadBytes = 50L * 1024 * 1024;
     private InputFile? _fileInput;
+    private Guid? _lastAutoOpenedUserId;
+
+    [SupplyParameterFromQuery(Name = "userId")]
+    public Guid? RequestedUserId { get; set; }
+
+    [SupplyParameterFromQuery(Name = "userName")]
+    public string? RequestedUserName { get; set; }
+
+    [SupplyParameterFromQuery(Name = "displayName")]
+    public string? RequestedDisplayName { get; set; }
 
     protected override async Task OnInitializedAsync()
     {
         Store.OnChange += OnStoreChanged;
         await Store.LoadContactsAsync();
+        await TryOpenRequestedConversationAsync();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await TryOpenRequestedConversationAsync();
     }
 
     private async Task SelectContact(UserInfo contact) => await Store.SelectContactAsync(contact);
@@ -235,6 +226,34 @@
     private void RemovePendingAttachment(Guid attachmentId)
     {
         _pendingAttachments.RemoveAll(a => a.Id == attachmentId);
+    }
+
+    private async Task TryOpenRequestedConversationAsync()
+    {
+        if (RequestedUserId == null || RequestedUserId == Guid.Empty) return;
+        if (RequestedUserId == Auth.CurrentUser?.Id) return;
+
+        var targetUserId = RequestedUserId.Value;
+        if (_lastAutoOpenedUserId == targetUserId && Store.SelectedContactId == targetUserId) return;
+
+        var requestedContact = Store.Contacts.FirstOrDefault(c => c.Id == targetUserId) ?? BuildRequestedContact(targetUserId);
+        await Store.OpenConversationAsync(requestedContact);
+        _lastAutoOpenedUserId = targetUserId;
+    }
+
+    private UserInfo BuildRequestedContact(Guid userId)
+    {
+        var fallbackUserName = $"user_{userId.ToString()[..8]}";
+        var userName = string.IsNullOrWhiteSpace(RequestedUserName) ? fallbackUserName : RequestedUserName.Trim();
+        var displayName = string.IsNullOrWhiteSpace(RequestedDisplayName) ? userName : RequestedDisplayName.Trim();
+
+        return new UserInfo
+        {
+            Id = userId,
+            UserName = userName,
+            DisplayName = displayName,
+            IsOnline = false
+        };
     }
 
     private void OnStoreChanged() => InvokeAsync(StateHasChanged);

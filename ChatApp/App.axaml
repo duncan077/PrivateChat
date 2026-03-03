@@ -1,9 +1,0 @@
-<Application xmlns="https://github.com/avaloniaui"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             x:Class="ChatApp.App"
-             RequestedThemeVariant="Dark">
-    <Application.Styles>
-        <FluentTheme />
-        <StyleInclude Source="avares://ChatApp/Styles/Theme.axaml" />
-    </Application.Styles>
-</Application>

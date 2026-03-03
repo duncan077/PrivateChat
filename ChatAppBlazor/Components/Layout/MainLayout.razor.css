@@ -25,8 +25,71 @@
     position: relative;
 }
 
+.app-shell-main-mobile {
+    padding-bottom: calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom));
+}
+
+.app-root-mobile .app-shell-drawer {
+    width: min(88vw, 340px) !important;
+    max-width: 340px;
+}
+
+.app-root-mobile .app-shell-nav {
+    padding-bottom: max(0.6rem, env(safe-area-inset-bottom));
+}
+
+.mobile-bottom-nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1500;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.55rem;
+    padding: 0.55rem max(0.65rem, env(safe-area-inset-left)) max(0.55rem, env(safe-area-inset-bottom)) max(0.65rem, env(safe-area-inset-right));
+    border-top: 1px solid rgba(164, 182, 212, 0.2);
+    background: linear-gradient(180deg, rgba(7, 14, 26, 0.98), rgba(9, 16, 29, 0.98));
+    backdrop-filter: blur(14px);
+}
+
+.mobile-bottom-nav-btn {
+    border: 1px solid rgba(164, 182, 212, 0.3);
+    border-radius: 13px;
+    background: rgba(255, 255, 255, 0.02);
+    color: var(--pc-text-muted);
+    min-height: 42px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
+}
+
+.mobile-bottom-nav-btn.active {
+    background: rgba(22, 165, 154, 0.18);
+    border-color: rgba(22, 165, 154, 0.55);
+    color: var(--pc-text);
+}
+
+.mobile-bottom-nav-btn .mud-icon-root {
+    font-size: 1rem;
+}
+
 @media (max-width: 880px) {
     .app-shell-subtitle {
         display: none;
+    }
+}
+
+@media (max-width: 760px) {
+    .app-shell-bar {
+        min-height: 56px;
+    }
+
+    .app-root-mobile .update-banner {
+        bottom: calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom) + 0.25rem);
     }
 }
