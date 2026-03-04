@@ -55,6 +55,7 @@ window.webrtcManager = {
     // Polling / keepalive / participant discovery
     polling: false,
     pollAbort: null,
+    lastPollActivityAt: 0,
     keepaliveTimer: null,
     participantCheckTimer: null,
     keepaliveFailures: 0,
@@ -2766,6 +2767,54 @@ window.webrtcManager = {
         return liveScreenTrack || liveMicTrack || null;
     },
 
+    isWindowsNativeFallbackAudioTrack(track) {
+        if (!track || !this.screenAudioFallbackTrack) return false;
+        return track.id === this.screenAudioFallbackTrack.id;
+    },
+
+    selectPreferredScreenShareAudioTrack(stream) {
+        const tracks = stream?.getAudioTracks?.() || [];
+        if (!Array.isArray(tracks) || tracks.length === 0) return null;
+
+        // Prefer browser/native display-captured audio over host fallback when both exist.
+        return tracks.find(t => t && t.readyState === 'live' && !this.isWindowsNativeFallbackAudioTrack(t))
+            || tracks.find(t => t && !this.isWindowsNativeFallbackAudioTrack(t))
+            || tracks.find(t => t && t.readyState === 'live')
+            || tracks[0]
+            || null;
+    },
+
+    async waitForScreenShareAudioTrack(stream, timeoutMs = 900) {
+        if (!stream || typeof stream.getAudioTracks !== 'function') return null;
+        const existing = stream.getAudioTracks().find(t => t && t.readyState === 'live') || null;
+        if (existing) return existing;
+
+        return await new Promise(resolve => {
+            let done = false;
+            let timerId = null;
+            const finish = (track) => {
+                if (done) return;
+                done = true;
+                if (timerId) clearTimeout(timerId);
+                try { stream.removeEventListener?.('addtrack', onAddTrack); } catch { }
+                resolve(track || null);
+            };
+            const onAddTrack = (event) => {
+                const track = event?.track;
+                if (track?.kind !== 'audio') return;
+                finish(track);
+            };
+
+            try { stream.addEventListener?.('addtrack', onAddTrack); } catch { }
+            timerId = setTimeout(() => {
+                const track = stream.getAudioTracks().find(t => t && t.readyState === 'live')
+                    || stream.getAudioTracks()[0]
+                    || null;
+                finish(track);
+            }, Math.max(100, parseInt(timeoutMs, 10) || 900));
+        });
+    },
+
     async buildBaseOutgoingAudioTrack() {
         if (this.isScreenSharing) {
             return await this.buildScreenShareOutgoingAudioTrack(
@@ -3911,10 +3960,7 @@ window.webrtcManager = {
             cell.appendChild(volumePanel);
         }
 
-        const identityKey = this.getFeedIdentityKey(feedId);
-        const currentVolume = identityKey
-            ? this.getIdentityVolumeState(identityKey).mic
-            : (this.remoteFeedVolumes[String(feedId)] ?? 100);
+        const currentVolume = this.getFeedVolumePercent(feedId);
 
         const slider = volumePanel.querySelector('.video-volume-slider-main');
         const label = volumePanel.querySelector('.video-volume-label-main');
@@ -4145,7 +4191,12 @@ window.webrtcManager = {
         if (!identityKey) {
             return this.remoteFeedVolumes[key] ?? 100;
         }
-        return this.getIdentityVolumeState(identityKey).mic;
+        const state = this.getIdentityVolumeState(identityKey);
+        const role = this.getFeedRole(key);
+        if (role === 'stream') {
+            return state.stream;
+        }
+        return state.mic;
     },
 
     identityHasStreamAudioFeed(identityKey) {
@@ -4209,15 +4260,25 @@ window.webrtcManager = {
         if (!identityKey) return;
 
         const volumeState = this.getIdentityVolumeState(identityKey);
-        volumeState.mic = volumePercent;
-        volumeState.stream = volumePercent;
+        const role = this.getFeedRole(key);
+        if (role === 'stream') {
+            volumeState.stream = volumePercent;
+        } else {
+            volumeState.mic = volumePercent;
+            // Keep stream tied to mic unless stream-specific volume was explicitly changed.
+            if (!this.identityHasStreamAudioFeed(identityKey)) {
+                volumeState.stream = volumePercent;
+            }
+        }
         this.remoteIdentityVolumes[identityKey] = volumeState;
 
         for (const [otherFeedId] of Object.entries(this.feeds)) {
             const normalizedOther = String(otherFeedId);
             if (this.getFeedIdentityKey(normalizedOther) !== identityKey) continue;
 
-            this.remoteFeedVolumes[normalizedOther] = volumePercent;
+            const otherRole = this.getFeedRole(normalizedOther);
+            this.remoteFeedVolumes[normalizedOther] =
+                otherRole === 'stream' ? volumeState.stream : volumeState.mic;
         }
 
         for (const [otherFeedId] of Object.entries(this.feeds)) {
@@ -4374,7 +4435,9 @@ window.webrtcManager = {
 
     async startPolling() {
         this.polling = true;
+        this.lastPollActivityAt = Date.now();
         this.log('poll', 'Polling loop started');
+        let emptyPollResponses = 0;
 
         while (this.polling) {
             try {
@@ -4384,9 +4447,23 @@ window.webrtcManager = {
                     `/api/janus/session/${this.janusSessionId}/poll`,
                     this.pollAbort.signal
                 );
-                if (!event || !this.polling) break;
+                this.lastPollActivityAt = Date.now();
+                if (!this.polling) break;
+                if (!event) {
+                    emptyPollResponses++;
+                    if (emptyPollResponses <= 3 || emptyPollResponses % 10 === 0) {
+                        this.log('poll', `Empty poll response (${emptyPollResponses}); continuing`);
+                    }
+                    await this.sleep(150);
+                    continue;
+                }
+                emptyPollResponses = 0;
 
-                const type = event.janus;
+                const type = event?.janus;
+                if (!type) {
+                    this.log('poll', 'Poll payload missing janus type; ignoring');
+                    continue;
+                }
 
                 // Log FULL raw event for every non-keepalive (critical for debugging)
                 if (type !== 'keepalive') {
@@ -4609,6 +4686,8 @@ window.webrtcManager = {
 
                 this.log('poll', `Poll error (retrying in 1s): ${errMsg}`);
                 await this.sleep(1000);
+            } finally {
+                this.pollAbort = null;
             }
         }
         this.log('poll', 'Polling loop ended');
@@ -4628,6 +4707,17 @@ window.webrtcManager = {
                 this.keepaliveFailures++;
                 this.log('keepalive', `Keepalive failed (${this.keepaliveFailures}/3): ${err.message}`);
                 if (this.keepaliveFailures >= 3) {
+                    // If long-poll is still healthy, avoid false-positive session loss.
+                    const lastPollAgeMs = this.lastPollActivityAt > 0
+                        ? (Date.now() - this.lastPollActivityAt)
+                        : Number.POSITIVE_INFINITY;
+                    const pollLooksHealthy = this.polling && Number.isFinite(lastPollAgeMs) && lastPollAgeMs < 90_000;
+                    if (pollLooksHealthy) {
+                        this.log('keepalive', `Suppressing session-lost trigger: poll active ${Math.round(lastPollAgeMs / 1000)}s ago`);
+                        this.keepaliveFailures = 0;
+                        return;
+                    }
+
                     this.log('keepalive', 'Janus session lost (3 consecutive keepalive failures)');
                     this.notifyDotNet('OnJanusSessionLost');
                     this.keepaliveFailures = 0; // Reset so we don't fire again
@@ -4866,8 +4956,17 @@ window.webrtcManager = {
                 { enforceResolutionCap: !isSystemShare }
             );
 
+            // Some Windows builds attach display-audio slightly after getDisplayMedia resolves.
+            // Give it a short grace window before engaging native fallback.
+            if (captureScreenAudio && stream.getAudioTracks().length === 0) {
+                const delayedAudioTrack = await this.waitForScreenShareAudioTrack(stream, 1100);
+                if (delayedAudioTrack) {
+                    this.log('screenshare', 'Display audio track appeared after capture start; skipping native fallback');
+                }
+            }
+
             // WebView2 often returns no display-audio track for window/screen picks.
-            // On Windows desktop, request native loopback fallback via host bridge.
+            // On Windows desktop, request native loopback fallback via host bridge only when still needed.
             if (captureScreenAudio && stream.getAudioTracks().length === 0) {
                 const preferProcessIsolation = treatAsWindowShare;
                 const allowSystemFallback = isSystemShare;
@@ -4899,8 +4998,9 @@ window.webrtcManager = {
             // Keep exactly one screen-share audio track to avoid duplicate playback/sending.
             const screenAudioTracks = stream.getAudioTracks();
             if (screenAudioTracks.length > 1) {
-                const [primaryAudioTrack, ...extraAudioTracks] = screenAudioTracks;
-                for (const track of extraAudioTracks) {
+                const primaryAudioTrack = this.selectPreferredScreenShareAudioTrack(stream) || screenAudioTracks[0] || null;
+                for (const track of screenAudioTracks) {
+                    if (!track || (primaryAudioTrack && track.id === primaryAudioTrack.id)) continue;
                     try { stream.removeTrack(track); } catch { }
                     try { track.stop(); } catch { }
                 }
@@ -4908,6 +5008,14 @@ window.webrtcManager = {
                     'screenshare',
                     `Detected ${screenAudioTracks.length} screen audio tracks; using only ${primaryAudioTrack?.id || 'primary'}`
                 );
+            }
+
+            const preferredPreFallbackShutdown = this.selectPreferredScreenShareAudioTrack(stream);
+            if (captureScreenAudio && preferredPreFallbackShutdown
+                && this.isWindowsNativeFallbackAudioTrack(this.screenAudioFallbackTrack)
+                && preferredPreFallbackShutdown.id !== this.screenAudioFallbackTrack.id) {
+                this.log('screenshare', 'Browser display audio track available; disabling Windows native fallback to avoid double audio');
+                await this.stopWindowsScreenAudioFallback(true);
             }
 
             const hasLiveShareAudioTrack = stream.getAudioTracks().some(t => t && t.readyState === 'live');
@@ -4920,16 +5028,67 @@ window.webrtcManager = {
             this.screenStream = stream;
             this.isScreenSharing = true;
 
+            stream.onaddtrack = async (event) => {
+                try {
+                    const addedTrack = event?.track;
+                    if (!this.isScreenSharing || this.screenStream !== stream || addedTrack?.kind !== 'audio') {
+                        return;
+                    }
+
+                    // If browser display-audio appears after we already attached fallback, switch away from fallback.
+                    if (this.isWindowsNativeFallbackAudioTrack(this.screenAudioFallbackTrack)
+                        && addedTrack.id !== this.screenAudioFallbackTrack?.id) {
+                        this.log('screenshare', 'Late browser display-audio track detected; disabling native fallback to avoid duplicate audio');
+                        await this.stopWindowsScreenAudioFallback(true);
+                    }
+
+                    const preferredTrack = this.selectPreferredScreenShareAudioTrack(stream);
+                    const audioSender = this.findSenderByKind(this.publisherPc, 'audio');
+                    if (!audioSender) return;
+
+                    const mixedOrPreferredTrack = await this.buildScreenShareOutgoingAudioTrack(
+                        preferredTrack,
+                        this.localStream?.getAudioTracks?.()[0] || null
+                    );
+                    await audioSender.replaceTrack(mixedOrPreferredTrack);
+                } catch (err) {
+                    this.log('screenshare', `onaddtrack audio reconcile failed: ${err.message}`);
+                }
+            };
+
             const outgoingScreenVideoTrack = this.screenStream.getVideoTracks()[0] || null;
             const outgoingScreenAudioTrack = await this.buildScreenShareOutgoingAudioTrack(
-                this.screenStream.getAudioTracks()[0] || null,
+                this.selectPreferredScreenShareAudioTrack(this.screenStream),
                 this.localStream?.getAudioTracks?.()[0] || null
             );
 
             const localVideo = document.getElementById('localVideo');
             if (localVideo) localVideo.srcObject = this.screenStream;
 
-            this.screenStream.getVideoTracks()[0].onended = () => this.stopScreenShare();
+            this.screenStream.getVideoTracks()[0].onended = () => {
+                const finalizeStop = () => {
+                    if (!this.isScreenSharing || this.screenStream !== stream) return;
+                    const activeVideoTrack = this.screenStream.getVideoTracks()[0] || null;
+                    if (activeVideoTrack && activeVideoTrack.readyState !== 'ended') return;
+                    this.stopScreenShare();
+                };
+
+                if (document.hidden) {
+                    this.log('screenshare', 'Screen-share track ended while app hidden; deferring stop until app is visible');
+                    const waitUntilVisible = () => {
+                        if (!this.isScreenSharing || this.screenStream !== stream) return;
+                        if (document.hidden) {
+                            setTimeout(waitUntilVisible, 350);
+                            return;
+                        }
+                        finalizeStop();
+                    };
+                    waitUntilVisible();
+                    return;
+                }
+
+                finalizeStop();
+            };
 
             // Replace tracks in publisher PC and renegotiate with Janus if needed
             if (this.publisherPc) {
@@ -5010,6 +5169,7 @@ window.webrtcManager = {
         this.setSystemScreenShareAppPlaybackSuppressed(false);
 
         if (this.screenStream) {
+            this.screenStream.onaddtrack = null;
             this.screenStream.getTracks().forEach(t => t.stop());
             this.screenStream = null;
         }
@@ -5343,7 +5503,9 @@ window.webrtcManager = {
 
     // â”€â”€â”€ Stop everything â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    stop() {
+    stop(reason) {
+        const stopReason = typeof reason === 'string' && reason.trim() ? reason.trim() : 'unspecified';
+        this.log('stop', `Stopping WebRTC manager (reason=${stopReason})`);
         this.polling = false;
         if (this.pollAbort) {
             this.pollAbort.abort();

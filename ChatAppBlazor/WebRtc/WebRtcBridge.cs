@@ -75,11 +75,12 @@ public class WebRtcBridge : IAsyncDisposable
         });
     }
 
-    public async Task StopAsync()
+    public async Task StopAsync(string reason = "unspecified")
     {
         try
         {
-            await _js.InvokeVoidAsync("webrtcManager.stop");
+            Console.WriteLine($"[WebRtcBridge] StopAsync called (reason={reason})");
+            await _js.InvokeVoidAsync("webrtcManager.stop", reason);
         }
         catch { }
     }
@@ -232,7 +233,7 @@ public class WebRtcBridge : IAsyncDisposable
         try
         {
             Console.WriteLine($"[WebRtcBridge] Re-initializing JS with new Janus session {session.JanusSessionId}...");
-            await StopAsync();
+            await StopAsync("janus-reconnect");
             await InitAsync(
                 session.JanusSessionId,
                 session.JanusHandleId,

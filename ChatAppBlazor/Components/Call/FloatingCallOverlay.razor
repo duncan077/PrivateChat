@@ -134,7 +134,7 @@
 
     private async Task LeaveCall()
     {
-        await WebRtc.StopAsync();
+        await WebRtc.StopAsync("ui-leave-floating-overlay");
         await Store.LeaveCallAsync();
     }
 

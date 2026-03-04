@@ -82,7 +82,7 @@
 
     private async Task LeaveCall()
     {
-        try { await WebRtc.StopAsync(); } catch { }
+        try { await WebRtc.StopAsync("ui-leave-active-panel"); } catch { }
         await Store.LeaveCallAsync();
     }
 

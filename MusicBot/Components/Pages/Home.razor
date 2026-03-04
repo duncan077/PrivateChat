@@ -1,0 +1,324 @@
+@page "/"
+@implements IAsyncDisposable
+@inject MusicBotRuntime Runtime
+@using Microsoft.Maui.Storage
+@using System.IO
+
+<h1>MusicBot</h1>
+
+<p>Standalone MAUI Blazor bot for PrivateChat voice rooms.</p>
+
+<div class="mb-3">
+    <label>Server URL</label>
+    <input class="form-control" @bind="_serverUrl" />
+</div>
+<div class="mb-3">
+    <label>Username</label>
+    <input class="form-control" @bind="_username" />
+</div>
+<div class="mb-3">
+    <label>Password</label>
+    <input class="form-control" type="password" @bind="_password" />
+</div>
+<div class="mb-3">
+    <label>Command Prefix</label>
+    <input class="form-control" @bind="_commandPrefix" />
+</div>
+
+<h4>YouTube Anti-Bot</h4>
+<div class="mb-3">
+    <label>External Verifier URL</label>
+    <input class="form-control" placeholder="https://your-verifier/resolve" @bind="_verifierUrl" />
+</div>
+<div class="mb-3">
+    <label>External Verifier API Key</label>
+    <input class="form-control" type="password" @bind="_verifierApiKey" />
+</div>
+<div class="mb-3">
+    <button class="btn btn-outline-primary" disabled="@(_busy)" @onclick="ApplyVerifierAsync">Apply Verifier</button>
+</div>
+@if (!string.IsNullOrWhiteSpace(_verifierStatus))
+{
+    <p><strong>Verifier:</strong> @_verifierStatus</p>
+}
+
+<div class="mb-3">
+    <label>YouTube Cookies (Netscape, JSON, or header format)</label>
+    <textarea class="form-control" rows="6" @bind="_youtubeCookies"></textarea>
+</div>
+<div class="mb-3">
+    <button class="btn btn-outline-primary me-2" disabled="@(_busy || string.IsNullOrWhiteSpace(_youtubeCookies))" @onclick="ImportCookiesAsync">Import Cookies</button>
+    <button class="btn btn-outline-secondary" disabled="@(_busy)" @onclick="ClearCookiesAsync">Clear Cookies</button>
+</div>
+@if (!string.IsNullOrWhiteSpace(_cookieStatus))
+{
+    <p><strong>Cookies:</strong> @_cookieStatus</p>
+}
+
+<div class="mb-3">
+    <button class="btn btn-success me-2" disabled="@(_busy || Runtime.IsRunning)" @onclick="StartBotAsync">Start Bot</button>
+    <button class="btn btn-danger me-2" disabled="@(_busy || !Runtime.IsRunning)" @onclick="StopBotAsync">Stop Bot</button>
+    <button class="btn btn-secondary" disabled="@(_busy)" @onclick="RefreshQueueAsync">Refresh Queue</button>
+</div>
+
+<p><strong>Status:</strong> @Runtime.Status</p>
+@if (!string.IsNullOrWhiteSpace(_error))
+{
+    <div class="alert alert-danger">@_error</div>
+}
+
+<h4>Queue</h4>
+@if (_queueLines.Count == 0)
+{
+    <p>(empty)</p>
+}
+else
+{
+    <ul>
+        @foreach (var line in _queueLines)
+        {
+            <li>@line</li>
+        }
+    </ul>
+}
+
+<h4>Logs</h4>
+<pre style="height: 320px; overflow: auto; background: #111; color: #d6ffd6; padding: 12px;">@string.Join("\n", _logs)</pre>
+
+@* Hidden elements required by webrtc-manager.js *@
+<div style="display:none">
+    <div id="videoGrid">
+        <div class="video-cell local-cell">
+            <video id="localVideo" autoplay muted playsinline></video>
+        </div>
+    </div>
+    <div id="floatVideoContainer"></div>
+</div>
+
+@code {
+    private const string PrefServerUrl = "musicbot.serverUrl";
+    private const string PrefUsername = "musicbot.username";
+    private const string PrefPassword = "musicbot.password";
+    private const string PrefCommandPrefix = "musicbot.commandPrefix";
+    private const string PrefVerifierUrl = "musicbot.verifierUrl";
+    private const string PrefVerifierApiKey = "musicbot.verifierApiKey";
+
+    private string _serverUrl = "https://chat.duncan.com.ar";
+    private string _username = "";
+    private string _password = "";
+    private string _commandPrefix = "!";
+    private string _verifierUrl = "";
+    private string _verifierApiKey = "";
+    private string _youtubeCookies = "";
+    private string? _error;
+    private string? _verifierStatus;
+    private string? _cookieStatus;
+    private bool _busy;
+    private readonly List<string> _logs = [];
+    private List<string> _queueLines = [];
+
+    protected override void OnInitialized()
+    {
+        LoadPersistedSettings();
+        Runtime.LogLine += OnLogLine;
+        Runtime.StateChanged += OnRuntimeStateChanged;
+    }
+
+    private async Task StartBotAsync()
+    {
+        _error = null;
+        _busy = true;
+        try
+        {
+            Runtime.ConfigureAntiBotVerifier(_verifierUrl, _verifierApiKey);
+            Runtime.ClearYoutubeCookies();
+            if (!string.IsNullOrWhiteSpace(_youtubeCookies))
+            {
+                Runtime.ImportYoutubeCookies(_youtubeCookies);
+            }
+            PersistSettings();
+
+            await Runtime.StartAsync(_serverUrl, _username, _password, _commandPrefix);
+            await RefreshQueueAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            AddLog($"ERROR: {ex.Message}");
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private Task ApplyVerifierAsync()
+    {
+        _error = null;
+        try
+        {
+            Runtime.ConfigureAntiBotVerifier(_verifierUrl, _verifierApiKey);
+            PersistSettings();
+            _verifierStatus = string.IsNullOrWhiteSpace(_verifierUrl)
+                ? "Disabled"
+                : $"Configured: {_verifierUrl}";
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            AddLog($"ERROR: {ex.Message}");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task ImportCookiesAsync()
+    {
+        _error = null;
+        try
+        {
+            var count = Runtime.ImportYoutubeCookies(_youtubeCookies);
+            PersistSettings();
+            _cookieStatus = count > 0 ? $"Imported {count} cookie(s)" : "No cookies imported";
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            AddLog($"ERROR: {ex.Message}");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task ClearCookiesAsync()
+    {
+        _error = null;
+        try
+        {
+            Runtime.ClearYoutubeCookies();
+            _youtubeCookies = string.Empty;
+            PersistSettings();
+            _cookieStatus = "Cleared imported cookies";
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            AddLog($"ERROR: {ex.Message}");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private async Task StopBotAsync()
+    {
+        _error = null;
+        _busy = true;
+        try
+        {
+            await Runtime.StopAsync();
+            await RefreshQueueAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            AddLog($"ERROR: {ex.Message}");
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task RefreshQueueAsync()
+    {
+        var snapshot = await Runtime.GetQueueSnapshotAsync();
+        _queueLines = snapshot.ToList();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void OnLogLine(string line)
+    {
+        AddLog(line);
+    }
+
+    private void AddLog(string line)
+    {
+        _logs.Add(line);
+        if (_logs.Count > 300)
+        {
+            _logs.RemoveRange(0, _logs.Count - 300);
+        }
+
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void OnRuntimeStateChanged()
+    {
+        _ = InvokeAsync(async () =>
+        {
+            await RefreshQueueAsync();
+            StateHasChanged();
+        });
+    }
+
+    private static string CookieFilePath
+        => Path.Combine(FileSystem.Current.AppDataDirectory, "musicbot-youtube-cookies.txt");
+
+    private void LoadPersistedSettings()
+    {
+        _serverUrl = Preferences.Default.Get(PrefServerUrl, _serverUrl);
+        _username = Preferences.Default.Get(PrefUsername, _username);
+        _password = Preferences.Default.Get(PrefPassword, _password);
+        _commandPrefix = Preferences.Default.Get(PrefCommandPrefix, _commandPrefix);
+        _verifierUrl = Preferences.Default.Get(PrefVerifierUrl, _verifierUrl);
+        _verifierApiKey = Preferences.Default.Get(PrefVerifierApiKey, _verifierApiKey);
+
+        try
+        {
+            if (File.Exists(CookieFilePath))
+            {
+                _youtubeCookies = File.ReadAllText(CookieFilePath);
+            }
+        }
+        catch
+        {
+            _youtubeCookies = string.Empty;
+        }
+    }
+
+    private void PersistSettings()
+    {
+        Preferences.Default.Set(PrefServerUrl, _serverUrl ?? string.Empty);
+        Preferences.Default.Set(PrefUsername, _username ?? string.Empty);
+        Preferences.Default.Set(PrefPassword, _password ?? string.Empty);
+        Preferences.Default.Set(PrefCommandPrefix, _commandPrefix ?? "!");
+        Preferences.Default.Set(PrefVerifierUrl, _verifierUrl ?? string.Empty);
+        Preferences.Default.Set(PrefVerifierApiKey, _verifierApiKey ?? string.Empty);
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_youtubeCookies))
+            {
+                if (File.Exists(CookieFilePath))
+                {
+                    File.Delete(CookieFilePath);
+                }
+            }
+            else
+            {
+                File.WriteAllText(CookieFilePath, _youtubeCookies);
+            }
+        }
+        catch
+        {
+            // Ignore persistence failures; runtime can still work with in-memory values.
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Runtime.LogLine -= OnLogLine;
+        Runtime.StateChanged -= OnRuntimeStateChanged;
+        await Runtime.StopAsync();
+    }
+}

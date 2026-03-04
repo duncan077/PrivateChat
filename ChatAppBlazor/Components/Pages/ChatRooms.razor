@@ -71,46 +71,55 @@
             @* Messages *@
             @if (IsChatVisible)
             {
-                <div class="chat-messages-area @(IsInlineCallVisible ? "call-active" : "")">
-                    @foreach (var msg in Store.Messages)
-                    {
-                        var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
-                        <div class="chat-msg @(isOwn ? "own" : "") @(msg.IsDeleted ? "deleted" : "")">
-                            <div class="chat-msg-header">
-                                <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
-                                    @msg.SenderName
-                                </MudText>
-                                <MudText Typo="Typo.caption" Color="Color.Secondary">
-                                    @msg.SentAt.ToLocalTime().ToString("HH:mm")
-                                </MudText>
-                                @if (isOwn || Store.CurrentUserRole >= UserRole.Moderator)
+                <div class="chat-messages-host">
+                    <div class="chat-messages-area @(IsInlineCallVisible ? "call-active" : "")" @ref="_messagesContainerRef">
+                        @foreach (var msg in Store.Messages)
+                        {
+                            var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
+                            <div class="chat-msg @(isOwn ? "own" : "") @(msg.IsDeleted ? "deleted" : "")">
+                                <div class="chat-msg-header">
+                                    <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
+                                        @msg.SenderName
+                                    </MudText>
+                                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                        @msg.SentAt.ToLocalTime().ToString("HH:mm")
+                                    </MudText>
+                                    @if (isOwn || Store.CurrentUserRole >= UserRole.Moderator)
+                                    {
+                                        <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                                                       Color="Color.Error" OnClick="() => DeleteMessage(msg.Id)"
+                                                       Style="padding:2px" title="Delete" />
+                                    }
+                                </div>
+                                @if (!msg.IsDeleted)
                                 {
-                                    <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
-                                                   Color="Color.Error" OnClick="() => DeleteMessage(msg.Id)"
-                                                   Style="padding:2px" title="Delete" />
+                                    <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
+                                    @if (msg.Attachments.Length > 0)
+                                    {
+                                        <div class="chat-msg-attachments">
+                                            @foreach (var att in msg.Attachments)
+                                            {
+                                                <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
+                                            }
+                                        </div>
+                                    }
+                                }
+                                else
+                                {
+                                    <MudText Typo="Typo.body2" Color="Color.Secondary" Style="font-style:italic">
+                                        Message deleted
+                                    </MudText>
                                 }
                             </div>
-                            @if (!msg.IsDeleted)
-                            {
-                                <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
-                                @if (msg.Attachments.Length > 0)
-                                {
-                                    <div class="chat-msg-attachments">
-                                        @foreach (var att in msg.Attachments)
-                                        {
-                                            <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
-                                        }
-                                    </div>
-                                }
-                            }
-                            else
-                            {
-                                <MudText Typo="Typo.body2" Color="Color.Secondary" Style="font-style:italic">
-                                    Message deleted
-                                </MudText>
-                            }
-                        </div>
-                    }
+                        }
+                    </div>
+                    <button type="button"
+                            class="chat-jump-latest-button"
+                            title="Jump to latest"
+                            @ref="_jumpLatestButtonRef"
+                            @onclick="JumpToLatestAsync">
+                        Latest
+                    </button>
                 </div>
 
                 @* Input *@
@@ -438,6 +447,11 @@
     private readonly List<AttachmentInfo> _pendingAttachments = [];
     private readonly Dictionary<Guid, Guid> _moveTargetsByUserId = [];
     private Guid? _moderationTargetUserId;
+    private ElementReference _messagesContainerRef;
+    private ElementReference _jumpLatestButtonRef;
+    private bool _forceScrollToBottom;
+    private int _lastRenderedMessageCount = -1;
+    private Guid? _lastRenderedMessagesRoomId;
     private const long MaxUploadBytes = 50L * 1024 * 1024;
     private InputFile? _fileInput;
 
@@ -446,6 +460,7 @@
     private bool _lastUseFloatingOverlayInActiveRoom;
     private string _lastParticipantDirectorySignature = string.Empty;
     private string _lastCallParticipantsSignature = string.Empty;
+    private CancellationTokenSource? _pendingInactiveStopCts;
     private bool IsCallActiveForSelectedRoom => Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId;
     private bool IsInlineCallVisible => IsCallActiveForSelectedRoom && !Call.UseFloatingOverlayInActiveRoom;
     private bool IsChatVisible => Store.SelectedRoomId != null && (!IsCallActiveForSelectedRoom || Call.UseFloatingOverlayInActiveRoom);
@@ -480,6 +495,35 @@
         }
     }
 
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!IsChatVisible || Store.SelectedRoomId == null)
+            return;
+
+        try
+        {
+            await JS.InvokeVoidAsync("chatScrollManager.init", _messagesContainerRef, _jumpLatestButtonRef, 20, 180);
+            var roomId = Store.SelectedRoomId;
+            var roomChanged = _lastRenderedMessagesRoomId != roomId;
+            var messageCount = Store.Messages.Count;
+            var countChanged = messageCount != _lastRenderedMessageCount;
+            var shouldForce = _forceScrollToBottom || roomChanged || firstRender || _lastRenderedMessageCount < 0;
+
+            if (shouldForce || countChanged)
+            {
+                await JS.InvokeVoidAsync("chatScrollManager.onMessagesChanged", _messagesContainerRef, shouldForce);
+            }
+
+            _lastRenderedMessagesRoomId = roomId;
+            _lastRenderedMessageCount = messageCount;
+            _forceScrollToBottom = false;
+        }
+        catch
+        {
+            // Ignore transient JS interop failures during rerenders/navigation.
+        }
+    }
+
     private async Task SelectRoom(Guid roomId)
     {
         if (Store.SelectedRoomId == roomId) return;
@@ -492,6 +536,9 @@
 
         await Store.SelectRoomAsync(roomId, keepPreviousRoomSubscription);
         await Call.RefreshRoomParticipantsAsync(roomId);
+        _forceScrollToBottom = true;
+        _lastRenderedMessageCount = -1;
+        _lastRenderedMessagesRoomId = null;
     }
 
     private async Task SendMessage()
@@ -499,8 +546,10 @@
         if (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0) return;
         var text = _messageText;
         var attachments = _pendingAttachments.ToArray();
-        _messageText = "";
+        _messageText = string.Empty;
         _pendingAttachments.Clear();
+        _forceScrollToBottom = true;
+        await InvokeAsync(StateHasChanged);
         await Store.SendMessageAsync(text, attachments);
     }
 
@@ -573,7 +622,7 @@
             {
                 try
                 {
-                    await WebRtc.StopAsync();
+                    await WebRtc.StopAsync("join-switch-room");
                 }
                 catch
                 {
@@ -745,6 +794,19 @@
         }
     }
 
+    private async Task JumpToLatestAsync()
+    {
+        _forceScrollToBottom = false;
+        try
+        {
+            await JS.InvokeVoidAsync("chatScrollManager.jumpToLatest", _messagesContainerRef);
+        }
+        catch
+        {
+            // Ignore transient JS interop failures.
+        }
+    }
+
     private async Task DeleteSelectedRoom()
     {
         var room = Store.SelectedRoom;
@@ -834,6 +896,7 @@
         if (!wasInAnyCall && Call.IsInCall)
         {
             _showAllMembersDuringCall = false;
+            CancelPendingInactiveStop();
         }
 
         if (wasInAnyCall && !Call.IsInCall)
@@ -870,13 +933,75 @@
 
     private async Task StopWebRtcSilentlyAsync()
     {
+        CancelPendingInactiveStop();
+        var cts = new CancellationTokenSource();
+        _pendingInactiveStopCts = cts;
+
         try
         {
-            await WebRtc.StopAsync();
+            // Guard against transient call-state flips caused by out-of-order presence events.
+            await Task.Delay(4500, cts.Token);
+            if (cts.IsCancellationRequested || Call.IsInCall)
+            {
+                return;
+            }
+
+            // If the host app is in background/second plane, do not tear down WebRTC
+            // based on transient call-store state flips. Let reconnect logic recover.
+            var appVisible = await IsAppVisibleAsync();
+            if (!appVisible)
+            {
+                return;
+            }
+
+            await WebRtc.StopAsync("call-store-inactive-confirmed");
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when call state recovers before the guard window elapses.
         }
         catch
         {
             // Ignore teardown races when call state changes remotely.
+        }
+        finally
+        {
+            if (ReferenceEquals(_pendingInactiveStopCts, cts))
+            {
+                _pendingInactiveStopCts = null;
+            }
+
+            cts.Dispose();
+        }
+    }
+
+    private async Task<bool> IsAppVisibleAsync()
+    {
+        try
+        {
+            return await JS.InvokeAsync<bool>("eval", "document.visibilityState === 'visible' && !document.hidden");
+        }
+        catch
+        {
+            // Be conservative: if visibility cannot be queried, avoid tearing down call state.
+            return false;
+        }
+    }
+
+    private void CancelPendingInactiveStop()
+    {
+        if (_pendingInactiveStopCts == null)
+        {
+            return;
+        }
+
+        try
+        {
+            _pendingInactiveStopCts.Cancel();
+        }
+        catch
+        {
+            // Ignore cancellation races.
         }
     }
 
@@ -1054,6 +1179,9 @@
 
     public void Dispose()
     {
+        CancelPendingInactiveStop();
+        _pendingInactiveStopCts?.Dispose();
+        _pendingInactiveStopCts = null;
         Store.OnChange -= OnStoreChanged;
         Call.OnChange -= OnCallChanged;
         MembersPanel.OnChange -= OnMembersPanelChanged;

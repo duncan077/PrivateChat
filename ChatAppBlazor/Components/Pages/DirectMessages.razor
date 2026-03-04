@@ -28,31 +28,40 @@
                 </div>
             </div>
 
-            <div class="chat-messages-area">
-                @foreach (var msg in Store.Messages)
-                {
-                    var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
-                    <div class="chat-msg @(isOwn ? "own" : "")">
-                        <div class="chat-msg-header">
-                            <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
-                                @msg.SenderName
-                            </MudText>
-                            <MudText Typo="Typo.caption" Color="Color.Secondary">
-                                @msg.SentAt.ToLocalTime().ToString("HH:mm")
-                            </MudText>
-                        </div>
-                        <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
-                        @if (msg.Attachments.Length > 0)
-                        {
-                            <div class="chat-msg-attachments">
-                                @foreach (var att in msg.Attachments)
-                                {
-                                    <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
-                                }
+            <div class="chat-messages-host">
+                <div class="chat-messages-area" @ref="_messagesContainerRef">
+                    @foreach (var msg in Store.Messages)
+                    {
+                        var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
+                        <div class="chat-msg @(isOwn ? "own" : "")">
+                            <div class="chat-msg-header">
+                                <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
+                                    @msg.SenderName
+                                </MudText>
+                                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                    @msg.SentAt.ToLocalTime().ToString("HH:mm")
+                                </MudText>
                             </div>
-                        }
-                    </div>
-                }
+                            <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
+                            @if (msg.Attachments.Length > 0)
+                            {
+                                <div class="chat-msg-attachments">
+                                    @foreach (var att in msg.Attachments)
+                                    {
+                                        <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
+                                    }
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+                <button type="button"
+                        class="chat-jump-latest-button"
+                        title="Jump to latest"
+                        @ref="_jumpLatestButtonRef"
+                        @onclick="JumpToLatestAsync">
+                    Latest
+                </button>
             </div>
 
             <div class="chat-input-area">
@@ -124,6 +133,11 @@
     private const long MaxUploadBytes = 50L * 1024 * 1024;
     private InputFile? _fileInput;
     private Guid? _lastAutoOpenedUserId;
+    private ElementReference _messagesContainerRef;
+    private ElementReference _jumpLatestButtonRef;
+    private bool _forceScrollToBottom;
+    private int _lastRenderedMessageCount = -1;
+    private Guid? _lastRenderedContactId;
 
     [SupplyParameterFromQuery(Name = "userId")]
     public Guid? RequestedUserId { get; set; }
@@ -146,6 +160,36 @@
         await TryOpenRequestedConversationAsync();
     }
 
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (Store.SelectedContact == null)
+            return;
+
+        try
+        {
+            await JS.InvokeVoidAsync("chatScrollManager.init", _messagesContainerRef, _jumpLatestButtonRef, 20, 180);
+
+            var contactId = Store.SelectedContactId;
+            var contactChanged = _lastRenderedContactId != contactId;
+            var messageCount = Store.Messages.Count;
+            var countChanged = messageCount != _lastRenderedMessageCount;
+            var shouldForce = _forceScrollToBottom || contactChanged || firstRender || _lastRenderedMessageCount < 0;
+
+            if (shouldForce || countChanged)
+            {
+                await JS.InvokeVoidAsync("chatScrollManager.onMessagesChanged", _messagesContainerRef, shouldForce);
+            }
+
+            _lastRenderedContactId = contactId;
+            _lastRenderedMessageCount = messageCount;
+            _forceScrollToBottom = false;
+        }
+        catch
+        {
+            // Ignore transient JS interop failures during rerenders/navigation.
+        }
+    }
+
     private async Task SelectContact(UserInfo contact) => await Store.SelectContactAsync(contact);
 
     private async Task SendMessage()
@@ -153,8 +197,10 @@
         if (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0) return;
         var text = _messageText;
         var attachments = _pendingAttachments.ToArray();
-        _messageText = "";
+        _messageText = string.Empty;
         _pendingAttachments.Clear();
+        _forceScrollToBottom = true;
+        await InvokeAsync(StateHasChanged);
         await Store.SendMessageAsync(text, attachments);
     }
 
@@ -176,6 +222,19 @@
         if (e.Key == "Enter" && !e.ShiftKey)
         {
             await SendMessage();
+        }
+    }
+
+    private async Task JumpToLatestAsync()
+    {
+        _forceScrollToBottom = false;
+        try
+        {
+            await JS.InvokeVoidAsync("chatScrollManager.jumpToLatest", _messagesContainerRef);
+        }
+        catch
+        {
+            // Ignore transient JS interop failures.
         }
     }
 
@@ -239,6 +298,9 @@
         var requestedContact = Store.Contacts.FirstOrDefault(c => c.Id == targetUserId) ?? BuildRequestedContact(targetUserId);
         await Store.OpenConversationAsync(requestedContact);
         _lastAutoOpenedUserId = targetUserId;
+        _forceScrollToBottom = true;
+        _lastRenderedMessageCount = -1;
+        _lastRenderedContactId = null;
     }
 
     private UserInfo BuildRequestedContact(Guid userId)

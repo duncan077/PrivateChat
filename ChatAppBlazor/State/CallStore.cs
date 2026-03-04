@@ -1,6 +1,7 @@
 using ChatAppBlazor.Services;
 using Microsoft.Maui.Storage;
 using Shared.Models;
+using System.Threading;
 
 namespace ChatAppBlazor.State;
 
@@ -80,6 +81,8 @@ public class CallStore : IDisposable
     /// </summary>
     public event Action<Guid, string, string>? OnWebRtcSignal;
     private bool _isAutoRejoiningAfterMove;
+    private CancellationTokenSource? _pendingSelfRemovalValidationCts;
+    private static readonly int[] SelfRemovalValidationDelaysMs = [1200, 2200, 3200];
 
     public CallStore(ChatClientService chat, AuthStateProvider auth)
     {
@@ -102,6 +105,7 @@ public class CallStore : IDisposable
     public async Task<JanusSessionInfo?> JoinCallAsync(Guid roomId)
     {
         if (roomId == Guid.Empty) return null;
+        CancelPendingSelfRemovalValidation();
 
         try
         {
@@ -168,6 +172,7 @@ public class CallStore : IDisposable
         catch { }
         finally
         {
+            CancelPendingSelfRemovalValidation();
             IsInCall = false;
             ActiveRoomId = null;
             Session = null;
@@ -340,8 +345,10 @@ public class CallStore : IDisposable
                 var myId = _auth.CurrentUser?.Id;
                 if (myId != null && !participants.Contains(myId.Value))
                 {
-                    EndCallLocally(roomId, "You were removed from this call.");
-                    return;
+                    // Janus/room participant lists can be eventually consistent while tracks are
+                    // renegotiated (screen-share start/stop, codec update, transient publisher swap).
+                    // Do not trigger reconnect/teardown from this signal alone.
+                    Console.WriteLine($"[CallStore] Self missing from participant refresh for room {roomId}; ignoring transient presence mismatch.");
                 }
 
                 Participants = participants
@@ -377,6 +384,10 @@ public class CallStore : IDisposable
     private void HandleParticipantJoined(Guid roomId, Guid userId)
     {
         var changed = AddRoomParticipant(roomId, userId);
+        if (roomId == ActiveRoomId && userId == _auth.CurrentUser?.Id)
+        {
+            CancelPendingSelfRemovalValidation();
+        }
 
         if (roomId == ActiveRoomId && userId != _auth.CurrentUser?.Id && !Participants.Contains(userId))
         {
@@ -391,7 +402,10 @@ public class CallStore : IDisposable
     {
         if (roomId == ActiveRoomId && userId == _auth.CurrentUser?.Id)
         {
-            EndCallLocally(roomId, "You were removed from this call.");
+            // Ignore self-left events that can be emitted while Janus swaps publisher handles
+            // during renegotiation/reconfiguration. Reconnection should only be driven by
+            // explicit Janus-session loss or kick/move events.
+            Console.WriteLine($"[CallStore] Received self left event for room {roomId}; ignoring transient self-leave.");
             return;
         }
 
@@ -433,7 +447,10 @@ public class CallStore : IDisposable
             return;
         }
 
-        EndCallLocally(roomId, string.IsNullOrWhiteSpace(reason) ? "You were removed from this call." : reason);
+        EndCallLocally(
+            roomId,
+            string.IsNullOrWhiteSpace(reason) ? "You were removed from this call." : reason,
+            "kicked-event");
     }
 
     private async void HandleUserMoved(Guid sourceRoomId, Guid targetRoomId, Guid userId)
@@ -530,7 +547,7 @@ public class CallStore : IDisposable
         var enableWebRtcH265Send = prefs.Get(PrefEnableWebRtcH265SendFeature, true);
         var args = new List<string>
         {
-            "--disable-features=WebRtcHideLocalIpsWithMdns",
+            "--disable-features=WebRtcHideLocalIpsWithMdns,CalculateNativeWinOcclusion",
             "--force-webrtc-ip-handling-policy=default_public_interface_only",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
@@ -639,8 +656,10 @@ public class CallStore : IDisposable
         return removed;
     }
 
-    private void EndCallLocally(Guid roomId, string? reason)
+    private void EndCallLocally(Guid roomId, string? reason, string source = "unknown")
     {
+        CancelPendingSelfRemovalValidation();
+        Console.WriteLine($"[CallStore] Ending call locally (room={roomId}, source={source}, reason={reason ?? "none"}).");
         IsInCall = false;
         ActiveRoomId = null;
         Session = null;
@@ -656,8 +675,131 @@ public class CallStore : IDisposable
 
     private void NotifyChanged() => OnChange?.Invoke();
 
+    private void CancelPendingSelfRemovalValidation()
+    {
+        if (_pendingSelfRemovalValidationCts == null) return;
+
+        try
+        {
+            _pendingSelfRemovalValidationCts.Cancel();
+        }
+        catch { }
+
+        _pendingSelfRemovalValidationCts.Dispose();
+        _pendingSelfRemovalValidationCts = null;
+    }
+
+    private void ScheduleSelfRemovalValidation(Guid roomId, string source)
+    {
+        if (!IsInCall || ActiveRoomId != roomId) return;
+        var myId = _auth.CurrentUser?.Id;
+        if (myId == null || myId == Guid.Empty)
+        {
+            EndCallLocally(roomId, "You were removed from this call.", $"validate-{source}-no-self");
+            return;
+        }
+
+        CancelPendingSelfRemovalValidation();
+        var cts = new CancellationTokenSource();
+        _pendingSelfRemovalValidationCts = cts;
+        _ = ValidateSelfStillInCallAsync(roomId, myId.Value, source, cts);
+    }
+
+    private async Task ValidateSelfStillInCallAsync(Guid roomId, Guid myId, string source, CancellationTokenSource cts)
+    {
+        var token = cts.Token;
+        var hadSuccessfulPresenceCheck = false;
+        Console.WriteLine($"[CallStore] Starting self-removal validation (room={roomId}, source={source}).");
+
+        try
+        {
+            for (var i = 0; i < SelfRemovalValidationDelaysMs.Length; i++)
+            {
+                try
+                {
+                    await Task.Delay(SelfRemovalValidationDelaysMs[i], token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                if (token.IsCancellationRequested || !IsInCall || ActiveRoomId != roomId)
+                {
+                    return;
+                }
+
+                try
+                {
+                    var participants = await _chat.GetVoiceVideoParticipantsAsync(roomId);
+                    hadSuccessfulPresenceCheck = true;
+                    if (token.IsCancellationRequested || !IsInCall || ActiveRoomId != roomId)
+                    {
+                        return;
+                    }
+
+                    if (participants.Contains(myId))
+                    {
+                        _roomCallParticipants[roomId] = participants
+                            .Where(id => id != Guid.Empty)
+                            .ToHashSet();
+                        Participants = participants
+                            .Where(id => id != Guid.Empty && id != myId)
+                            .Distinct()
+                            .ToList();
+                        Error = null;
+                        Console.WriteLine($"[CallStore] Self-removal validation cleared (room={roomId}, source={source}, attempt={i + 1}).");
+                        NotifyChanged();
+                        return;
+                    }
+
+                    Console.WriteLine($"[CallStore] Self still absent (room={roomId}, source={source}, attempt={i + 1}/{SelfRemovalValidationDelaysMs.Length}).");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[CallStore] Self-removal validation check failed (room={roomId}, source={source}, attempt={i + 1}): {ex.Message}");
+                }
+            }
+
+            if (!token.IsCancellationRequested && IsInCall && ActiveRoomId == roomId)
+            {
+                if (!hadSuccessfulPresenceCheck)
+                {
+                    Console.WriteLine($"[CallStore] Self-removal validation ended with no successful presence checks (room={roomId}, source={source}); keeping call active.");
+                    return;
+                }
+
+                try
+                {
+                    Console.WriteLine($"[CallStore] Self absent after validation (room={roomId}, source={source}); attempting soft rejoin before local teardown.");
+                    Session = await _chat.JoinVoiceVideoAsync(roomId);
+                    Console.WriteLine($"[CallStore] Soft rejoin succeeded after self-removal validation (session={Session.JanusSessionId}).");
+                    OnJanusReconnect?.Invoke(Session, roomId);
+                    NotifyChanged();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[CallStore] Soft rejoin failed after self-removal validation (room={roomId}, source={source}): {ex.Message}");
+                }
+
+                EndCallLocally(roomId, "You were removed from this call.", $"validated-{source}");
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_pendingSelfRemovalValidationCts, cts))
+            {
+                _pendingSelfRemovalValidationCts = null;
+            }
+
+            cts.Dispose();
+        }
+    }
+
     public void Dispose()
     {
+        CancelPendingSelfRemovalValidation();
         _chat.OnUserJoinedVoiceVideo -= HandleParticipantJoined;
         _chat.OnUserLeftVoiceVideo -= HandleParticipantLeft;
         _chat.OnUserKickedFromVoiceVideo -= HandleKickedFromVoiceVideo;
