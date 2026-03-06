@@ -1,10 +1,12 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
 
     <PropertyGroup>
-        <TargetFrameworks>net9.0-android;net9.0-ios;net9.0-maccatalyst</TargetFrameworks>
-        <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net9.0-windows10.0.19041.0</TargetFrameworks>
-        <!-- Uncomment to also build the tizen app. You will need to install tizen by following this: https://github.com/Samsung/Tizen.NET -->
-        <!-- <TargetFrameworks>$(TargetFrameworks);net9.0-tizen</TargetFrameworks> -->
+		<TargetFrameworks>net10.0-android</TargetFrameworks>
+		<TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('linux'))">$(TargetFrameworks);net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
+		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+
+		<!-- Uncomment to also build the tizen app. You will need to install tizen by following this: https://github.com/Samsung/Tizen.NET -->
+        <!-- <TargetFrameworks>$(TargetFrameworks);net10.0-tizen</TargetFrameworks> -->
 
         <!-- Note for MacCatalyst:
             The default runtime is maccatalyst-x64, except in Release config, in which case the default is maccatalyst-x64;maccatalyst-arm64.
@@ -28,19 +30,36 @@
         <ApplicationId>com.companyname.chatappblazor</ApplicationId>
 
         <!-- Versions -->
-        <ApplicationDisplayVersion>1.6.5</ApplicationDisplayVersion>
+        <ApplicationDisplayVersion>1.7.3</ApplicationDisplayVersion>
         <ApplicationVersion>1</ApplicationVersion>
 
         <!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
         <WindowsPackageType>None</WindowsPackageType>
 
-        <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
-        <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">15.0</SupportedOSPlatformVersion>
-        <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">24.0</SupportedOSPlatformVersion>
-        <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</SupportedOSPlatformVersion>
-        <TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
-        <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'tizen'">6.5</SupportedOSPlatformVersion>
-        <PublishAot>False</PublishAot>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">15.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">24.0</SupportedOSPlatformVersion>
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</SupportedOSPlatformVersion>
+		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
+		<PublishAot>False</PublishAot>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Release|net10.0-android|AnyCPU'">
+      <AndroidPackageFormat>apk</AndroidPackageFormat>
+      <RunAOTCompilation>False</RunAOTCompilation>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net10.0-android|AnyCPU'">
+      <RunAOTCompilation>False</RunAOTCompilation>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)'=='Release|net10.0-windows10.0.19041.0'">
+      <PublishSingleFile>False</PublishSingleFile>
+      <SelfContained>False</SelfContained>
+      <DebugSymbols>False</DebugSymbols>
+      <DebugType>None</DebugType>
+      <CopyOutputSymbolsToPublishDirectory>False</CopyOutputSymbolsToPublishDirectory>
+      <GenerateWindowsPublishZip>true</GenerateWindowsPublishZip>
     </PropertyGroup>
 
     <ItemGroup>
@@ -62,16 +81,17 @@
 
     <ItemGroup>
         <PackageReference Include="MagicOnion.Client" Version="7.10.0" />
-        <PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
-        <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="$(MauiVersion)" />
-        <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="9.0.0" />
+        <PackageReference Include="Microsoft.Maui.Controls" Version="10.0.41" />
+        <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="10.0.41" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="10.0.3" />
 			<PackageReference Include="Grpc.Net.Client" Version="2.76.0" />
 			<PackageReference Include="MessagePack" Version="3.1.4" />
-			<PackageReference Include="MudBlazor" Version="8.5.0" />
+			<PackageReference Include="MudBlazor" Version="9.1.0" />
 		
     </ItemGroup>
 
     <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
+        <PackageReference Include="DataChannelDotnet" Version="1.3.1" />
         <PackageReference Include="NAudio" Version="2.2.1" />
         <None Update="Platforms\Windows\ApplicationLoopback.dll" Condition="Exists('Platforms\\Windows\\ApplicationLoopback.dll')">
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -88,5 +108,17 @@
         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       </None>
     </ItemGroup>
+
+    <Target Name="ZipWindowsPublishOutput"
+            AfterTargets="Publish"
+            Condition="'$(GenerateWindowsPublishZip)' == 'true' and '$(TargetPlatformIdentifier)' == 'windows' and '$(PublishDir)' != ''">
+        <PropertyGroup>
+            <_ZipRidSuffix Condition="'$(RuntimeIdentifier)' != ''">-$(RuntimeIdentifier)</_ZipRidSuffix>
+            <WindowsPublishZipPath>$(PublishDir)..\$(AssemblyName)-$(ApplicationDisplayVersion)-$(Configuration)$(_ZipRidSuffix).zip</WindowsPublishZipPath>
+        </PropertyGroup>
+
+        <Message Importance="High" Text="Creating publish zip: $(WindowsPublishZipPath)" />
+        <ZipDirectory SourceDirectory="$(PublishDir)" DestinationFile="$(WindowsPublishZipPath)" Overwrite="true" />
+    </Target>
 
 </Project>

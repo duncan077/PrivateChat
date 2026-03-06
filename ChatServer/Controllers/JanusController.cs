@@ -20,6 +20,42 @@ public class JanusController : ControllerBase
     }
 
     /// <summary>
+    /// Creates a dedicated Janus session.
+    /// </summary>
+    [HttpPost("session/create")]
+    public async Task<IActionResult> CreateSession()
+    {
+        try
+        {
+            var sessionId = await _janus.CreateSessionAsync();
+            return Ok(new { sessionId });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed creating Janus session.");
+            return StatusCode(502, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Destroys a Janus session.
+    /// </summary>
+    [HttpDelete("session/{sessionId}")]
+    public async Task<IActionResult> DestroySession(long sessionId)
+    {
+        try
+        {
+            await _janus.DestroySessionAsync(sessionId);
+            return Ok();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed destroying Janus session {SessionId}.", sessionId);
+            return StatusCode(502, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
     /// Attaches a new plugin handle to an existing session.
     /// The client calls this to get a dedicated handle per subscriber feed.
     /// </summary>

@@ -25,6 +25,11 @@
                     </div>
 
                     <MudStack Row Wrap="Wrap.Wrap" AlignItems="AlignItems.Center" Spacing="1" Class="chat-toolbar-actions">
+                        <MudIconButton Icon="@GetSelectedRoomNotificationIcon()"
+                                       Size="Size.Small"
+                                       Color="@GetSelectedRoomNotificationColor()"
+                                       title="@GetSelectedRoomNotificationTooltip()"
+                                       OnClick="CycleSelectedRoomNotificationMode" />
                         @if ((Store.SelectedRoom?.IsVoiceEnabled == true || Store.SelectedRoom?.IsVideoEnabled == true))
                         {
                             @if (_joining)
@@ -62,10 +67,13 @@
                 </div>
             </div>
 
-            @* Active call panel (if in call for this room) *@
-            @if (IsInlineCallVisible)
+            @* Active call panel (keep mounted while any call is active so remote audio sinks stay alive) *@
+            @if (HasActiveCall)
             {
-                <ActiveCallPanel RoomId="Store.SelectedRoomId.Value" RoomName="@(Store.SelectedRoom?.Name ?? "")" />
+                <div class="call-panel-host @(IsInlineCallVisible ? string.Empty : "keep-alive-hidden")"
+                     aria-hidden="@(!IsInlineCallVisible)">
+                    <ActiveCallPanel RoomId="Call.ActiveRoomId!.Value" RoomName="@GetActiveCallRoomName()" />
+                </div>
             }
 
             @* Messages *@
@@ -94,12 +102,68 @@
                                 @if (!msg.IsDeleted)
                                 {
                                     <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
+                                    var previewUrl = ExtractFirstHttpUrl(msg.Content);
+                                    var preview = GetCachedLinkPreview(previewUrl);
+                                    @if (preview != null && !string.IsNullOrWhiteSpace(preview.Url))
+                                    {
+                                        var href = !string.IsNullOrWhiteSpace(preview.CanonicalUrl) ? preview.CanonicalUrl : preview.Url;
+                                        <a class="chat-link-preview" href="@href" target="_blank" rel="noopener noreferrer">
+                                            @if (!string.IsNullOrWhiteSpace(preview.ImageUrl))
+                                            {
+                                                <img class="chat-link-preview-image" src="@preview.ImageUrl" alt="Link preview image" loading="lazy" />
+                                            }
+                                            <div class="chat-link-preview-content">
+                                                @if (!string.IsNullOrWhiteSpace(preview.SiteName))
+                                                {
+                                                    <span class="chat-link-preview-site">@preview.SiteName</span>
+                                                }
+                                                <span class="chat-link-preview-title">@GetPreviewTitle(preview, href)</span>
+                                                @if (!string.IsNullOrWhiteSpace(preview.Description))
+                                                {
+                                                    <span class="chat-link-preview-description">@preview.Description</span>
+                                                }
+                                                <span class="chat-link-preview-url">@FormatPreviewUrl(href)</span>
+                                            </div>
+                                        </a>
+                                    }
                                     @if (msg.Attachments.Length > 0)
                                     {
                                         <div class="chat-msg-attachments">
                                             @foreach (var att in msg.Attachments)
                                             {
-                                                <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
+                                                var attachmentUrl = GetAttachmentUrl(att);
+                                                if (string.IsNullOrWhiteSpace(attachmentUrl))
+                                                {
+                                                    <MudText Typo="Typo.caption">@GetAttachmentLabel(att)</MudText>
+                                                }
+                                                else if (IsImageAttachment(att))
+                                                {
+                                                    <a class="chat-attachment-link" href="@attachmentUrl" target="_blank" rel="noopener noreferrer">
+                                                        <img class="chat-attachment-image"
+                                                             src="@attachmentUrl"
+                                                             alt="@GetAttachmentLabel(att)"
+                                                             loading="lazy" />
+                                                    </a>
+                                                }
+                                                else if (IsVideoAttachment(att))
+                                                {
+                                                    <video class="chat-attachment-video"
+                                                           controls
+                                                           preload="metadata"
+                                                           onloadedmetadata="window.webrtcManager?.applyAttachmentVideoVolume(this)"
+                                                           onplay="window.webrtcManager?.applyAttachmentVideoVolume(this)"
+                                                           onvolumechange="window.webrtcManager?.rememberAttachmentVideoVolume(this)">
+                                                        <source src="@attachmentUrl" type="@ResolveVideoMime(att)" />
+                                                        Your browser does not support inline video playback.
+                                                    </video>
+                                                    <a class="chat-attachment-link chat-attachment-filename" href="@attachmentUrl" target="_blank" rel="noopener noreferrer">
+                                                        @GetAttachmentLabel(att)
+                                                    </a>
+                                                }
+                                                else
+                                                {
+                                                    <MudLink Href="@attachmentUrl" Target="_blank" Typo="Typo.caption">@GetAttachmentLabel(att)</MudLink>
+                                                }
                                             }
                                         </div>
                                     }
@@ -123,7 +187,15 @@
                 </div>
 
                 @* Input *@
-                <div class="chat-input-area @(IsInlineCallVisible ? "call-active" : "")">
+                <div class="chat-input-area @(IsInlineCallVisible ? "call-active" : "") @(_isAttachmentDragActive ? "drag-over" : "")"
+                     @ondragenter="OnAttachmentDragEnter"
+                     @ondragenter:preventDefault
+                     @ondragover="OnAttachmentDragOver"
+                     @ondragover:preventDefault
+                     @ondragleave="OnAttachmentDragLeave"
+                     @ondragleave:preventDefault
+                     @ondrop="OnAttachmentDrop"
+                     @ondrop:preventDefault>
                     @if (_pendingAttachments.Count > 0)
                     {
                         <MudStack Row Wrap="Wrap.Wrap" Spacing="1" Class="mb-2">
@@ -157,16 +229,43 @@
                                        style="display:none" id="chatFileInput" />
                         </div>
 
-                        <MudTextField @bind-Value="_messageText" Placeholder="Type a message..."
-                                      Variant="Variant.Outlined" Immediate="true" Dense="true"
-                                      OnKeyDown="HandleKeyDown"
-                                      Class="chat-input-field" />
+                        <div class="chat-input-mention-host">
+                            <MudTextField @bind-Value="_messageText" @bind-Value:after="OnMessageTextEdited" Placeholder="Type a message... (&#64;username)"
+                                          Variant="Variant.Outlined" Immediate="true" Dense="true"
+                                          OnKeyDown="HandleKeyDown"
+                                          Class="chat-input-field" />
+
+                            @if (_showMentionSuggestions && _mentionSuggestions.Count > 0)
+                            {
+                                <div class="chat-mention-suggestions" role="listbox" aria-label="Mention suggestions">
+                                    @for (var i = 0; i < _mentionSuggestions.Count; i++)
+                                    {
+                                        var suggestion = _mentionSuggestions[i];
+                                        var isActive = i == _activeMentionSuggestionIndex;
+                                        <button type="button"
+                                                class="chat-mention-suggestion-item @(isActive ? "active" : string.Empty)"
+                                                title="@($"@{suggestion.UserName}")"
+                                                @onclick="() => SelectMentionSuggestion(suggestion)">
+                                            <span class="chat-mention-suggestion-name">@($"@{suggestion.UserName}")</span>
+                                            <span class="chat-mention-suggestion-display">@suggestion.DisplayName</span>
+                                        </button>
+                                    }
+                                </div>
+                            }
+                        </div>
 
                         <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SendMessage"
                                    Disabled="@(_uploading || (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0))">
                             Send
                         </MudButton>
                     </MudStack>
+
+                    <div class="chat-input-drop-overlay" aria-hidden="@(!_isAttachmentDragActive)">
+                        <InputFile OnChange="HandleAttachmentSelected"
+                                   multiple
+                                   class="chat-input-drop-file-input" />
+                        <div class="chat-input-drop-hint">Drop files to attach</div>
+                    </div>
                 </div>
             }
         }
@@ -189,7 +288,7 @@
                     @if (Store.SelectedRoomId != null)
                     {
                         <MudText Typo="Typo.caption" Color="Color.Secondary">
-                            Room context: @Store.SelectedRoom?.Name
+                            Room: @Store.SelectedRoom?.Name
                         </MudText>
                     }
                     else
@@ -220,6 +319,7 @@
                     var roomMember = Store.GetSelectedRoomMember(member.UserId);
                     var isCurrentUser = member.UserId == Auth.CurrentUser?.Id;
                     var canModerateTarget = CanModerateTarget(member.UserId);
+                    var memberAvatarUrl = GetMemberAvatarUrl(member.AvatarUrl);
 
                     <MudListItem T="Guid" Value="member.UserId" Class="member-list-item">
                         <div class="member-entry member-entry-clickable"
@@ -227,7 +327,14 @@
                              @ondblclick="() => OpenPrivateMessage(member)">
                             <MudStack Row AlignItems="AlignItems.Center" Spacing="2" Class="member-entry-main">
                                 <MudAvatar Size="Size.Small" Color="Color.Primary">
-                                    @GetMemberInitial(member.DisplayName, member.UserName)
+                                    @if (!string.IsNullOrWhiteSpace(memberAvatarUrl))
+                                    {
+                                        <img src="@memberAvatarUrl" alt="Profile" class="avatar-image-fill" />
+                                    }
+                                    else
+                                    {
+                                        @GetMemberInitial(member.DisplayName, member.UserName)
+                                    }
                                 </MudAvatar>
                                 <div class="member-entry-text">
                                     <MudText Typo="Typo.body2" Class="member-name-row">
@@ -250,11 +357,8 @@
                                         }
                                     </MudText>
                                     <MudText Typo="Typo.caption" Color="Color.Secondary" Class="member-meta-row">
-                                        <span>Global role: @member.Role</span>
-                                        @if (Store.SelectedRoomId != null)
-                                        {
-                                            <span> Â· @(roomMember != null ? "In selected room" : "Not in selected room")</span>
-                                        }
+                                        <span>Role: @member.Role</span>
+                                      
                                     </MudText>
                                 </div>
                             </MudStack>
@@ -433,6 +537,9 @@
 </div>
 
 @code {
+    private sealed record MentionSuggestion(Guid UserId, string UserName, string DisplayName);
+    private const string MentionAllToken = "all";
+
     private string _messageText = "";
     private bool _showCreateRoom;
     private bool _joining;
@@ -454,6 +561,8 @@
     private Guid? _lastRenderedMessagesRoomId;
     private const long MaxUploadBytes = 50L * 1024 * 1024;
     private InputFile? _fileInput;
+    private bool _isAttachmentDragActive;
+    private int _attachmentDragDepth;
 
     // Track call state to avoid re-rendering on every mute/PTT/camera change
     private bool _lastCallActive;
@@ -462,9 +571,24 @@
     private string _lastCallParticipantsSignature = string.Empty;
     private CancellationTokenSource? _pendingInactiveStopCts;
     private bool IsCallActiveForSelectedRoom => Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId;
+    private bool HasActiveCall => Call.IsInCall && Call.ActiveRoomId is Guid activeId && activeId != Guid.Empty;
     private bool IsInlineCallVisible => IsCallActiveForSelectedRoom && !Call.UseFloatingOverlayInActiveRoom;
     private bool IsChatVisible => Store.SelectedRoomId != null && (!IsCallActiveForSelectedRoom || Call.UseFloatingOverlayInActiveRoom);
     private Guid? _lastAutoOpenedRoomId;
+    private static readonly System.Text.RegularExpressions.Regex UrlRegex = new(
+        "(?i)\\bhttps?://[^\\s<>()]+",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+    private readonly Dictionary<string, LinkPreviewInfo?> _linkPreviewCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _linkPreviewInFlight = new(StringComparer.OrdinalIgnoreCase);
+    private const int MaxLinkPreviewCacheEntries = 300;
+    private readonly List<MentionSuggestion> _mentionSuggestions = [];
+    private bool _showMentionSuggestions;
+    private int _activeMentionSuggestionIndex;
+    private int _mentionQueryStartIndex = -1;
+    private string _mentionQuery = string.Empty;
+    private static readonly System.Text.RegularExpressions.Regex MentionTokenRegex = new(
+        "(^|\\s)@([A-Za-z0-9_.-]+)",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
 
     [SupplyParameterFromQuery(Name = "roomId")]
     public Guid? RequestedRoomId { get; set; }
@@ -514,6 +638,8 @@
                 await JS.InvokeVoidAsync("chatScrollManager.onMessagesChanged", _messagesContainerRef, shouldForce);
             }
 
+            QueueVisibleLinkPreviewLoads();
+
             _lastRenderedMessagesRoomId = roomId;
             _lastRenderedMessageCount = messageCount;
             _forceScrollToBottom = false;
@@ -541,16 +667,23 @@
         _lastRenderedMessagesRoomId = null;
     }
 
+    private void OnMessageTextEdited()
+    {
+        UpdateMentionSuggestions();
+    }
+
     private async Task SendMessage()
     {
         if (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0) return;
         var text = _messageText;
+        var mentionedUserIds = ExtractMentionedUserIds(text);
         var attachments = _pendingAttachments.ToArray();
         _messageText = string.Empty;
+        ClearMentionSuggestions();
         _pendingAttachments.Clear();
         _forceScrollToBottom = true;
         await InvokeAsync(StateHasChanged);
-        await Store.SendMessageAsync(text, attachments);
+        await Store.SendMessageAsync(text, attachments, mentionedUserIds);
     }
 
     private async Task DeleteMessage(Guid messageId) => await Store.DeleteMessageAsync(messageId);
@@ -650,6 +783,7 @@
                     ? Auth.CurrentUser.DisplayName
                     : Auth.CurrentUser.UserName,
                 BuildParticipantDirectory(),
+                BuildParticipantAvatarDirectory(),
                 session.IceServers
             );
 
@@ -673,6 +807,39 @@
         if (!IsCallActiveForSelectedRoom) return;
         Call.SetUseFloatingOverlayInActiveRoom(!Call.UseFloatingOverlayInActiveRoom);
     }
+
+    private void CycleSelectedRoomNotificationMode()
+    {
+        if (Store.SelectedRoomId == null) return;
+        Store.CycleRoomNotificationMode(Store.SelectedRoomId.Value);
+    }
+
+    private RoomNotificationMode GetSelectedRoomNotificationMode()
+        => Store.SelectedRoomNotificationMode ?? RoomNotificationMode.All;
+
+    private string GetSelectedRoomNotificationIcon()
+        => GetSelectedRoomNotificationMode() switch
+        {
+            RoomNotificationMode.Muted => Icons.Material.Filled.NotificationsOff,
+            RoomNotificationMode.MentionsOnly => Icons.Material.Filled.AlternateEmail,
+            _ => Icons.Material.Filled.NotificationsActive
+        };
+
+    private Color GetSelectedRoomNotificationColor()
+        => GetSelectedRoomNotificationMode() switch
+        {
+            RoomNotificationMode.Muted => Color.Warning,
+            RoomNotificationMode.MentionsOnly => Color.Info,
+            _ => Color.Default
+        };
+
+    private string GetSelectedRoomNotificationTooltip()
+        => GetSelectedRoomNotificationMode() switch
+        {
+            RoomNotificationMode.Muted => "Notifications: muted (click for all)",
+            RoomNotificationMode.MentionsOnly => "Notifications: mentions only (click for muted)",
+            _ => "Notifications: all (click for mentions only)"
+        };
 
     private void OnShowAllMembersDuringCallChanged(bool showAllMembers)
     {
@@ -788,10 +955,221 @@
 
     private async Task HandleKeyDown(KeyboardEventArgs e)
     {
+        if (_showMentionSuggestions && _mentionSuggestions.Count > 0)
+        {
+            if (string.Equals(e.Key, "ArrowDown", StringComparison.Ordinal))
+            {
+                MoveMentionSuggestionSelection(1);
+                return;
+            }
+
+            if (string.Equals(e.Key, "ArrowUp", StringComparison.Ordinal))
+            {
+                MoveMentionSuggestionSelection(-1);
+                return;
+            }
+
+            if (string.Equals(e.Key, "Escape", StringComparison.Ordinal))
+            {
+                ClearMentionSuggestions();
+                await InvokeAsync(StateHasChanged);
+                return;
+            }
+
+            if (string.Equals(e.Key, "Enter", StringComparison.Ordinal) || string.Equals(e.Key, "Tab", StringComparison.Ordinal))
+            {
+                SelectMentionSuggestion(_mentionSuggestions[_activeMentionSuggestionIndex]);
+                await InvokeAsync(StateHasChanged);
+                return;
+            }
+        }
+
         if (e.Key == "Enter" && !e.ShiftKey)
         {
             await SendMessage();
         }
+    }
+
+    private void MoveMentionSuggestionSelection(int delta)
+    {
+        if (_mentionSuggestions.Count == 0) return;
+
+        var next = _activeMentionSuggestionIndex + delta;
+        if (next < 0) next = _mentionSuggestions.Count - 1;
+        if (next >= _mentionSuggestions.Count) next = 0;
+        _activeMentionSuggestionIndex = next;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void SelectMentionSuggestion(MentionSuggestion suggestion)
+    {
+        if (_mentionQueryStartIndex < 0)
+        {
+            ClearMentionSuggestions();
+            return;
+        }
+
+        var prefix = _messageText[.._mentionQueryStartIndex];
+        var suffixStart = Math.Min(_messageText.Length, _mentionQueryStartIndex + 1 + _mentionQuery.Length);
+        var suffix = suffixStart < _messageText.Length ? _messageText[suffixStart..] : string.Empty;
+
+        if (string.IsNullOrEmpty(suffix))
+        {
+            _messageText = $"{prefix}@{suggestion.UserName} ";
+        }
+        else
+        {
+            var spacer = char.IsWhiteSpace(suffix[0]) ? string.Empty : " ";
+            _messageText = $"{prefix}@{suggestion.UserName}{spacer}{suffix}";
+        }
+
+        ClearMentionSuggestions();
+    }
+
+    private void UpdateMentionSuggestions()
+    {
+        _mentionSuggestions.Clear();
+        _showMentionSuggestions = false;
+        _activeMentionSuggestionIndex = 0;
+        _mentionQueryStartIndex = -1;
+        _mentionQuery = string.Empty;
+
+        if (Store.SelectedRoomId == null || string.IsNullOrWhiteSpace(_messageText))
+        {
+            return;
+        }
+
+        var atIndex = _messageText.LastIndexOf('@');
+        if (atIndex < 0)
+        {
+            return;
+        }
+
+        if (atIndex > 0 && !char.IsWhiteSpace(_messageText[atIndex - 1]))
+        {
+            return;
+        }
+
+        var query = _messageText[(atIndex + 1)..];
+        if (query.Any(char.IsWhiteSpace))
+        {
+            return;
+        }
+
+        var candidates = Store.Members
+            .Where(member => member.UserId != Guid.Empty && !string.IsNullOrWhiteSpace(member.UserName))
+            .Where(member => member.UserId != Auth.CurrentUser?.Id)
+            .GroupBy(member => member.UserName.Trim(), StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .Where(member => string.IsNullOrWhiteSpace(query)
+                || member.UserName.StartsWith(query, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(member => member.IsOnline)
+            .ThenBy(member => member.UserName, StringComparer.OrdinalIgnoreCase)
+            .Take(8)
+            .Select(member => new MentionSuggestion(
+                member.UserId,
+                member.UserName.Trim(),
+                string.IsNullOrWhiteSpace(member.DisplayName) ? member.UserName.Trim() : member.DisplayName.Trim()))
+            .ToList();
+
+        if (string.IsNullOrWhiteSpace(query)
+            || MentionAllToken.StartsWith(query, StringComparison.OrdinalIgnoreCase))
+        {
+            candidates.Insert(0, new MentionSuggestion(Guid.Empty, MentionAllToken, "Mention everyone in room"));
+        }
+
+        if (candidates.Count == 0)
+        {
+            return;
+        }
+
+        _mentionQueryStartIndex = atIndex;
+        _mentionQuery = query;
+        _mentionSuggestions.AddRange(candidates);
+        _showMentionSuggestions = true;
+    }
+
+    private void ClearMentionSuggestions()
+    {
+        _mentionSuggestions.Clear();
+        _showMentionSuggestions = false;
+        _activeMentionSuggestionIndex = 0;
+        _mentionQueryStartIndex = -1;
+        _mentionQuery = string.Empty;
+    }
+
+    private Guid[] ExtractMentionedUserIds(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return [];
+        }
+
+        var usernameLookup = Store.Members
+            .Where(member => member.UserId != Guid.Empty && !string.IsNullOrWhiteSpace(member.UserName))
+            .GroupBy(member => member.UserName.Trim(), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First().UserId, StringComparer.OrdinalIgnoreCase);
+
+        if (usernameLookup.Count == 0)
+        {
+            return [];
+        }
+
+        var mentionedUserIds = new HashSet<Guid>();
+        foreach (System.Text.RegularExpressions.Match match in MentionTokenRegex.Matches(content))
+        {
+            var username = match.Groups[2].Value;
+            if (username.Equals(MentionAllToken, StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var member in Store.Members)
+                {
+                    if (member.UserId == Guid.Empty || member.UserId == Auth.CurrentUser?.Id)
+                    {
+                        continue;
+                    }
+
+                    mentionedUserIds.Add(member.UserId);
+                }
+
+                continue;
+            }
+
+            if (usernameLookup.TryGetValue(username, out var mentionedUserId) && mentionedUserId != Guid.Empty)
+            {
+                mentionedUserIds.Add(mentionedUserId);
+            }
+        }
+
+        return [.. mentionedUserIds];
+    }
+
+    private void OnAttachmentDragEnter(DragEventArgs _)
+    {
+        _attachmentDragDepth++;
+        _isAttachmentDragActive = true;
+    }
+
+    private void OnAttachmentDragOver(DragEventArgs _)
+    {
+        _isAttachmentDragActive = true;
+    }
+
+    private void OnAttachmentDragLeave(DragEventArgs _)
+    {
+        if (_attachmentDragDepth > 0)
+        {
+            _attachmentDragDepth--;
+        }
+
+        if (_attachmentDragDepth == 0)
+        {
+            _isAttachmentDragActive = false;
+        }
+    }
+
+    private void OnAttachmentDrop(DragEventArgs _)
+    {
+        _attachmentDragDepth = 0;
     }
 
     private async Task JumpToLatestAsync()
@@ -812,7 +1190,7 @@
         var room = Store.SelectedRoom;
         if (room == null) return;
 
-        var confirm = await Dialogs.ShowMessageBox(
+        var confirm = await Dialogs.ShowMessageBoxAsync(
             "Delete Room",
             $"Delete '{room.Name}' permanently?",
             yesText: "Delete",
@@ -826,6 +1204,8 @@
 
     private async Task HandleAttachmentSelected(InputFileChangeEventArgs e)
     {
+        _attachmentDragDepth = 0;
+        _isAttachmentDragActive = false;
         _uploadError = null;
         _uploading = true;
         StateHasChanged();
@@ -864,6 +1244,8 @@
         finally
         {
             _uploading = false;
+            _attachmentDragDepth = 0;
+            _isAttachmentDragActive = false;
             StateHasChanged();
         }
     }
@@ -878,6 +1260,15 @@
         if (_moderationTargetUserId != null && !Store.ServerMembers.Any(member => member.UserId == _moderationTargetUserId.Value))
         {
             _moderationTargetUserId = null;
+        }
+
+        if (Store.SelectedRoomId == null)
+        {
+            ClearMentionSuggestions();
+        }
+        else
+        {
+            UpdateMentionSuggestions();
         }
 
         _ = SyncParticipantDirectoryAsync();
@@ -1059,6 +1450,16 @@
         return "?";
     }
 
+    private string? GetMemberAvatarUrl(string? avatarUrl)
+    {
+        if (string.IsNullOrWhiteSpace(avatarUrl))
+        {
+            return null;
+        }
+
+        return Api.ToAbsoluteUrl(avatarUrl);
+    }
+
     private IReadOnlyList<UserRole> GetAssignableRoles()
     {
         return Enum.GetValues<UserRole>()
@@ -1128,6 +1529,28 @@
         return map;
     }
 
+    private Dictionary<string, string> BuildParticipantAvatarDirectory()
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var member in Store.ServerMembers)
+        {
+            if (member.UserId == Guid.Empty || string.IsNullOrWhiteSpace(member.AvatarUrl))
+            {
+                continue;
+            }
+
+            map[member.UserId.ToString()] = Api.ToAbsoluteUrl(member.AvatarUrl);
+        }
+
+        if (Auth.CurrentUser != null && !string.IsNullOrWhiteSpace(Auth.CurrentUser.AvatarUrl))
+        {
+            map[Auth.CurrentUser.Id.ToString()] = Api.ToAbsoluteUrl(Auth.CurrentUser.AvatarUrl);
+        }
+
+        return map;
+    }
+
     private static string ResolveMemberDisplayName(string? displayName, string? userName, Guid userId)
     {
         if (!string.IsNullOrWhiteSpace(displayName)) return displayName.Trim();
@@ -1135,15 +1558,209 @@
         return $"User {userId.ToString()[..8]}";
     }
 
+    private void QueueVisibleLinkPreviewLoads()
+    {
+        foreach (var message in Store.Messages)
+        {
+            if (message.IsDeleted) continue;
+            var url = ExtractFirstHttpUrl(message.Content);
+            if (string.IsNullOrWhiteSpace(url)) continue;
+            if (_linkPreviewCache.ContainsKey(url) || _linkPreviewInFlight.Contains(url)) continue;
+
+            _linkPreviewInFlight.Add(url);
+            _ = LoadLinkPreviewAsync(url);
+        }
+    }
+
+    private async Task LoadLinkPreviewAsync(string url)
+    {
+        try
+        {
+            var preview = await Api.GetLinkPreviewAsync(url);
+            _linkPreviewCache[url] = preview;
+            TrimLinkPreviewCacheIfNeeded();
+        }
+        catch
+        {
+            _linkPreviewCache[url] = null;
+        }
+        finally
+        {
+            _linkPreviewInFlight.Remove(url);
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void TrimLinkPreviewCacheIfNeeded()
+    {
+        if (_linkPreviewCache.Count <= MaxLinkPreviewCacheEntries) return;
+
+        var toRemove = _linkPreviewCache.Count - MaxLinkPreviewCacheEntries;
+        foreach (var key in _linkPreviewCache.Keys.Take(toRemove).ToArray())
+        {
+            _linkPreviewCache.Remove(key);
+            _linkPreviewInFlight.Remove(key);
+        }
+    }
+
+    private LinkPreviewInfo? GetCachedLinkPreview(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+        _linkPreviewCache.TryGetValue(url, out var preview);
+        return preview;
+    }
+
+    private static string? ExtractFirstHttpUrl(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+
+        var match = UrlRegex.Match(text);
+        if (!match.Success) return null;
+
+        var raw = match.Value.Trim();
+        raw = raw.TrimEnd('.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'');
+        if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri)) return null;
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return uri.ToString();
+    }
+
+    private static string GetPreviewTitle(LinkPreviewInfo preview, string href)
+    {
+        if (!string.IsNullOrWhiteSpace(preview.Title))
+        {
+            return preview.Title!;
+        }
+
+        return FormatPreviewUrl(href);
+    }
+
+    private static string FormatPreviewUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return string.Empty;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return url.Length > 72 ? url[..72] + "..." : url;
+        }
+
+        var host = uri.Host;
+        var path = uri.AbsolutePath == "/" ? string.Empty : uri.AbsolutePath;
+        var compact = $"{host}{path}";
+        if (compact.Length > 72)
+        {
+            compact = compact[..72] + "...";
+        }
+
+        return compact;
+    }
+
+    private static string GetAttachmentUrl(AttachmentInfo? attachment)
+        => attachment?.Url?.Trim() ?? string.Empty;
+
+    private static string GetAttachmentLabel(AttachmentInfo? attachment)
+        => string.IsNullOrWhiteSpace(attachment?.FileName) ? "attachment" : attachment.FileName;
+
+    private static bool IsImageAttachment(AttachmentInfo? attachment)
+    {
+        var contentType = attachment?.ContentType?.Trim() ?? string.Empty;
+        if (contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var ext = GetAttachmentExtension(attachment);
+        return ext is ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".bmp" or ".svg";
+    }
+
+    private static bool IsVideoAttachment(AttachmentInfo? attachment)
+    {
+        var contentType = attachment?.ContentType?.Trim() ?? string.Empty;
+        if (contentType.StartsWith("video/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var ext = GetAttachmentExtension(attachment);
+        return ext is ".mp4" or ".webm" or ".mov" or ".m4v" or ".ogv" or ".avi" or ".mkv";
+    }
+
+    private static string ResolveVideoMime(AttachmentInfo? attachment)
+    {
+        var contentType = attachment?.ContentType?.Trim() ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(contentType))
+        {
+            return contentType;
+        }
+
+        return GetAttachmentExtension(attachment) switch
+        {
+            ".webm" => "video/webm",
+            ".mov" => "video/quicktime",
+            ".ogv" => "video/ogg",
+            ".m4v" => "video/mp4",
+            _ => "video/mp4"
+        };
+    }
+
+    private static string GetAttachmentExtension(AttachmentInfo? attachment)
+    {
+        var candidate = !string.IsNullOrWhiteSpace(attachment?.FileName)
+            ? attachment.FileName
+            : attachment?.Url ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return string.Empty;
+        }
+
+        if (Uri.TryCreate(candidate, UriKind.Absolute, out var uri))
+        {
+            candidate = uri.AbsolutePath;
+        }
+
+        var queryIndex = candidate.IndexOf('?');
+        if (queryIndex >= 0)
+        {
+            candidate = candidate[..queryIndex];
+        }
+
+        var hashIndex = candidate.IndexOf('#');
+        if (hashIndex >= 0)
+        {
+            candidate = candidate[..hashIndex];
+        }
+
+        return (System.IO.Path.GetExtension(candidate) ?? string.Empty).ToLowerInvariant();
+    }
+
+    private string GetActiveCallRoomName()
+    {
+        if (Call.ActiveRoomId is not Guid activeRoomId || activeRoomId == Guid.Empty)
+            return string.Empty;
+
+        var room = Store.Rooms.FirstOrDefault(r => r.Id == activeRoomId);
+        return room?.Name ?? string.Empty;
+    }
+
     private async Task SyncParticipantDirectoryAsync(bool force = false)
     {
         if (!(Call.IsInCall && Call.ActiveRoomId == Store.SelectedRoomId))
             return;
 
-        var map = BuildParticipantDirectory();
-        var signature = string.Join("|", map
+        var nameMap = BuildParticipantDirectory();
+        var avatarMap = BuildParticipantAvatarDirectory();
+        var namesSignature = string.Join("|", nameMap
             .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
             .Select(x => $"{x.Key}:{x.Value}"));
+        var avatarSignature = string.Join("|", avatarMap
+            .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => $"{x.Key}:{x.Value}"));
+        var signature = $"{namesSignature}||{avatarSignature}";
 
         if (!force && signature == _lastParticipantDirectorySignature)
             return;
@@ -1151,7 +1768,7 @@
         _lastParticipantDirectorySignature = signature;
         try
         {
-            await WebRtc.UpdateParticipantDirectoryAsync(map);
+            await WebRtc.UpdateParticipantProfilesAsync(nameMap, avatarMap);
         }
         catch
         {

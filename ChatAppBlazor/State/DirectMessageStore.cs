@@ -1,5 +1,7 @@
 using ChatAppBlazor.Services;
+using Microsoft.Maui.Storage;
 using Shared.Models;
+using System.Text.Json;
 
 namespace ChatAppBlazor.State;
 
@@ -8,9 +10,12 @@ namespace ChatAppBlazor.State;
 /// </summary>
 public class DirectMessageStore : IDisposable
 {
+    private const string MutedDirectNotificationsPrefPrefix = "notifications.muted.direct.";
     private readonly ApiClientService _api;
     private readonly ChatClientService _chat;
     private readonly AuthStateProvider _auth;
+    private HashSet<Guid> _mutedDirectNotifications = [];
+    private Guid? _notificationPrefsUserId;
 
     public UserInfo[] Contacts { get; private set; } = [];
     public Guid? SelectedContactId { get; private set; }
@@ -28,6 +33,37 @@ public class DirectMessageStore : IDisposable
 
         _chat.OnPrivateMessageReceived += HandlePrivateMessageReceived;
         _chat.OnPrivateMessagesRead += HandlePrivateMessagesRead;
+        _chat.OnUserProfileUpdated += HandleUserProfileUpdated;
+    }
+
+    public bool IsContactNotificationsMuted(Guid userId)
+    {
+        if (userId == Guid.Empty) return false;
+        EnsureNotificationMuteStateLoaded();
+        return _mutedDirectNotifications.Contains(userId);
+    }
+
+    public bool IsSelectedContactNotificationsMuted
+        => SelectedContactId != null && IsContactNotificationsMuted(SelectedContactId.Value);
+
+    public void SetContactNotificationsMuted(Guid userId, bool muted)
+    {
+        if (userId == Guid.Empty) return;
+        EnsureNotificationMuteStateLoaded();
+
+        var changed = muted
+            ? _mutedDirectNotifications.Add(userId)
+            : _mutedDirectNotifications.Remove(userId);
+
+        if (!changed) return;
+        SaveMutedDirectNotifications();
+        NotifyChanged();
+    }
+
+    public void ToggleContactNotificationsMuted(Guid userId)
+    {
+        if (userId == Guid.Empty) return;
+        SetContactNotificationsMuted(userId, !IsContactNotificationsMuted(userId));
     }
 
     public async Task LoadContactsAsync()
@@ -124,11 +160,95 @@ public class DirectMessageStore : IDisposable
         NotifyChanged();
     }
 
+    private void HandleUserProfileUpdated(UserProfileUpdateInfo profile)
+    {
+        var changed = false;
+
+        var contact = Contacts.FirstOrDefault(c => c.Id == profile.UserId);
+        if (contact != null)
+        {
+            contact.DisplayName = profile.DisplayName;
+            contact.AvatarUrl = profile.AvatarUrl;
+            changed = true;
+        }
+
+        if (SelectedContact?.Id == profile.UserId)
+        {
+            SelectedContact.DisplayName = profile.DisplayName;
+            SelectedContact.AvatarUrl = profile.AvatarUrl;
+            changed = true;
+        }
+
+        if (_auth.CurrentUser?.Id == profile.UserId)
+        {
+            _auth.UpdateCurrentUserProfile(profile.DisplayName, profile.AvatarUrl);
+            changed = true;
+        }
+
+        if (changed)
+        {
+            NotifyChanged();
+        }
+    }
+
     private void NotifyChanged() => OnChange?.Invoke();
+
+    private void EnsureNotificationMuteStateLoaded()
+    {
+        var userId = _auth.CurrentUser?.Id;
+        if (_notificationPrefsUserId == userId)
+        {
+            return;
+        }
+
+        _notificationPrefsUserId = userId;
+        _mutedDirectNotifications = LoadMutedDirectNotifications();
+    }
+
+    private string GetMutedDirectNotificationsPrefKey()
+    {
+        var userToken = _auth.CurrentUser?.Id.ToString("D") ?? "anonymous";
+        return $"{MutedDirectNotificationsPrefPrefix}{userToken}";
+    }
+
+    private HashSet<Guid> LoadMutedDirectNotifications()
+    {
+        try
+        {
+            var raw = Preferences.Default.Get(GetMutedDirectNotificationsPrefKey(), string.Empty);
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return [];
+            }
+
+            var ids = JsonSerializer.Deserialize<Guid[]>(raw) ?? [];
+            return ids
+                .Where(id => id != Guid.Empty)
+                .ToHashSet();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private void SaveMutedDirectNotifications()
+    {
+        try
+        {
+            var payload = JsonSerializer.Serialize(_mutedDirectNotifications.ToArray());
+            Preferences.Default.Set(GetMutedDirectNotificationsPrefKey(), payload);
+        }
+        catch
+        {
+            // Ignore preference persistence failures.
+        }
+    }
 
     public void Dispose()
     {
         _chat.OnPrivateMessageReceived -= HandlePrivateMessageReceived;
         _chat.OnPrivateMessagesRead -= HandlePrivateMessagesRead;
+        _chat.OnUserProfileUpdated -= HandleUserProfileUpdated;
     }
 }

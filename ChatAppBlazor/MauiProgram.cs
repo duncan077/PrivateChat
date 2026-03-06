@@ -1,16 +1,39 @@
 using ChatAppBlazor.Services;
 using ChatAppBlazor.State;
 using ChatAppBlazor.WebRtc;
+using MessagePack;
+using MessagePack.Resolvers;
 using Microsoft.Extensions.Logging;
 using MudBlazor.Services;
 using System.Reflection;
+using System.Threading;
 
 namespace ChatAppBlazor
 {
     public static class MauiProgram
     {
+        private static int _messagePackConfigured;
+
+        private static void ConfigureMessagePackForAot()
+        {
+            if (Interlocked.Exchange(ref _messagePackConfigured, 1) == 1)
+            {
+                return;
+            }
+
+            StaticCompositeResolver.Instance.Register(
+                global::MagicOnionClientGenerationMarker.Resolver,
+                StandardResolver.Instance);
+
+            MessagePackSerializer.DefaultOptions =
+                MessagePackSerializerOptions.Standard.WithResolver(StaticCompositeResolver.Instance);
+        }
+
         public static MauiApp CreateMauiApp()
         {
+            global::MagicOnionClientGenerationMarker.Register();
+            ConfigureMessagePackForAot();
+
             var builder = MauiApp.CreateBuilder();
             builder
                 .UseMauiApp<App>()
@@ -29,6 +52,7 @@ namespace ChatAppBlazor
             builder.Services.AddSingleton<GrpcChannelProvider>();
             builder.Services.AddSingleton<ChatClientService>();
             builder.Services.AddSingleton<ApiClientService>();
+            builder.Services.AddSingleton<ISystemNotificationService, SystemNotificationService>();
 
             // State stores (singletons — Blazor components subscribe to their events)
             builder.Services.AddSingleton<ChatRoomStore>();

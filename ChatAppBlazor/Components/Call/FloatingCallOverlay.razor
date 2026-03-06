@@ -1,13 +1,14 @@
 @implements IDisposable
 @inject CallStore Store
 @inject ChatRoomStore Rooms
+@inject DirectMessageStore DirectMessages
 @inject WebRtcBridge WebRtc
 @inject NavigationManager Nav
 @inject IJSRuntime JS
 
 @* ─── Floating PiP overlay shown when in a call but NOT on the call room page ─── *@
 
-@if (Store.IsInCall && (!_isOnCallRoom || Store.UseFloatingOverlayInActiveRoom))
+@if (Store.IsInCall && (!_isOnCallContextPage || Store.UseFloatingOverlayInActiveRoom))
 {
     <div id="floatingCallOverlay" class="floating-call-overlay @(_minimized ? "minimized" : "")">
         <div id="floatingCallOverlayHeader" class="float-header">
@@ -46,7 +47,7 @@
 
 @code {
     private bool _minimized;
-    private bool _isOnCallRoom;
+    private bool _isOnCallContextPage;
     private bool? _lastFloatVideoVisible;
 
     protected override void OnInitialized()
@@ -60,7 +61,7 @@
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         var shouldShowFloatVideo = Store.IsInCall
-            && (!_isOnCallRoom || Store.UseFloatingOverlayInActiveRoom)
+            && (!_isOnCallContextPage || Store.UseFloatingOverlayInActiveRoom)
             && !_minimized;
         if (!firstRender && _lastFloatVideoVisible == shouldShowFloatVideo)
         {
@@ -89,9 +90,25 @@
     private void CheckIfOnCallRoom()
     {
         var relative = Nav.ToBaseRelativePath(Nav.Uri);
-        var pathOnly = relative.Split('?', '#')[0].Trim('/');
+        var pathOnly = relative.Split('?', '#')[0].Trim('/').ToLowerInvariant();
+        if (!Store.IsInCall)
+        {
+            _isOnCallContextPage = false;
+            return;
+        }
+
+        if (Store.ActiveCallKind == CallContextKind.DirectMessage)
+        {
+            var activePeer = Store.ActiveDirectPeerUserId;
+            var onDmRoute = pathOnly == "dm";
+            var directStoreSelected = activePeer != null && DirectMessages.SelectedContactId == activePeer;
+            var querySelected = activePeer != null && TryGetQueryGuid("userId", out var queryUserId) && queryUserId == activePeer.Value;
+            _isOnCallContextPage = onDmRoute && (directStoreSelected || querySelected);
+            return;
+        }
+
         var isRoomsRoute = string.IsNullOrEmpty(pathOnly);
-        _isOnCallRoom = isRoomsRoute && Store.IsInCall && Rooms.SelectedRoomId == Store.ActiveRoomId;
+        _isOnCallContextPage = isRoomsRoute && Rooms.SelectedRoomId == Store.ActiveRoomId;
     }
 
     private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e)
@@ -112,6 +129,15 @@
 
     private async Task GoToCall()
     {
+        if (Store.ActiveCallKind == CallContextKind.DirectMessage
+            && Store.ActiveDirectPeerUserId is Guid activePeerId
+            && activePeerId != Guid.Empty)
+        {
+            Store.SetUseFloatingOverlayInActiveRoom(false);
+            Nav.NavigateTo($"/dm?userId={Uri.EscapeDataString(activePeerId.ToString())}");
+            return;
+        }
+
         var activeRoomId = Store.ActiveRoomId;
         if (activeRoomId == null || activeRoomId == Guid.Empty)
         {
@@ -149,5 +175,33 @@
         Store.OnChange -= OnStoreChanged;
         Rooms.OnChange -= OnRoomsChanged;
         Nav.LocationChanged -= OnLocationChanged;
+    }
+
+    private bool TryGetQueryGuid(string key, out Guid value)
+    {
+        value = Guid.Empty;
+        var uri = Nav.ToAbsoluteUri(Nav.Uri);
+        var query = uri.Query;
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return false;
+        }
+
+        var trimmed = query.TrimStart('?');
+        foreach (var pair in trimmed.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = pair.IndexOf('=');
+            var rawKey = separator >= 0 ? pair[..separator] : pair;
+            if (!rawKey.Equals(key, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var rawValue = separator >= 0 ? pair[(separator + 1)..] : string.Empty;
+            var decoded = Uri.UnescapeDataString(rawValue);
+            return Guid.TryParse(decoded, out value);
+        }
+
+        return false;
     }
 }

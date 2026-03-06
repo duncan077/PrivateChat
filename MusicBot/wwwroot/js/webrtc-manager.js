@@ -71,7 +71,8 @@ window.webrtcManager = {
         fps: 30,
         bitrateKbps: 2000,
         preferredVideoCodec: 'h264',
-        screenShareAudioEnabled: true
+        screenShareAudioEnabled: true,
+        screenShareAutoGainEnabled: true
     },
     minPublisherBitrateKbps: 1000,
     maxPublisherBitrateKbps: 20000,
@@ -118,8 +119,14 @@ window.webrtcManager = {
     screenAudioFallbackContext: null,
     screenAudioFallbackDestination: null,
     screenAudioFallbackGain: null,
+    screenAudioFallbackLimiter: null,
     screenAudioFallbackTrack: null,
     screenAudioFallbackNextTime: 0,
+    screenAudioFallbackAutoGain: 1.0,
+    screenAudioFallbackTargetRms: 0.11,
+    screenAudioFallbackNoiseGateRms: 0.002,
+    screenAudioFallbackMinGain: 1.0,
+    screenAudioFallbackMaxGain: 4.5,
     screenShareAudioMixContext: null,
     screenShareAudioMixTrack: null,
 
@@ -216,6 +223,7 @@ window.webrtcManager = {
         const maxBitrateBps = maxBitrateKbps * 1000;
         const minBitrateBps = minBitrateKbps * 1000;
         const requestedScale = Number(options?.scaleResolutionDownBy);
+        const minRequiredScale = this.getRequiredScreenShareScaleDownBy(videoSender?.track || null);
 
         try {
             const params = videoSender.getParameters() || {};
@@ -231,11 +239,13 @@ window.webrtcManager = {
             if ('networkPriority' in params.encodings[0]) {
                 params.encodings[0].networkPriority = 'high';
             }
+            const currentScale = Number(params.encodings[0].scaleResolutionDownBy);
+            let nextScale = Number.isFinite(currentScale) && currentScale >= 1 ? currentScale : 1;
             if (Number.isFinite(requestedScale) && requestedScale >= 1) {
-                params.encodings[0].scaleResolutionDownBy = requestedScale;
-            } else if (!Number.isFinite(params.encodings[0].scaleResolutionDownBy) || params.encodings[0].scaleResolutionDownBy < 1) {
-                params.encodings[0].scaleResolutionDownBy = 1;
+                nextScale = requestedScale;
             }
+            nextScale = Math.max(minRequiredScale, nextScale);
+            params.encodings[0].scaleResolutionDownBy = nextScale;
 
             await videoSender.setParameters(params);
             this.log(
@@ -363,6 +373,22 @@ window.webrtcManager = {
         return { width, height };
     },
 
+    getRequiredScreenShareScaleDownBy(videoTrack) {
+        if (!videoTrack) return 1;
+        const targetResolution = this.parseResolutionSetting(this.currentConstraints?.resolution, 1920, 1080);
+        const settings = videoTrack.getSettings?.() || {};
+        const sourceWidth = Number(settings.width ?? 0);
+        const sourceHeight = Number(settings.height ?? 0);
+        if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight) || sourceWidth <= 0 || sourceHeight <= 0) {
+            return 1;
+        }
+
+        const widthRatio = sourceWidth / Math.max(1, targetResolution.width);
+        const heightRatio = sourceHeight / Math.max(1, targetResolution.height);
+        const requiredScale = Math.max(1, widthRatio, heightRatio);
+        return Math.max(1, Math.min(4, Math.round(requiredScale * 100) / 100));
+    },
+
     clearScreenShareBitrateWarmupTimers() {
         if (!Array.isArray(this.screenShareBitrateWarmupTimers)) {
             this.screenShareBitrateWarmupTimers = [];
@@ -475,12 +501,14 @@ window.webrtcManager = {
         const recoveryFpsThreshold = Math.max(12, targetFps * 0.9);
         const isEncoderLimited = qualityLimitationReason === 'cpu' || qualityLimitationReason === 'other';
         const hasLowFps = Number.isFinite(measuredFps) && measuredFps > 0 && measuredFps < lowFpsThreshold;
+        const minRequiredScale = this.getRequiredScreenShareScaleDownBy(videoSender.track);
 
         const senderParams = videoSender.getParameters?.() || {};
         const senderScale = Number(senderParams?.encodings?.[0]?.scaleResolutionDownBy);
         if (Number.isFinite(senderScale) && senderScale >= 1) {
-            state.scaleResolutionDownBy = senderScale;
+            state.scaleResolutionDownBy = Math.max(minRequiredScale, senderScale);
         }
+        state.scaleResolutionDownBy = Math.max(minRequiredScale, Number(state.scaleResolutionDownBy) || 1);
 
         if (isEncoderLimited && hasLowFps) {
             state.lowFpsStreak += 1;
@@ -498,7 +526,7 @@ window.webrtcManager = {
 
         if (state.lowFpsStreak >= 3) {
             state.lowFpsStreak = 0;
-            const nextScale = Math.min(2.5, Math.round((state.scaleResolutionDownBy + 0.25) * 100) / 100);
+            const nextScale = Math.max(minRequiredScale, Math.min(2.5, Math.round((state.scaleResolutionDownBy + 0.25) * 100) / 100));
             if (nextScale > state.scaleResolutionDownBy + 0.001) {
                 state.scaleResolutionDownBy = nextScale;
                 await this.tuneScreenShareVideoSenderForPerformance(
@@ -515,9 +543,9 @@ window.webrtcManager = {
             return;
         }
 
-        if (state.recoveryStreak >= 5 && state.scaleResolutionDownBy > 1.01) {
+        if (state.recoveryStreak >= 5 && state.scaleResolutionDownBy > (minRequiredScale + 0.01)) {
             state.recoveryStreak = 0;
-            const nextScale = Math.max(1, Math.round((state.scaleResolutionDownBy - 0.25) * 100) / 100);
+            const nextScale = Math.max(minRequiredScale, Math.round((state.scaleResolutionDownBy - 0.25) * 100) / 100);
             if (nextScale < state.scaleResolutionDownBy - 0.001) {
                 state.scaleResolutionDownBy = nextScale;
                 await this.tuneScreenShareVideoSenderForPerformance(
@@ -2525,6 +2553,10 @@ window.webrtcManager = {
             if (!this.botMode && existingPublishers.length > 0) {
                 this.log('init', `Subscribing to ${existingPublishers.length} existing publisher(s)...`);
                 for (const pub of existingPublishers) {
+                    if (this.isSelfPublisherDisplay(pub?.display)) {
+                        this.log('init', `Skip self existing publisher feed ${pub?.id} (${pub?.display || 'unknown'})`);
+                        continue;
+                    }
                     await this.initiateSubscribe(pub.id, pub.display, pub.streams);
                 }
             }
@@ -2547,6 +2579,7 @@ window.webrtcManager = {
         const c = this.currentConstraints;
         c.preferredVideoCodec = this.normalizeVideoCodec(c.preferredVideoCodec);
         c.screenShareAudioEnabled = c.screenShareAudioEnabled !== false;
+        c.screenShareAutoGainEnabled = c.screenShareAutoGainEnabled !== false;
         c.bitrateKbps = this.clampPublisherBitrateKbps(c.bitrateKbps);
 
         // Parse resolution
@@ -3138,9 +3171,23 @@ window.webrtcManager = {
         }
 
         const gain = context.createGain();
+        const limiter = context.createDynamicsCompressor();
         const destination = context.createMediaStreamDestination();
-        gain.connect(destination);
-        gain.gain.value = 1.0;
+        gain.connect(limiter);
+        limiter.connect(destination);
+        const autoGainEnabled = this.currentConstraints.screenShareAutoGainEnabled !== false;
+        const initialGain = autoGainEnabled
+            ? Math.max(
+                this.screenAudioFallbackMinGain,
+                Math.min(this.screenAudioFallbackMaxGain, Number(this.screenAudioFallbackAutoGain) || 1.0)
+            )
+            : 1.0;
+        gain.gain.value = initialGain;
+        limiter.threshold.value = -2;
+        limiter.knee.value = 0;
+        limiter.ratio.value = 20;
+        limiter.attack.value = 0.003;
+        limiter.release.value = 0.12;
 
         const track = destination.stream.getAudioTracks()[0];
         if (!track) {
@@ -3150,8 +3197,30 @@ window.webrtcManager = {
 
         this.screenAudioFallbackContext = context;
         this.screenAudioFallbackGain = gain;
+        this.screenAudioFallbackLimiter = limiter;
         this.screenAudioFallbackDestination = destination;
         this.screenAudioFallbackTrack = track;
+    },
+
+    applyWindowsScreenAudioFallbackGainMode(reason = 'settings') {
+        if (!this.screenAudioFallbackGain || !this.screenAudioFallbackContext) return;
+
+        const autoGainEnabled = this.currentConstraints.screenShareAutoGainEnabled !== false;
+        const minGain = Math.max(0.1, Number(this.screenAudioFallbackMinGain) || 1.0);
+        const maxGain = Math.max(minGain, Number(this.screenAudioFallbackMaxGain) || 4.5);
+        const targetGain = autoGainEnabled
+            ? Math.max(minGain, Math.min(maxGain, Number(this.screenAudioFallbackAutoGain) || 1.0))
+            : 1.0;
+
+        const now = this.screenAudioFallbackContext.currentTime;
+        try {
+            this.screenAudioFallbackGain.gain.cancelScheduledValues(now);
+            this.screenAudioFallbackGain.gain.setTargetAtTime(targetGain, now, 0.06);
+        } catch {
+            this.screenAudioFallbackGain.gain.value = targetGain;
+        }
+
+        this.log('screenshare', `Screen-share fallback auto gain ${autoGainEnabled ? 'enabled' : 'disabled'} (${reason})`);
     },
 
     decodeBase64ToBytes(base64Data) {
@@ -3161,6 +3230,58 @@ window.webrtcManager = {
             out[i] = raw.charCodeAt(i);
         }
         return out;
+    },
+
+    getInterleavedAudioStats(samples) {
+        if (!samples || samples.length === 0) return { rms: 0, peak: 0 };
+        let sumSquares = 0;
+        let peak = 0;
+        for (let i = 0; i < samples.length; i++) {
+            const value = samples[i];
+            const absValue = Math.abs(value);
+            if (absValue > peak) peak = absValue;
+            sumSquares += value * value;
+        }
+        const rms = Math.sqrt(sumSquares / samples.length);
+        return { rms, peak };
+    },
+
+    updateWindowsScreenAudioAutoGain(rms, peak) {
+        if (!this.screenAudioFallbackGain || !this.screenAudioFallbackContext) return;
+        if (this.currentConstraints.screenShareAutoGainEnabled === false) return;
+        if (!Number.isFinite(rms) || !Number.isFinite(peak)) return;
+        if (rms <= 0 || peak <= 0) return;
+
+        const noiseGateRms = Math.max(0, Number(this.screenAudioFallbackNoiseGateRms) || 0.002);
+        if (rms < noiseGateRms && peak < noiseGateRms * 3) {
+            return;
+        }
+
+        const minGain = Math.max(0.1, Number(this.screenAudioFallbackMinGain) || 1.0);
+        const maxGain = Math.max(minGain, Number(this.screenAudioFallbackMaxGain) || 4.5);
+        const targetRms = Math.max(0.005, Number(this.screenAudioFallbackTargetRms) || 0.11);
+        let desiredGain = targetRms / Math.max(rms, 0.0001);
+        desiredGain = Math.max(minGain, Math.min(maxGain, desiredGain));
+
+        if (peak * desiredGain > 0.98 && peak > 0.0001) {
+            desiredGain = Math.max(minGain, Math.min(maxGain, 0.98 / peak));
+        }
+
+        const previousGain = Math.max(minGain, Math.min(maxGain, Number(this.screenAudioFallbackAutoGain) || 1.0));
+        const smoothing = desiredGain >= previousGain ? 0.35 : 0.12;
+        const smoothedGain = previousGain + (desiredGain - previousGain) * smoothing;
+        const nextGain = Math.max(minGain, Math.min(maxGain, smoothedGain));
+
+        if (!Number.isFinite(nextGain)) return;
+        this.screenAudioFallbackAutoGain = nextGain;
+
+        const now = this.screenAudioFallbackContext.currentTime;
+        try {
+            this.screenAudioFallbackGain.gain.cancelScheduledValues(now);
+            this.screenAudioFallbackGain.gain.setTargetAtTime(nextGain, now, 0.06);
+        } catch {
+            this.screenAudioFallbackGain.gain.value = nextGain;
+        }
     },
 
     ingestWindowsScreenAudioChunk(chunk) {
@@ -3186,6 +3307,8 @@ window.webrtcManager = {
         }
 
         const interleaved = new Float32Array(rawBytes.buffer, rawBytes.byteOffset, frameCount * channels);
+        const stats = this.getInterleavedAudioStats(interleaved);
+        this.updateWindowsScreenAudioAutoGain(stats.rms, stats.peak);
         const buffer = this.screenAudioFallbackContext.createBuffer(channels, frameCount, sampleRate);
 
         for (let ch = 0; ch < channels; ch++) {
@@ -3223,6 +3346,8 @@ window.webrtcManager = {
         this.screenAudioFallbackTrack = null;
         this.screenAudioFallbackDestination = null;
         this.screenAudioFallbackGain = null;
+        this.screenAudioFallbackLimiter = null;
+        this.screenAudioFallbackAutoGain = 1.0;
 
         if (this.screenAudioFallbackContext) {
             try { await this.screenAudioFallbackContext.close(); } catch { }
@@ -4255,11 +4380,27 @@ window.webrtcManager = {
         const feed = this.feeds[key];
         if (!feed) return 'mic';
 
+        const parsedDisplay = this.parsePublisherDisplay((feed.display || '').toString());
+        if (parsedDisplay.role === 'screen-audio') {
+            return 'stream';
+        }
+
+        const identityKey = this.getFeedIdentityKey(key);
+        if (parsedDisplay.role === 'primary' && identityKey) {
+            const hasDedicatedScreenAudioSibling = this.listIdentityFeeds(identityKey, true).some(otherFeedId => {
+                const otherKey = String(otherFeedId);
+                if (otherKey === key) return false;
+                return this.isFeedTaggedScreenAudio(otherKey);
+            });
+            if (hasDedicatedScreenAudioSibling) {
+                return 'mic';
+            }
+        }
+
         if (feed.roleHint === 'mic' || feed.roleHint === 'stream') {
             return feed.roleHint;
         }
 
-        const identityKey = this.getFeedIdentityKey(key);
         if (!identityKey) return 'mic';
 
         const identityAudioFeeds = this.listIdentityFeeds(identityKey, true);
@@ -4630,6 +4771,10 @@ window.webrtcManager = {
                                 data.publishers.map(p => ({ id: p.id, display: p.display })));
 
                             for (const pub of data.publishers) {
+                                if (this.isSelfPublisherDisplay(pub?.display)) {
+                                    this.log('poll', `Skip self publisher event feed ${pub?.id} (${pub?.display || 'unknown'})`);
+                                    continue;
+                                }
                                 this.updatePublisherStreamHint(pub.id, pub.streams);
                                 const existingPending = this.findPendingSubscribeByFeed(pub.id);
                                 if (existingPending) {
@@ -5042,7 +5187,7 @@ window.webrtcManager = {
                 sharedVideoTrack,
                 fps,
                 'screenshare-capture',
-                { enforceResolutionCap: !isSystemShare }
+                { enforceResolutionCap: true }
             );
 
             // Some Windows builds attach display-audio slightly after getDisplayMedia resolves.
@@ -5722,6 +5867,10 @@ window.webrtcManager = {
             settings.screenShareAudioEnabled !== undefined
                 ? settings.screenShareAudioEnabled !== false
                 : this.currentConstraints.screenShareAudioEnabled !== false;
+        const requestedScreenShareAutoGainEnabled =
+            settings.screenShareAutoGainEnabled !== undefined
+                ? settings.screenShareAutoGainEnabled !== false
+                : this.currentConstraints.screenShareAutoGainEnabled !== false;
 
         // Re-acquire local stream with new device constraints
         await this.startLocalStream({
@@ -5731,8 +5880,13 @@ window.webrtcManager = {
             fps: settings.fps || 30,
             bitrateKbps,
             preferredVideoCodec: requestedVideoCodec,
-            screenShareAudioEnabled: requestedScreenShareAudioEnabled
+            screenShareAudioEnabled: requestedScreenShareAudioEnabled,
+            screenShareAutoGainEnabled: requestedScreenShareAutoGainEnabled
         });
+
+        if (this.screenAudioFallbackActive) {
+            this.applyWindowsScreenAudioFallbackGainMode('settings');
+        }
 
         // Replace tracks in publisher PeerConnection
         if (this.publisherPc && this.localStream) {
@@ -5756,14 +5910,11 @@ window.webrtcManager = {
                 }
 
                 const screenTrack = this.screenStream?.getVideoTracks?.()[0] || null;
-                const settingsSnapshot = screenTrack?.getSettings?.() || {};
-                const displaySurface = (settingsSnapshot.displaySurface || '').toString();
-                const shareTarget = this.classifyScreenShareTarget(displaySurface, (screenTrack?.label || '').toString());
                 await this.tuneScreenShareVideoTrackForPerformance(
                     screenTrack,
                     activeFps,
                     'screenshare-settings',
-                    { enforceResolutionCap: shareTarget !== 'system' }
+                    { enforceResolutionCap: true }
                 );
 
                 const videoSender = this.findSenderByKind(this.publisherPc, 'video');

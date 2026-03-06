@@ -1,7 +1,6 @@
 @implements IAsyncDisposable
 @inject CallStore Store
 @inject WebRtcBridge WebRtc
-@inject IDialogService DialogService
 
 @* ─── Embedded call panel shown inside ChatRooms when IsInCall ─── *@
 @* ChatRooms handles joining + WebRtc.InitAsync. This is purely the controls UI. *@
@@ -40,11 +39,6 @@
                        Variant="Variant.Filled"
                        OnClick="ToggleScreenShare" />
 
-        <MudIconButton Icon="@Icons.Material.Filled.Tune"
-                       Color="Color.Default"
-                       Variant="Variant.Filled"
-                       OnClick="OpenSettings" />
-
         <MudIconButton Icon="@Icons.Material.Filled.CallEnd"
                        Color="Color.Error"
                        Variant="Variant.Filled"
@@ -60,7 +54,6 @@
     protected override void OnInitialized()
     {
         Store.OnChange += OnStoreChanged;
-        Store.OnWebRtcSignal += OnWebRtcSignal;
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -108,42 +101,11 @@
         catch { }
     }
 
-    private async Task OpenSettings()
-    {
-        try { await WebRtc.EnumerateDevicesAsync(); } catch { }
-        await Task.Delay(200);
-
-        var parameters = new DialogParameters<CallSettingsDialog>
-        {
-            { x => x.Store, Store },
-            { x => x.WebRtc, WebRtc }
-        };
-
-        var options = new DialogOptions
-        {
-            CloseButton = true,
-            MaxWidth = MaxWidth.Small,
-            FullWidth = true
-        };
-
-        await DialogService.ShowAsync<CallSettingsDialog>("Call Settings", parameters, options);
-    }
-
-    private async void OnWebRtcSignal(Guid fromUserId, string signalType, string payload)
-    {
-        try
-        {
-            await WebRtc.DeliverSignalAsync(fromUserId, signalType, payload);
-        }
-        catch { }
-    }
-
     private void OnStoreChanged() => InvokeAsync(StateHasChanged);
 
     public async ValueTask DisposeAsync()
     {
         Store.OnChange -= OnStoreChanged;
-        Store.OnWebRtcSignal -= OnWebRtcSignal;
         // DO NOT stop the call on dispose — the call persists via singleton WebRtcBridge
     }
 }

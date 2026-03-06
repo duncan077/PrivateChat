@@ -20,6 +20,8 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 {
     private static readonly ConcurrentDictionary<Guid, HashSet<Guid>> _onlineUsers = new();
     private static readonly ConcurrentDictionary<Guid, HashSet<Guid>> _voiceVideoUsers = new();
+    private static readonly ConcurrentDictionary<Guid, HashSet<Guid>> _privateVoiceVideoUsers = new();
+    private static readonly ConcurrentDictionary<Guid, HashSet<Guid>> _roomConnections = new();
 
     private readonly AppDbContext _db;
     private readonly IDistributedCache _cache;
@@ -30,6 +32,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
     private Guid _userId;
     private string _userName = string.Empty;
     private readonly HashSet<Guid> _joinedRooms = [];
+    private readonly HashSet<Guid> _joinedPrivateCallContexts = [];
     private bool _becameOnlineOnConnect;
 
     public ChatHubImpl(AppDbContext db, IDistributedCache cache, JwtTokenService jwt, JanusService janus, IConfiguration config)
@@ -133,6 +136,25 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
             }
         }
 
+        foreach (var callContextId in _joinedPrivateCallContexts)
+        {
+            if (_privateVoiceVideoUsers.TryGetValue(callContextId, out var privateVoiceUsers))
+            {
+                lock (privateVoiceUsers)
+                {
+                    privateVoiceUsers.Remove(_userId);
+                    if (privateVoiceUsers.Count == 0)
+                    {
+                        _privateVoiceVideoUsers.TryRemove(callContextId, out _);
+                    }
+                }
+            }
+
+            var privateCallGroup = await Group.AddAsync($"pcall:{callContextId}");
+            privateCallGroup.All.OnUserLeftVoiceVideo(callContextId, _userId);
+            await privateCallGroup.RemoveAsync(Context);
+        }
+
         if (becameOffline)
         {
             var globalGroup = await Group.AddAsync("global");
@@ -165,6 +187,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
         var group = await Group.AddAsync($"room:{roomId}");
         _joinedRooms.Add(roomId);
+        AddRoomConnection(roomId, ConnectionId);
 
         var user = await _db.Users.FindAsync(_userId);
         var memberInfo = new ChatMemberInfo
@@ -249,6 +272,39 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
         var group = await Group.AddAsync($"room:{roomId}");
         group.All.OnMessageReceived(chatMessage);
+
+        // Server-side push: notify room members who are online but not connected to this room.
+        var memberIds = await _db.ChatRoomMembers
+            .Where(m => m.RoomId == roomId && m.UserId != _userId)
+            .Select(m => m.UserId)
+            .Distinct()
+            .ToArrayAsync();
+
+        if (memberIds.Length > 0)
+        {
+            var globalGroup = await Group.AddAsync("global");
+            var roomConnectionSnapshot = GetRoomConnectionSnapshot(roomId);
+
+            foreach (var memberId in memberIds)
+            {
+                if (!_onlineUsers.TryGetValue(memberId, out var memberConnections))
+                {
+                    continue;
+                }
+
+                Guid[] targetConnections;
+                lock (memberConnections)
+                {
+                    targetConnections = [.. memberConnections.Where(connId =>
+                        roomConnectionSnapshot == null || !roomConnectionSnapshot.Contains(connId))];
+                }
+
+                foreach (var connectionId in targetConnections)
+                {
+                    globalGroup.Single(connectionId).OnMessageReceived(chatMessage);
+                }
+            }
+        }
 
         await InvalidateMessageCache(roomId);
     }
@@ -433,6 +489,50 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
         group.All.OnUserRoleChanged(roomId, userId, role);
     }
 
+    public async ValueTask<UserInfo> UpdateProfileAsync(UpdateProfileRequest request)
+    {
+        var displayName = (request.DisplayName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            throw new ReturnStatusException(StatusCode.InvalidArgument, "Display name is required");
+        }
+
+        if (displayName.Length > 64)
+        {
+            throw new ReturnStatusException(StatusCode.InvalidArgument, "Display name must be 64 characters or fewer");
+        }
+
+        var avatarUrl = NormalizeAvatarUrl(request.AvatarUrl);
+        if (avatarUrl != null && avatarUrl.Length > 2048)
+        {
+            throw new ReturnStatusException(StatusCode.InvalidArgument, "Avatar URL is too long");
+        }
+
+        var user = await _db.Users.FindAsync(_userId)
+            ?? throw new ReturnStatusException(StatusCode.NotFound, "User not found");
+
+        user.DisplayName = displayName;
+        user.AvatarUrl = avatarUrl;
+        await _db.SaveChangesAsync();
+
+        var globalGroup = await Group.AddAsync("global");
+        globalGroup.All.OnUserProfileUpdated(new UserProfileUpdateInfo
+        {
+            UserId = _userId,
+            DisplayName = user.DisplayName,
+            AvatarUrl = user.AvatarUrl
+        });
+
+        return new UserInfo
+        {
+            Id = user.Id,
+            UserName = user.UserName ?? _userName,
+            DisplayName = user.DisplayName,
+            AvatarUrl = user.AvatarUrl,
+            IsOnline = IsUserOnline(user.Id)
+        };
+    }
+
     public async ValueTask SendPrivateMessageAsync(Guid recipientId, SendMessageRequest request)
     {
         var recipient = await _db.Users.FindAsync(recipientId)
@@ -475,8 +575,29 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
             MentionedUserIds = request.MentionedUserIds
         };
 
-        var dmGroup = await Group.AddAsync($"dm:{GetDmKey(_userId, recipientId)}");
-        dmGroup.All.OnPrivateMessageReceived(privateMessage);
+        // Push directly to sender/recipient online connections so DM delivery
+        // does not depend on either side having joined a transient dm:* group.
+        var globalGroup = await Group.AddAsync("global");
+        var targetUserIds = new HashSet<Guid> { _userId, recipientId };
+
+        foreach (var targetUserId in targetUserIds)
+        {
+            if (!_onlineUsers.TryGetValue(targetUserId, out var targetConnections))
+            {
+                continue;
+            }
+
+            Guid[] connectionSnapshot;
+            lock (targetConnections)
+            {
+                connectionSnapshot = [.. targetConnections];
+            }
+
+            foreach (var connectionId in connectionSnapshot)
+            {
+                globalGroup.Single(connectionId).OnPrivateMessageReceived(privateMessage);
+            }
+        }
     }
 
     public async ValueTask MarkPrivateMessageReadAsync(Guid senderId)
@@ -492,8 +613,27 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
         await _db.SaveChangesAsync();
 
-        var dmGroup = await Group.AddAsync($"dm:{GetDmKey(_userId, senderId)}");
-        dmGroup.All.OnPrivateMessagesRead(_userId);
+        var globalGroup = await Group.AddAsync("global");
+        var targetUserIds = new HashSet<Guid> { _userId, senderId };
+
+        foreach (var targetUserId in targetUserIds)
+        {
+            if (!_onlineUsers.TryGetValue(targetUserId, out var targetConnections))
+            {
+                continue;
+            }
+
+            Guid[] connectionSnapshot;
+            lock (targetConnections)
+            {
+                connectionSnapshot = [.. targetConnections];
+            }
+
+            foreach (var connectionId in connectionSnapshot)
+            {
+                globalGroup.Single(connectionId).OnPrivateMessagesRead(_userId);
+            }
+        }
     }
 
     public async ValueTask<JanusSessionInfo> JoinVoiceVideoAsync(Guid roomId)
@@ -514,29 +654,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
         var group = await Group.AddAsync($"room:{roomId}");
         group.All.OnUserJoinedVoiceVideo(roomId, _userId);
 
-        var sessionId = await _janus.CreateSessionAsync();
-           var handleId = await _janus.AttachPluginAsync(sessionId);
-    
-          var guidBytes = roomId.ToByteArray();
-           long janusRoomId = Math.Abs((long)(BitConverter.ToInt32(guidBytes, 0) ^ BitConverter.ToInt32(guidBytes, 4)));
-         if (janusRoomId == 0) janusRoomId = 1;
-    
-            await _janus.EnsureVideoRoomAsync(sessionId, janusRoomId);
-
-        var serverBase = _config["Server:BaseUrl"] ?? "http://localhost:5000";
-        var iceServersJson = _config["Janus:IceServers"]
-            ?? "[{\"urls\":\"stun:stun.l.google.com:19302\"}]";
-
-        return new JanusSessionInfo
-        {
-            RoomId = roomId,
-            JanusSessionId = sessionId,
-            JanusHandleId = handleId,
-            JanusUrl = _config["Janus:Url"] ?? "ws://localhost:8188",
-            IceServers = iceServersJson,
-            ServerBaseUrl = serverBase,
-            JanusRoomId = janusRoomId
-        };
+        return await CreateJanusSessionInfoAsync(roomId);
     }
 
     public async ValueTask LeaveVoiceVideoAsync(Guid roomId)
@@ -590,6 +708,196 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
         }
     }
 
+    public async ValueTask<JanusSessionInfo> JoinPrivateVoiceVideoAsync(Guid peerUserId)
+    {
+        if (peerUserId == Guid.Empty || peerUserId == _userId)
+        {
+            throw new ReturnStatusException(StatusCode.InvalidArgument, "Invalid private call target");
+        }
+
+        var peerExists = await _db.Users.AnyAsync(u => u.Id == peerUserId);
+        if (!peerExists)
+        {
+            throw new ReturnStatusException(StatusCode.NotFound, "Target user not found");
+        }
+
+        var callContextId = BuildPrivateCallContextId(_userId, peerUserId);
+        var addedSelf = false;
+
+        _privateVoiceVideoUsers.AddOrUpdate(callContextId,
+            _ =>
+            {
+                addedSelf = true;
+                return [_userId];
+            },
+            (_, set) =>
+            {
+                lock (set)
+                {
+                    addedSelf = set.Add(_userId);
+                }
+
+                return set;
+            });
+
+        var privateCallGroup = await Group.AddAsync($"pcall:{callContextId}");
+        _joinedPrivateCallContexts.Add(callContextId);
+        privateCallGroup.All.OnUserJoinedVoiceVideo(callContextId, _userId);
+
+        if (addedSelf && _onlineUsers.TryGetValue(peerUserId, out var peerConnections))
+        {
+            Guid[] peerConnectionIds;
+            lock (peerConnections)
+            {
+                peerConnectionIds = [.. peerConnections];
+            }
+
+            if (peerConnectionIds.Length > 0)
+            {
+                var globalGroup = await Group.AddAsync("global");
+                foreach (var peerConnectionId in peerConnectionIds)
+                {
+                    globalGroup.Single(peerConnectionId).OnPrivateCallIncoming(_userId);
+                }
+            }
+        }
+
+        return await CreateJanusSessionInfoAsync(callContextId);
+    }
+
+    public async ValueTask LeavePrivateVoiceVideoAsync(Guid peerUserId)
+    {
+        if (peerUserId == Guid.Empty || peerUserId == _userId)
+        {
+            throw new ReturnStatusException(StatusCode.InvalidArgument, "Invalid private call target");
+        }
+
+        var callContextId = BuildPrivateCallContextId(_userId, peerUserId);
+
+        if (_privateVoiceVideoUsers.TryGetValue(callContextId, out var users))
+        {
+            lock (users)
+            {
+                users.Remove(_userId);
+                if (users.Count == 0)
+                {
+                    _privateVoiceVideoUsers.TryRemove(callContextId, out _);
+                }
+            }
+        }
+
+        _joinedPrivateCallContexts.Remove(callContextId);
+        var privateCallGroup = await Group.AddAsync($"pcall:{callContextId}");
+        privateCallGroup.All.OnUserLeftVoiceVideo(callContextId, _userId);
+        await privateCallGroup.RemoveAsync(Context);
+    }
+
+    public ValueTask<Guid[]> GetPrivateVoiceVideoParticipantsAsync(Guid peerUserId)
+    {
+        if (peerUserId == Guid.Empty || peerUserId == _userId)
+        {
+            throw new ReturnStatusException(StatusCode.InvalidArgument, "Invalid private call target");
+        }
+
+        var callContextId = BuildPrivateCallContextId(_userId, peerUserId);
+        if (_privateVoiceVideoUsers.TryGetValue(callContextId, out var users))
+        {
+            lock (users)
+            {
+                return ValueTask.FromResult(users.ToArray());
+            }
+        }
+
+        return ValueTask.FromResult(Array.Empty<Guid>());
+    }
+
+    public async ValueTask SendPrivateWebRtcSignalAsync(Guid peerUserId, Guid targetUserId, string signalType, string payload)
+    {
+        if (peerUserId == Guid.Empty || peerUserId == _userId)
+        {
+            throw new ReturnStatusException(StatusCode.InvalidArgument, "Invalid private call target");
+        }
+
+        var callContextId = BuildPrivateCallContextId(_userId, peerUserId);
+        if (!_privateVoiceVideoUsers.TryGetValue(callContextId, out var users))
+        {
+            throw new ReturnStatusException(StatusCode.FailedPrecondition, "Private call is not active");
+        }
+
+        lock (users)
+        {
+            if (!users.Contains(_userId))
+            {
+                throw new ReturnStatusException(StatusCode.FailedPrecondition, "Not joined in private call");
+            }
+        }
+
+        var privateCallGroup = await Group.AddAsync($"pcall:{callContextId}");
+        if (_onlineUsers.TryGetValue(targetUserId, out var targetConnections))
+        {
+            Guid[] targets;
+            lock (targetConnections)
+            {
+                targets = [.. targetConnections];
+            }
+
+            foreach (var connId in targets)
+            {
+                privateCallGroup.Single(connId).OnWebRtcSignalReceived(callContextId, _userId, signalType, payload);
+            }
+        }
+    }
+
+    private async Task<JanusSessionInfo> CreateJanusSessionInfoAsync(Guid contextId)
+    {
+        var sessionId = await _janus.CreateSessionAsync();
+        var handleId = await _janus.AttachPluginAsync(sessionId);
+
+        var guidBytes = contextId.ToByteArray();
+        long janusRoomId = Math.Abs((long)(BitConverter.ToInt32(guidBytes, 0) ^ BitConverter.ToInt32(guidBytes, 4)));
+        if (janusRoomId == 0) janusRoomId = 1;
+
+        await _janus.EnsureVideoRoomAsync(sessionId, janusRoomId);
+
+        var serverBase = _config["Server:BaseUrl"] ?? "http://localhost:5000";
+        var iceServersJson = _config["Janus:IceServers"]
+            ?? "[{\"urls\":\"stun:stun.l.google.com:19302\"}]";
+
+        return new JanusSessionInfo
+        {
+            RoomId = contextId,
+            JanusSessionId = sessionId,
+            JanusHandleId = handleId,
+            JanusUrl = _config["Janus:Url"] ?? "ws://localhost:8188",
+            IceServers = iceServersJson,
+            ServerBaseUrl = serverBase,
+            JanusRoomId = janusRoomId
+        };
+    }
+
+    private static Guid BuildPrivateCallContextId(Guid a, Guid b)
+    {
+        var first = a.ToByteArray();
+        var second = b.ToByteArray();
+        var bytes = new byte[16];
+
+        for (var i = 0; i < bytes.Length; i++)
+        {
+            bytes[i] = (byte)(first[i] ^ second[i] ^ 0x5A);
+        }
+
+        if (bytes.All(static b => b == 0))
+        {
+            bytes[0] = 1;
+        }
+
+        // Force valid UUID version/variant bits.
+        bytes[6] = (byte)((bytes[6] & 0x0F) | 0x40);
+        bytes[8] = (byte)((bytes[8] & 0x3F) | 0x80);
+
+        return new Guid(bytes);
+    }
+
     private async Task<ChatRoomMember> GetMembershipOrThrowAsync(Guid roomId)
     {
         return await _db.ChatRoomMembers
@@ -609,6 +917,7 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
     private async Task RemoveFromRoomGroupAsync(Guid roomId)
     {
+        RemoveRoomConnection(roomId, ConnectionId);
         var group = await Group.AddAsync($"room:{roomId}");
         group.All.OnUserLeftRoom(roomId, _userId);
         await group.RemoveAsync(Context);
@@ -636,6 +945,66 @@ public class ChatHubImpl : StreamingHubBase<IChatHub, IChatHubReceiver>, IChatHu
 
             return removed;
         }
+    }
+
+    private static void AddRoomConnection(Guid roomId, Guid connectionId)
+    {
+        _roomConnections.AddOrUpdate(roomId,
+            _ => new HashSet<Guid> { connectionId },
+            (_, set) =>
+            {
+                lock (set)
+                {
+                    set.Add(connectionId);
+                }
+                return set;
+            });
+    }
+
+    private static void RemoveRoomConnection(Guid roomId, Guid connectionId)
+    {
+        if (!_roomConnections.TryGetValue(roomId, out var connections))
+        {
+            return;
+        }
+
+        lock (connections)
+        {
+            connections.Remove(connectionId);
+            if (connections.Count == 0)
+            {
+                _roomConnections.TryRemove(roomId, out _);
+            }
+        }
+    }
+
+    private static HashSet<Guid>? GetRoomConnectionSnapshot(Guid roomId)
+    {
+        if (!_roomConnections.TryGetValue(roomId, out var connections))
+        {
+            return null;
+        }
+
+        lock (connections)
+        {
+            if (connections.Count == 0)
+            {
+                return null;
+            }
+
+            return new HashSet<Guid>(connections);
+        }
+    }
+
+    private static string? NormalizeAvatarUrl(string? avatarUrl)
+    {
+        if (string.IsNullOrWhiteSpace(avatarUrl))
+        {
+            return null;
+        }
+
+        var normalized = avatarUrl.Trim();
+        return normalized.Length == 0 ? null : normalized;
     }
 
     private static string GetDmKey(Guid a, Guid b) =>

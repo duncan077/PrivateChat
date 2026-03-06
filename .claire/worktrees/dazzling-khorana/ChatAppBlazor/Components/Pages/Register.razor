@@ -1,0 +1,101 @@
+@page "/register"
+@inject ApiClientService Api
+@inject AuthStateProvider Auth
+@inject ChatClientService Chat
+@inject NavigationManager Nav
+
+<div class="auth-screen">
+    <MudCard Class="auth-card" Elevation="0">
+        <MudCardHeader>
+            <div style="width:100%;text-align:center">
+                <div class="auth-logo-mark">PC</div>
+                <MudText Typo="Typo.h5" Align="Align.Center" Class="auth-title">Create Account</MudText>
+                <MudText Typo="Typo.body2" Class="auth-subtitle">
+                    Set up your profile and join the conversation.
+                </MudText>
+            </div>
+        </MudCardHeader>
+        <form @onsubmit="HandleRegister" @onsubmit:preventDefault="true">
+            <MudCardContent>
+                @if (!string.IsNullOrEmpty(_error))
+                {
+                    <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
+                }
+                <MudStack Spacing="3">
+                    <MudTextField @bind-Value="_userName" Label="Username" Variant="Variant.Outlined"
+                                  Immediate="true" Disabled="_loading"
+                                  AdornmentIcon="@Icons.Material.Outlined.AlternateEmail" Adornment="Adornment.Start" />
+                    <MudTextField @bind-Value="_displayName" Label="Display Name" Variant="Variant.Outlined"
+                                  Immediate="true" Disabled="_loading"
+                                  AdornmentIcon="@Icons.Material.Outlined.Badge" Adornment="Adornment.Start" />
+                    <MudTextField @bind-Value="_password" Label="Password" Variant="Variant.Outlined"
+                                  InputType="InputType.Password" Immediate="true" Disabled="_loading"
+                                  AdornmentIcon="@Icons.Material.Outlined.Lock" Adornment="Adornment.Start" />
+                    <MudTextField @bind-Value="_confirmPassword" Label="Confirm Password" Variant="Variant.Outlined"
+                                  InputType="InputType.Password" Immediate="true" Disabled="_loading"
+                                  AdornmentIcon="@Icons.Material.Outlined.LockOpen" Adornment="Adornment.Start" />
+                </MudStack>
+            </MudCardContent>
+            <MudCardActions Class="d-flex flex-column px-4 pb-4">
+                <MudButton Variant="Variant.Filled" Color="Color.Primary" FullWidth="true"
+                           ButtonType="ButtonType.Submit" Disabled="_loading" Size="Size.Large">
+                    @(_loading ? "Creating account..." : "Register")
+                </MudButton>
+                <MudText Typo="Typo.body2" Align="Align.Center" Class="mt-3" Style="color:var(--pc-text-muted)">
+                    Already have an account? <MudLink Href="/login">Sign In</MudLink>
+                </MudText>
+            </MudCardActions>
+        </form>
+    </MudCard>
+</div>
+
+@code {
+    private string _userName = "";
+    private string _displayName = "";
+    private string _password = "";
+    private string _confirmPassword = "";
+    private string? _error;
+    private bool _loading;
+
+    private async Task HandleRegister()
+    {
+        _error = null;
+
+        if (_password != _confirmPassword)
+        {
+            _error = "Passwords do not match";
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_userName) || string.IsNullOrWhiteSpace(_password))
+        {
+            _error = "Username and password are required";
+            return;
+        }
+
+        _loading = true;
+
+        try
+        {
+            var response = await Api.RegisterAsync(_userName, _displayName, _password);
+            if (response.Success)
+            {
+                Auth.SetAuth(response.Token!, response.User!);
+                await Chat.ConnectAsync();
+                Nav.NavigateTo("/");
+            }
+            else
+            {
+                _error = response.Error;
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = $"Connection error: {ex.Message}";
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+}

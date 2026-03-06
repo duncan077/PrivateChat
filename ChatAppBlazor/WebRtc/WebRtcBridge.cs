@@ -23,6 +23,7 @@ public class WebRtcBridge : IAsyncDisposable
     private string? _userId;
     private string? _userDisplayName;
     private Dictionary<string, string> _participantDirectory = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, string> _participantAvatars = new(StringComparer.OrdinalIgnoreCase);
 
     public WebRtcBridge(
         IJSRuntime js,
@@ -35,6 +36,7 @@ public class WebRtcBridge : IAsyncDisposable
 
         // Subscribe to Janus reconnection events from CallStore
         _callStore.OnJanusReconnect += HandleJanusReconnect;
+        _callStore.OnWebRtcSignal += HandleStoreWebRtcSignal;
     }
 
     /// <summary>
@@ -49,6 +51,7 @@ public class WebRtcBridge : IAsyncDisposable
         string userId,
         string userDisplayName,
         IReadOnlyDictionary<string, string>? participantDirectory,
+        IReadOnlyDictionary<string, string>? participantAvatarDirectory,
         string iceServers)
     {
         var resolvedServerBaseUrl = ResolveServerBaseUrl(serverBaseUrl);
@@ -57,6 +60,7 @@ public class WebRtcBridge : IAsyncDisposable
         _userId = userId;
         _userDisplayName = userDisplayName;
         _participantDirectory = NormalizeParticipantDirectory(participantDirectory);
+        _participantAvatars = NormalizeParticipantAvatarDirectory(participantAvatarDirectory);
 
         _dotNetRef?.Dispose();
         _dotNetRef = DotNetObjectReference.Create(this);
@@ -70,6 +74,7 @@ public class WebRtcBridge : IAsyncDisposable
             userId,
             userDisplayName,
             participantDirectory = _participantDirectory,
+            participantAvatarDirectory = _participantAvatars,
             iceServers,
             dotNetRef = _dotNetRef
         });
@@ -118,7 +123,8 @@ public class WebRtcBridge : IAsyncDisposable
         int fps = 30,
         int bitrateKbps = 2000,
         string? preferredVideoCodec = "h264",
-        bool screenShareAudioEnabled = true)
+        bool screenShareAudioEnabled = true,
+        bool screenShareAutoGainEnabled = true)
     {
         await _js.InvokeVoidAsync("webrtcManager.updateSettings", new
         {
@@ -128,7 +134,8 @@ public class WebRtcBridge : IAsyncDisposable
             fps,
             bitrateKbps,
             preferredVideoCodec,
-            screenShareAudioEnabled
+            screenShareAudioEnabled,
+            screenShareAutoGainEnabled
         });
     }
 
@@ -224,6 +231,18 @@ public class WebRtcBridge : IAsyncDisposable
         _ = _callStore.HandleJanusSessionLostAsync();
     }
 
+    private async void HandleStoreWebRtcSignal(Guid fromUserId, string signalType, string payload)
+    {
+        try
+        {
+            await DeliverSignalAsync(fromUserId, signalType, payload);
+        }
+        catch
+        {
+            // Ignore transient JS/native signaling races.
+        }
+    }
+
     /// <summary>
     /// Called by CallStore.OnJanusReconnect when a new Janus session is acquired.
     /// Stops the old JS session and re-initializes with new credentials.
@@ -243,10 +262,11 @@ public class WebRtcBridge : IAsyncDisposable
                 _userId ?? "",
                 _userDisplayName ?? _userId ?? "",
                 _participantDirectory,
+                _participantAvatars,
                 session.IceServers
             );
             await ApplyStoredSettingsAsync();
-            await UpdateParticipantDirectoryAsync(_participantDirectory);
+            await UpdateParticipantProfilesAsync(_participantDirectory, _participantAvatars);
         }
         catch (Exception ex)
         {
@@ -257,7 +277,18 @@ public class WebRtcBridge : IAsyncDisposable
 
     public async Task EnumerateDevicesAsync()
     {
-        await _js.InvokeVoidAsync("webrtcManager.enumerateDevices");
+        try
+        {
+            var devices = await _js.InvokeAsync<MediaDeviceInfo[]>("webrtcManager.enumerateDevices");
+            if (devices is { Length: > 0 })
+            {
+                _callStore.UpdateDevices(devices.ToList());
+            }
+        }
+        catch
+        {
+            // Some platforms may only update via JS->.NET callback once initialized.
+        }
     }
 
     public async Task SetVolumeAsync(double level)
@@ -301,9 +332,15 @@ public class WebRtcBridge : IAsyncDisposable
     }
 
     public async Task UpdateParticipantDirectoryAsync(IReadOnlyDictionary<string, string>? participantDirectory)
+        => await UpdateParticipantProfilesAsync(participantDirectory, _participantAvatars);
+
+    public async Task UpdateParticipantProfilesAsync(
+        IReadOnlyDictionary<string, string>? participantDirectory,
+        IReadOnlyDictionary<string, string>? participantAvatarDirectory)
     {
         _participantDirectory = NormalizeParticipantDirectory(participantDirectory);
-        await _js.InvokeVoidAsync("webrtcManager.updateParticipantNames", _participantDirectory);
+        _participantAvatars = NormalizeParticipantAvatarDirectory(participantAvatarDirectory);
+        await _js.InvokeVoidAsync("webrtcManager.updateParticipantProfiles", _participantDirectory, _participantAvatars);
     }
 
     public async Task ApplyStoredSettingsAsync()
@@ -315,7 +352,8 @@ public class WebRtcBridge : IAsyncDisposable
             _callStore.SelectedFps,
             _callStore.SelectedBitrate,
             _callStore.SelectedVideoCodec,
-            _callStore.ScreenShareAudioEnabled);
+            _callStore.ScreenShareAudioEnabled,
+            _callStore.ScreenShareAutoGainEnabled);
 
         await SetVolumeAsync(_callStore.Volume);
         await SetStreamVolumeAsync(_callStore.StreamVolume);
@@ -326,6 +364,7 @@ public class WebRtcBridge : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _callStore.OnJanusReconnect -= HandleJanusReconnect;
+        _callStore.OnWebRtcSignal -= HandleStoreWebRtcSignal;
         // Do NOT stop the call here — the JS layer persists in the WebView
         // and the call should survive page navigation.  Only explicit
         // "Leave Call" (via StopAsync + LeaveCallAsync) tears it down.
@@ -391,5 +430,35 @@ public class WebRtcBridge : IAsyncDisposable
         }
 
         return result;
+    }
+
+    private Dictionary<string, string> NormalizeParticipantAvatarDirectory(IReadOnlyDictionary<string, string>? participantAvatarDirectory)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (participantAvatarDirectory == null) return result;
+
+        foreach (var (key, value) in participantAvatarDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(value))
+            {
+                continue;
+            }
+
+            result[key.Trim()] = NormalizeAvatarUrl(value.Trim());
+        }
+
+        return result;
+    }
+
+    private string NormalizeAvatarUrl(string avatarUrl)
+    {
+        if (Uri.TryCreate(avatarUrl, UriKind.Absolute, out _))
+        {
+            return avatarUrl;
+        }
+
+        var baseUrl = _channelProvider.ServerUrl.TrimEnd('/');
+        var path = avatarUrl.StartsWith('/') ? avatarUrl : $"/{avatarUrl}";
+        return $"{baseUrl}{path}";
     }
 }
