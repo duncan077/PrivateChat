@@ -7,35 +7,37 @@
 <div class="auth-screen">
     <MudCard Class="auth-card" Elevation="0">
         <MudCardHeader>
-            <MudText Typo="Typo.h5" Align="Align.Center" Class="auth-title" Style="width:100%;font-weight:700">Sign In</MudText>
-        </MudCardHeader>
-        <form @onsubmit="HandleLogin" @onsubmit:preventDefault="true">
-            <MudCardContent>
+            <div style="width:100%;text-align:center">
+                <div class="auth-logo-mark">PC</div>
+                <MudText Typo="Typo.h5" Align="Align.Center" Class="auth-title">Sign In</MudText>
                 <MudText Typo="Typo.body2" Class="auth-subtitle">
                     Continue to your secure workspace.
                 </MudText>
+            </div>
+        </MudCardHeader>
+        <form @onsubmit="HandleLogin" @onsubmit:preventDefault="true">
+            <MudCardContent>
                 @if (!string.IsNullOrEmpty(_error))
                 {
                     <MudAlert Severity="Severity.Error" Dense="true" Class="mb-3">@_error</MudAlert>
                 }
-
                 <MudStack Spacing="3">
                     <MudTextField @bind-Value="_userName" Label="Username" Variant="Variant.Outlined"
-                                  Immediate="true" Disabled="_loading" />
-
+                                  Immediate="true" Disabled="_loading" AdornmentIcon="@Icons.Material.Outlined.Person"
+                                  Adornment="Adornment.Start" />
                     <MudTextField @bind-Value="_password" Label="Password" Variant="Variant.Outlined"
-                                  InputType="InputType.Password" Immediate="true" Disabled="_loading" />
+                                  InputType="InputType.Password" Immediate="true" Disabled="_loading"
+                                  AdornmentIcon="@Icons.Material.Outlined.Lock" Adornment="Adornment.Start" />
                     <MudCheckBox @bind-Value="_rememberMe" Disabled="_loading">Remember me</MudCheckBox>
-                    
                 </MudStack>
             </MudCardContent>
             <MudCardActions Class="d-flex flex-column px-4 pb-4">
                 <MudButton Variant="Variant.Filled" Color="Color.Primary" FullWidth="true"
-                           ButtonType="ButtonType.Submit" Disabled="_loading">
+                           ButtonType="ButtonType.Submit" Disabled="_loading" Size="Size.Large">
                     @(_loading ? "Signing in..." : "Sign In")
                 </MudButton>
-                <MudText Typo="Typo.body2" Align="Align.Center" Class="mt-3">
-                    Don't have an account? <MudLink Href="/register">Register</MudLink>
+                <MudText Typo="Typo.body2" Align="Align.Center" Class="mt-3" Style="color:var(--pc-text-muted)">
+                    Don't have an account? <MudLink Href="/register">Create one</MudLink>
                 </MudText>
             </MudCardActions>
         </form>
