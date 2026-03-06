@@ -4,21 +4,26 @@
 @inject ChatClientService Chat
 @inject ChatRoomStore Rooms
 @inject DirectMessageStore DirectMessages
+@inject CallStore Call
+@inject WebRtcBridge WebRtc
 @inject GrpcChannelProvider Grpc
 @inject NavigationManager Nav
 @inject UpdateService Updater
 @inject ApiClientService Api
 @inject MembersPanelStore MembersPanel
+@inject ISnackbar Snackbar
+@inject IDialogService DialogService
+@inject ISystemNotificationService SystemNotifications
 <MudThemeProvider Theme="_theme" IsDarkMode="true" />
 <MudPopoverProvider />
 <MudDialogProvider />
 <MudSnackbarProvider />
 
 <div class="app-root @(_isMobileShell ? "app-root-mobile" : "app-root-desktop")">
-    @if (Updater.HasUpdate && !_updateDismissed)
+    @if (Updater.HasUpdate)
     {
         <div class="update-banner">
-            @if (Updater.State == UpdateState.Idle || Updater.State == UpdateState.Failed)
+            @if (Updater.State == UpdateState.Idle)
             {
                 <span class="update-banner-text">
                     &#x1F4E6; Update available: v@(Updater.AvailableUpdate!.Version)
@@ -26,14 +31,10 @@
                     {
                         <span class="update-banner-notes"> - @Updater.AvailableUpdate.ReleaseNotes</span>
                     }
-                    @if (Updater.State == UpdateState.Failed)
-                    {
-                        <span class="update-banner-error"> &#x26A0; @Updater.ErrorMessage</span>
-                    }
                 </span>
                 <div class="update-banner-actions">
-                    <button class="btn-update" @onclick="InstallUpdate">Download &amp; Install</button>
-                    <button class="btn-update-dismiss" @onclick="DismissUpdate">&#x2716;</button>
+                    <button class="btn-update" @onclick="InstallUpdate">Update</button>
+                    <button class="btn-update-dismiss" @onclick="DismissUpdate">Dismiss</button>
                 </div>
             }
             else if (Updater.State == UpdateState.Downloading)
@@ -50,6 +51,16 @@
             else if (Updater.State == UpdateState.Relaunching)
             {
                 <span class="update-banner-text">&#x1F504; Relaunching...</span>
+            }
+            else if (Updater.State == UpdateState.Failed)
+            {
+                <span class="update-banner-text">
+                    &#x26A0; Update failed: @Updater.ErrorMessage
+                </span>
+                <div class="update-banner-actions">
+                    <button class="btn-update" @onclick="InstallUpdate">Retry update</button>
+                    <button class="btn-update-dismiss" @onclick="DismissUpdate">Dismiss</button>
+                </div>
             }
         </div>
     }
@@ -101,103 +112,151 @@
                 </MudButton>
                 @if (!_isMobileShell)
                 {
-                    <MudChip T="string" Size="Size.Small" Color="Color.Primary" Variant="Variant.Text">
-                        @Auth.CurrentUser?.DisplayName
-                    </MudChip>
+                    var currentAvatarUrl = GetAvatarUrl(Auth.CurrentUser?.AvatarUrl);
+                    <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="mr-2">
+                        <MudAvatar Size="Size.Small" Color="Color.Secondary">
+                            @if (!string.IsNullOrWhiteSpace(currentAvatarUrl))
+                            {
+                                <img src="@currentAvatarUrl" alt="Profile" class="avatar-image-fill" />
+                            }
+                            else
+                            {
+                                @GetAvatarInitial(Auth.CurrentUser?.DisplayName, Auth.CurrentUser?.UserName)
+                            }
+                        </MudAvatar>
+                        <MudChip T="string" Size="Size.Small" Color="Color.Primary" Variant="Variant.Text">
+                            @Auth.CurrentUser?.DisplayName
+                        </MudChip>
+                    </MudStack>
                 }
+                <MudIconButton Icon="@Icons.Material.Filled.AccountCircle"
+                               Color="Color.Inherit"
+                               OnClick="OpenProfileSettings"
+                               title="Edit profile" />
                 <MudIconButton Icon="@Icons.Material.Filled.ExitToApp" Color="Color.Inherit"
                                OnClick="Logout" title="Logout" />
             </MudAppBar>
 
-            <MudDrawer @bind-Open="_drawerOpen" Elevation="0" ClipMode="DrawerClipMode.Always"
-                       Variant="@(_isMobileShell ? DrawerVariant.Temporary : DrawerVariant.Mini)"
-                       Breakpoint="@(_isMobileShell ? Breakpoint.Lg : Breakpoint.Md)"
-                       OpenMiniOnHover="@(!_isMobileShell)" Class="app-shell-drawer">
-                <MudNavMenu Class="app-shell-nav">
-                    <MudText Typo="Typo.overline" Class="chat-type-title">Chat</MudText>
+            @if (!_isMobileShell || _drawerOpen)
+            {
+                <MudDrawer @bind-Open="_drawerOpen" Elevation="0" ClipMode="DrawerClipMode.Always"
+                           Variant="@(_isMobileShell ? DrawerVariant.Temporary : DrawerVariant.Mini)"
+                           Breakpoint="@(_isMobileShell ? Breakpoint.Lg : Breakpoint.Md)"
+                           OpenMiniOnHover="@(!_isMobileShell)" Class="app-shell-drawer">
+                    <MudNavMenu Class="app-shell-nav">
+                        <MudText Typo="Typo.overline" Class="chat-type-title">Chat</MudText>
 
-                    <MudNavGroup Title="Rooms" Icon="@Icons.Material.Filled.Forum" Expanded="@_roomsGroupExpanded">
-                        <div class="chat-type-group-content">
-                            <div class="chat-type-actions">
-                                <MudButton Variant="Variant.Outlined" Size="Size.Small" Color="Color.Primary"
-                                           StartIcon="@Icons.Material.Filled.Add"
-                                           OnClick="OpenCreateRoomFromDrawer">
-                                </MudButton>
+                        <MudNavGroup Title="Rooms" Icon="@Icons.Material.Filled.Forum" Expanded="@_roomsGroupExpanded">
+                            <div class="chat-type-group-content">
+                                <div class="chat-type-actions">
+                                    <MudButton Variant="Variant.Outlined" Size="Size.Small" Color="Color.Primary"
+                                               StartIcon="@Icons.Material.Filled.Add"
+                                               OnClick="OpenCreateRoomFromDrawer">
+                                    </MudButton>
+                                </div>
+
+                                @if (_chatTypeListsLoading && Rooms.Rooms.Length == 0)
+                                {
+                                    <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-type-loading">
+                                        <MudProgressCircular Color="Color.Primary" Indeterminate="true" Size="Size.Small" />
+                                        <MudText Typo="Typo.caption">Loading rooms...</MudText>
+                                    </MudStack>
+                                }
+                                else if (Rooms.Rooms.Length == 0)
+                                {
+                                    <MudText Typo="Typo.caption" Class="chat-type-empty">No rooms yet</MudText>
+                                }
+                                else
+                                {
+                                    <MudList T="Guid" Dense="true" Class="chat-type-list">
+                                        @foreach (var room in Rooms.Rooms.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase))
+                                        {
+                                            <MudListItem T="Guid" Value="room.Id"
+                                                         OnClick="() => OpenRoomFromDrawer(room.Id)"
+                                                         Class="@($"chat-type-entry {(IsRoomSelected(room.Id) ? "active" : string.Empty)}")">
+                                                <div class="chat-type-row">
+                                                    <MudIcon Icon="@GetRoomIcon(room)" Size="Size.Small" />
+                                                    <MudText Typo="Typo.caption" Class="chat-type-label">@room.Name</MudText>
+                                                </div>
+                                            </MudListItem>
+                                        }
+                                    </MudList>
+                                }
                             </div>
+                        </MudNavGroup>
 
-                            @if (_chatTypeListsLoading && Rooms.Rooms.Length == 0)
-                            {
-                                <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-type-loading">
-                                    <MudProgressCircular Color="Color.Primary" Indeterminate="true" Size="Size.Small" />
-                                    <MudText Typo="Typo.caption">Loading rooms...</MudText>
-                                </MudStack>
-                            }
-                            else if (Rooms.Rooms.Length == 0)
-                            {
-                                <MudText Typo="Typo.caption" Class="chat-type-empty">No rooms yet</MudText>
-                            }
-                            else
-                            {
-                                <MudList T="Guid" Dense="true" Class="chat-type-list">
-                                    @foreach (var room in Rooms.Rooms.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase))
-                                    {
-                                        <MudListItem T="Guid" Value="room.Id"
-                                                     OnClick="() => OpenRoomFromDrawer(room.Id)"
-                                                     Class="@($"chat-type-entry {(IsRoomSelected(room.Id) ? "active" : string.Empty)}")">
-                                            <div class="chat-type-row">
-                                                <MudIcon Icon="@GetRoomIcon(room)" Size="Size.Small" />
-                                                <MudText Typo="Typo.caption" Class="chat-type-label">@room.Name</MudText>
-                                            </div>
-                                        </MudListItem>
-                                    }
-                                </MudList>
-                            }
-                        </div>
-                    </MudNavGroup>
+                        <MudNavGroup Title="Private Chats" Icon="@Icons.Material.Filled.Email" Expanded="@_privateChatsGroupExpanded">
+                            <div class="chat-type-group-content">
+                                <div class="chat-type-actions">
+                                    <MudButton Variant="Variant.Outlined" Size="Size.Small" Color="Color.Primary"
+                                               StartIcon="@Icons.Material.Filled.PersonSearch"
+                                               OnClick="OpenSelectPrivateUserFromDrawer">
+                                    </MudButton>
+                                </div>
 
-                    <MudNavGroup Title="Private Chats" Icon="@Icons.Material.Filled.Email" Expanded="@_privateChatsGroupExpanded">
-                        <div class="chat-type-group-content">
-                            <div class="chat-type-actions">
-                                <MudButton Variant="Variant.Outlined" Size="Size.Small" Color="Color.Primary"
-                                           StartIcon="@Icons.Material.Filled.PersonSearch"
-                                           OnClick="OpenSelectPrivateUserFromDrawer">
-                                </MudButton>
+                                @if (_chatTypeListsLoading && DirectMessages.Contacts.Length == 0)
+                                {
+                                    <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-type-loading">
+                                        <MudProgressCircular Color="Color.Primary" Indeterminate="true" Size="Size.Small" />
+                                        <MudText Typo="Typo.caption">Loading contacts...</MudText>
+                                    </MudStack>
+                                }
+                                else if (DirectMessages.Contacts.Length == 0)
+                                {
+                                    <MudText Typo="Typo.caption" Class="chat-type-empty">No private chats yet</MudText>
+                                }
+                                else
+                                {
+                                    <MudList T="Guid" Dense="true" Class="chat-type-list">
+                                        @foreach (var contact in DirectMessages.Contacts.OrderBy(c => c.DisplayName, StringComparer.OrdinalIgnoreCase))
+                                        {
+                                            var contactAvatarUrl = GetAvatarUrl(contact.AvatarUrl);
+                                            <MudListItem T="Guid" Value="contact.Id"
+                                                         OnClick="() => OpenDirectMessageFromDrawer(contact.Id)"
+                                                         Class="@($"chat-type-entry {(IsDirectMessageSelected(contact.Id) ? "active" : string.Empty)}")">
+                                                <div class="chat-type-row">
+                                                    <MudAvatar Size="Size.Small"
+                                                               Color="Color.Secondary"
+                                                               Class="chat-type-avatar">
+                                                        @if (!string.IsNullOrWhiteSpace(contactAvatarUrl))
+                                                        {
+                                                            <img src="@contactAvatarUrl" alt="Profile" class="avatar-image-fill" />
+                                                        }
+                                                        else
+                                                        {
+                                                            @GetAvatarInitial(contact.DisplayName, contact.UserName)
+                                                        }
+                                                    </MudAvatar>
+                                                    <MudText Typo="Typo.caption" Class="chat-type-label">@contact.DisplayName</MudText>
+                                                </div>
+                                            </MudListItem>
+                                        }
+                                    </MudList>
+                                }
                             </div>
+                        </MudNavGroup>
 
-                            @if (_chatTypeListsLoading && DirectMessages.Contacts.Length == 0)
-                            {
-                                <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-type-loading">
-                                    <MudProgressCircular Color="Color.Primary" Indeterminate="true" Size="Size.Small" />
-                                    <MudText Typo="Typo.caption">Loading contacts...</MudText>
-                                </MudStack>
-                            }
-                            else if (DirectMessages.Contacts.Length == 0)
-                            {
-                                <MudText Typo="Typo.caption" Class="chat-type-empty">No private chats yet</MudText>
-                            }
-                            else
-                            {
-                                <MudList T="Guid" Dense="true" Class="chat-type-list">
-                                    @foreach (var contact in DirectMessages.Contacts.OrderBy(c => c.DisplayName, StringComparer.OrdinalIgnoreCase))
-                                    {
-                                        <MudListItem T="Guid" Value="contact.Id"
-                                                     OnClick="() => OpenDirectMessageFromDrawer(contact.Id)"
-                                                     Class="@($"chat-type-entry {(IsDirectMessageSelected(contact.Id) ? "active" : string.Empty)}")">
-                                            <div class="chat-type-row">
-                                                <MudAvatar Size="Size.Small" Color="Color.Secondary" Class="chat-type-avatar">
-                                                    @GetAvatarInitial(contact.DisplayName)
-                                                </MudAvatar>
-                                                <MudText Typo="Typo.caption" Class="chat-type-label">@contact.DisplayName</MudText>
-                                            </div>
-                                        </MudListItem>
-                                    }
-                                </MudList>
-                            }
+                        <div class="chat-type-nav-footer">
+                            <MudDivider Class="my-2" />
+                            <MudButton Variant="Variant.Text"
+                                       Size="Size.Small"
+                                       Color="Color.Default"
+                                       StartIcon="@Icons.Material.Filled.AccountCircle"
+                                       OnClick="OpenProfileSettings"
+                                       Class="mb-1">
+                                Profile
+                            </MudButton>
+                            <MudButton Variant="Variant.Outlined"
+                                       Size="Size.Small"
+                                       Color="Color.Primary"
+                                       StartIcon="@Icons.Material.Filled.Settings"
+                                       OnClick="OpenGlobalSettings">
+                                Settings
+                            </MudButton>
                         </div>
-                    </MudNavGroup>
-
-                </MudNavMenu>
-            </MudDrawer>
+                    </MudNavMenu>
+                </MudDrawer>
+            }
 
             <MudMainContent Class="@($"main-content-area app-shell-main {(_isMobileShell ? "app-shell-main-mobile" : string.Empty)}")">
                 <ErrorBoundary>
@@ -233,6 +292,32 @@
 
         @* Floating call overlay (PiP when navigating away from call room) *@
         <FloatingCallOverlay />
+
+        @if (_incomingPrivateCallUserId != null && !string.IsNullOrWhiteSpace(_incomingPrivateCallDisplayName))
+        {
+            <div class="incoming-call-overlay">
+                <div class="incoming-call-sheet">
+                    <MudStack Spacing="1">
+                        <MudText Typo="Typo.overline" Class="incoming-call-label">Incoming call</MudText>
+                        <MudText Typo="Typo.h6" Class="incoming-call-name">@_incomingPrivateCallDisplayName</MudText>
+                        <MudText Typo="Typo.caption" Class="incoming-call-ringing">Ringing...</MudText>
+                    </MudStack>
+
+                    <MudStack Row Spacing="1" Class="incoming-call-actions">
+                        <MudButton Variant="Variant.Outlined"
+                                   Color="Color.Default"
+                                   OnClick="DeclineIncomingPrivateCall">
+                            Decline
+                        </MudButton>
+                        <MudButton Variant="Variant.Filled"
+                                   Color="Color.Success"
+                                   OnClick="AcceptIncomingPrivateCallAsync">
+                            Accept
+                        </MudButton>
+                    </MudStack>
+                </div>
+            </div>
+        }
     }
 </div>
 
@@ -240,7 +325,6 @@
     private bool _initialized;
     private bool _showRegister;
     private bool _drawerOpen = !(OperatingSystem.IsAndroid() || OperatingSystem.IsIOS());
-    private bool _updateDismissed;
     private bool _roomsGroupExpanded = true;
     private bool _privateChatsGroupExpanded = true;
     private bool _chatTypeListsLoading;
@@ -249,6 +333,8 @@
     private bool _isRoomsRoute = true;
     private bool _isDirectMessagesRoute;
     private bool _keepDrawerOpenOnNextNavigation;
+    private Guid? _incomingPrivateCallUserId;
+    private string? _incomingPrivateCallDisplayName;
     private MudTheme _theme = new()
     {
         PaletteLight = new PaletteLight
@@ -314,12 +400,17 @@
         Auth.OnAuthStateChanged += OnAuthChanged;
         Nav.LocationChanged += OnLocationChanged;
         Chat.OnConnectionStateChanged += OnConnectionChanged;
+        Chat.OnMessageReceived += OnIncomingRoomMessage;
+        Chat.OnPrivateMessageReceived += OnIncomingPrivateMessage;
+        Chat.OnPrivateCallIncoming += OnIncomingPrivateCall;
+        Call.OnChange += OnCallChanged;
         Rooms.OnChange += OnRoomsChanged;
         DirectMessages.OnChange += OnDirectMessagesChanged;
         _showRegister = IsRegisterPage();
         UpdateCurrentRoute();
         Updater.OnUpdateAvailable += OnUpdateAvailable;
         Updater.OnStateChanged += OnUpdaterStateChanged;
+        NotificationNavigationBridge.NavigateRequested += OnNotificationNavigateRequested;
 
         if (!Auth.IsAuthenticated)
         {
@@ -343,6 +434,12 @@
         }
 
         _initialized = true;
+
+        var pendingRoute = NotificationNavigationBridge.ConsumePendingNavigation();
+        if (!string.IsNullOrWhiteSpace(pendingRoute))
+        {
+            NavigateToNotificationRoute(pendingRoute);
+        }
     }
 
     private void OnUpdateAvailable()
@@ -362,7 +459,7 @@
 
     private void DismissUpdate()
     {
-        _updateDismissed = true;
+        Updater.DismissAvailableUpdate();
     }
 
     private void OnAuthChanged()
@@ -378,6 +475,7 @@
         else
         {
             _chatTypeListsLoaded = false;
+            ClearIncomingPrivateCallPrompt();
         }
 
         InvokeAsync(StateHasChanged);
@@ -435,6 +533,325 @@
 
     private void ToggleDrawer() => _drawerOpen = !_drawerOpen;
     private void ToggleMembersPanel() => MembersPanel.Toggle();
+
+    private async Task OpenGlobalSettings()
+    {
+        try { await WebRtc.EnumerateDevicesAsync(); } catch { }
+        await Task.Delay(120);
+
+        var parameters = new DialogParameters<CallSettingsDialog>
+        {
+            { x => x.Store, Call },
+            { x => x.WebRtc, WebRtc },
+            { x => x.ApplyLiveChanges, Call.IsInCall }
+        };
+
+        var options = new DialogOptions
+        {
+            CloseButton = true,
+            MaxWidth = MaxWidth.Small,
+            FullWidth = true
+        };
+
+        CloseDrawerOnMobile();
+        await DialogService.ShowAsync<CallSettingsDialog>("Settings", parameters, options);
+    }
+
+    private async Task OpenProfileSettings()
+    {
+        var options = new DialogOptions
+        {
+            CloseButton = true,
+            MaxWidth = MaxWidth.ExtraSmall,
+            FullWidth = true
+        };
+
+        CloseDrawerOnMobile();
+        await DialogService.ShowAsync<ProfileSettingsDialog>(
+            "Edit Profile",
+            new DialogParameters<ProfileSettingsDialog>(),
+            options);
+    }
+
+    private void OnIncomingRoomMessage(ChatMessage message)
+    {
+        _ = InvokeAsync(async () =>
+        {
+            if (!Call.NotificationsEnabled)
+                return;
+
+            var currentUserId = Auth.CurrentUser?.Id;
+            if (currentUserId != null && message.SenderId == currentUserId.Value)
+                return;
+
+            if (message.MessageType == ChatMessageType.System)
+                return;
+
+            var roomNotificationMode = Rooms.GetRoomNotificationMode(message.RoomId);
+            if (roomNotificationMode == RoomNotificationMode.Muted)
+                return;
+
+            if (roomNotificationMode == RoomNotificationMode.MentionsOnly
+                && (currentUserId == null || message.MentionedUserIds == null || !message.MentionedUserIds.Contains(currentUserId.Value)))
+                return;
+
+            if (IsCurrentRoomConversation(message.RoomId))
+                return;
+
+            var roomName = Rooms.Rooms.FirstOrDefault(r => r.Id == message.RoomId)?.Name ?? "room";
+            await ShowIncomingMessageNotificationAsync(
+                locationLabel: $"#{roomName}",
+                senderLabel: message.SenderName,
+                content: message.Content,
+                attachmentCount: message.Attachments?.Length ?? 0,
+                navigateUri: $"/?roomId={message.RoomId:D}");
+        });
+    }
+
+    private void OnIncomingPrivateMessage(PrivateMessage message)
+    {
+        _ = InvokeAsync(async () =>
+        {
+            if (!Call.NotificationsEnabled)
+                return;
+
+            var currentUserId = Auth.CurrentUser?.Id;
+            if (currentUserId == null)
+                return;
+
+            // Only notify incoming messages from other users.
+            if (message.SenderId == currentUserId.Value)
+                return;
+
+            var conversationUserId = message.SenderId;
+            if (DirectMessages.IsContactNotificationsMuted(conversationUserId))
+                return;
+
+            if (IsCurrentDirectConversation(conversationUserId))
+                return;
+
+            var senderName = DirectMessages.Contacts.FirstOrDefault(c => c.Id == conversationUserId)?.DisplayName;
+            if (string.IsNullOrWhiteSpace(senderName))
+            {
+                senderName = !string.IsNullOrWhiteSpace(message.SenderName)
+                    ? message.SenderName
+                    : "Direct message";
+            }
+
+            await ShowIncomingMessageNotificationAsync(
+                locationLabel: "direct message",
+                senderLabel: senderName,
+                content: message.Content,
+                attachmentCount: message.Attachments?.Length ?? 0,
+                navigateUri: $"/dm?userId={conversationUserId:D}");
+        });
+    }
+
+    private void OnIncomingPrivateCall(Guid callerUserId)
+    {
+        _ = InvokeAsync(async () =>
+        {
+            if (!Call.NotificationsEnabled)
+                return;
+
+            var currentUserId = Auth.CurrentUser?.Id;
+            if (currentUserId == null || callerUserId == Guid.Empty || callerUserId == currentUserId.Value)
+                return;
+
+            if (DirectMessages.IsContactNotificationsMuted(callerUserId))
+                return;
+
+            if (Call.IsActiveDirectCallWith(callerUserId))
+                return;
+
+            var callerName = DirectMessages.Contacts.FirstOrDefault(c => c.Id == callerUserId)?.DisplayName;
+            if (string.IsNullOrWhiteSpace(callerName))
+            {
+                callerName = $"User {callerUserId.ToString()[..8]}";
+            }
+
+            ShowIncomingPrivateCallPrompt(callerUserId, callerName);
+
+            var navigateUri = BuildIncomingCallRoute(callerUserId);
+            var deliveredBySystem = await SystemNotifications.ShowChatNotificationAsync(
+                title: callerName,
+                message: "is calling you",
+                navigateUri: navigateUri);
+
+            if (deliveredBySystem)
+            {
+                return;
+            }
+
+            Snackbar.Add($"{callerName} is calling you", Severity.Info, options =>
+            {
+                options.ShowCloseIcon = true;
+                options.VisibleStateDuration = 7000;
+                options.HideTransitionDuration = 150;
+                options.ShowTransitionDuration = 150;
+                options.Action = "Open";
+                options.ActionColor = Color.Primary;
+                options.OnClick = _ =>
+                {
+                    CloseDrawerOnMobile();
+                    Nav.NavigateTo(navigateUri);
+                    return Task.CompletedTask;
+                };
+            });
+        });
+    }
+
+    private void OnCallChanged()
+    {
+        if (_incomingPrivateCallUserId != null
+            && Call.IsInCall
+            && Call.ActiveCallKind == CallContextKind.DirectMessage
+            && Call.ActiveDirectPeerUserId == _incomingPrivateCallUserId.Value)
+        {
+            ClearIncomingPrivateCallPrompt();
+        }
+
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void ShowIncomingPrivateCallPrompt(Guid callerUserId, string callerDisplayName)
+    {
+        _incomingPrivateCallUserId = callerUserId;
+        _incomingPrivateCallDisplayName = callerDisplayName;
+    }
+
+    private void ClearIncomingPrivateCallPrompt()
+    {
+        _incomingPrivateCallUserId = null;
+        _incomingPrivateCallDisplayName = null;
+    }
+
+    private string BuildIncomingCallRoute(Guid callerUserId)
+    {
+        var nonce = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        return $"/dm?userId={callerUserId:D}&joinCall=true&callNonce={nonce}";
+    }
+
+    private void DeclineIncomingPrivateCall()
+    {
+        ClearIncomingPrivateCallPrompt();
+    }
+
+    private Task AcceptIncomingPrivateCallAsync()
+    {
+        if (_incomingPrivateCallUserId == null || _incomingPrivateCallUserId == Guid.Empty)
+        {
+            ClearIncomingPrivateCallPrompt();
+            return Task.CompletedTask;
+        }
+
+        var target = _incomingPrivateCallUserId.Value;
+        ClearIncomingPrivateCallPrompt();
+        CloseDrawerOnMobile();
+        Nav.NavigateTo(BuildIncomingCallRoute(target));
+        return Task.CompletedTask;
+    }
+
+    private bool IsCurrentRoomConversation(Guid roomId)
+    {
+        if (!_isRoomsRoute) return false;
+        if (Rooms.SelectedRoomId == roomId) return true;
+
+        var uri = Nav.ToAbsoluteUri(Nav.Uri);
+        return TryGetQueryGuid(uri.Query, "roomId", out var queryRoomId) && queryRoomId == roomId;
+    }
+
+    private bool IsCurrentDirectConversation(Guid userId)
+    {
+        if (!_isDirectMessagesRoute) return false;
+        if (DirectMessages.SelectedContactId == userId) return true;
+
+        var uri = Nav.ToAbsoluteUri(Nav.Uri);
+        return TryGetQueryGuid(uri.Query, "userId", out var queryUserId) && queryUserId == userId;
+    }
+
+    private async Task ShowIncomingMessageNotificationAsync(string locationLabel, string? senderLabel, string? content, int attachmentCount, string? navigateUri = null)
+    {
+        var sender = string.IsNullOrWhiteSpace(senderLabel) ? "New message" : senderLabel.Trim();
+        var snippet = BuildMessageNotificationSnippet(content, attachmentCount);
+        var text = $"{sender} in {locationLabel}";
+        if (!string.IsNullOrWhiteSpace(snippet))
+        {
+            text = $"{text}: {snippet}";
+        }
+
+        var systemMessage = string.IsNullOrWhiteSpace(snippet)
+            ? locationLabel
+            : $"{locationLabel}: {snippet}";
+
+        var deliveredBySystem = await SystemNotifications.ShowChatNotificationAsync(
+            title: sender,
+            message: systemMessage,
+            navigateUri: navigateUri);
+
+        if (deliveredBySystem)
+        {
+            return;
+        }
+
+        Snackbar.Add(text, Severity.Info, options =>
+        {
+            options.ShowCloseIcon = true;
+            options.VisibleStateDuration = 5000;
+            options.HideTransitionDuration = 150;
+            options.ShowTransitionDuration = 150;
+            if (!string.IsNullOrWhiteSpace(navigateUri))
+            {
+                options.Action = "Open";
+                options.ActionColor = Color.Primary;
+                options.OnClick = _ =>
+                {
+                    CloseDrawerOnMobile();
+                    Nav.NavigateTo(navigateUri);
+                    return Task.CompletedTask;
+                };
+            }
+        });
+    }
+
+    private void OnNotificationNavigateRequested(string route)
+    {
+        _ = InvokeAsync(() => NavigateToNotificationRoute(route));
+    }
+
+    private void NavigateToNotificationRoute(string route)
+    {
+        if (string.IsNullOrWhiteSpace(route))
+        {
+            return;
+        }
+
+        CloseDrawerOnMobile();
+        Nav.NavigateTo(route.Trim());
+    }
+
+    private static string BuildMessageNotificationSnippet(string? content, int attachmentCount)
+    {
+        var normalized = (content ?? string.Empty)
+            .Trim()
+            .ReplaceLineEndings(" ");
+
+        if (normalized.Length > 90)
+        {
+            normalized = $"{normalized[..87]}...";
+        }
+
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            if (attachmentCount <= 0) return string.Empty;
+            return attachmentCount == 1 ? "[attachment]" : $"[{attachmentCount} attachments]";
+        }
+
+        if (attachmentCount <= 0) return normalized;
+        return attachmentCount == 1
+            ? $"{normalized} (+1 attachment)"
+            : $"{normalized} (+{attachmentCount} attachments)";
+    }
 
     private async Task Logout()
     {
@@ -578,10 +995,25 @@
         return Icons.Material.Filled.Tag;
     }
 
-    private static string GetAvatarInitial(string? displayName)
+    private string? GetAvatarUrl(string? avatarUrl)
+    {
+        if (string.IsNullOrWhiteSpace(avatarUrl))
+            return null;
+
+        return Api.ToAbsoluteUrl(avatarUrl);
+    }
+
+    private static string GetAvatarInitial(string? displayName, string? userName = null)
     {
         if (string.IsNullOrWhiteSpace(displayName))
+        {
+            if (!string.IsNullOrWhiteSpace(userName))
+            {
+                return userName.Trim()[0].ToString().ToUpperInvariant();
+            }
+
             return "?";
+        }
         return displayName.Trim()[0].ToString().ToUpperInvariant();
     }
 
@@ -590,9 +1022,14 @@
         Auth.OnAuthStateChanged -= OnAuthChanged;
         Nav.LocationChanged -= OnLocationChanged;
         Chat.OnConnectionStateChanged -= OnConnectionChanged;
+        Chat.OnMessageReceived -= OnIncomingRoomMessage;
+        Chat.OnPrivateMessageReceived -= OnIncomingPrivateMessage;
+        Chat.OnPrivateCallIncoming -= OnIncomingPrivateCall;
+        Call.OnChange -= OnCallChanged;
         Rooms.OnChange -= OnRoomsChanged;
         DirectMessages.OnChange -= OnDirectMessagesChanged;
         Updater.OnUpdateAvailable -= OnUpdateAvailable;
         Updater.OnStateChanged -= OnUpdaterStateChanged;
+        NotificationNavigationBridge.NavigateRequested -= OnNotificationNavigateRequested;
     }
 }

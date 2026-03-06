@@ -1,0 +1,203 @@
+@inject AuthStateProvider Auth
+@inject ChatClientService Chat
+@inject ApiClientService Api
+@inject ISnackbar Snackbar
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">
+            <MudIcon Icon="@Icons.Material.Filled.AccountCircle" Class="mr-2" /> Edit Profile
+        </MudText>
+    </TitleContent>
+    <DialogContent>
+        <MudStack Spacing="2">
+            <MudStack AlignItems="AlignItems.Center" Spacing="1">
+                @{
+                    var previewAvatarUrl = GetPreviewAvatarUrl();
+                }
+                <MudAvatar Size="Size.Large" Color="Color.Secondary" Class="profile-settings-avatar">
+                    @if (!string.IsNullOrWhiteSpace(previewAvatarUrl))
+                    {
+                        <img src="@previewAvatarUrl" alt="Avatar preview" class="avatar-image-fill" />
+                    }
+                    else
+                    {
+                        @GetAvatarInitial(_displayName, Auth.CurrentUser?.UserName)
+                    }
+                </MudAvatar>
+                <MudText Typo="Typo.caption" Color="Color.Secondary">Avatar preview</MudText>
+            </MudStack>
+
+            <MudTextField @bind-Value="_displayName"
+                          Label="Display Name"
+                          Variant="Variant.Outlined"
+                          MaxLength="64"
+                          Required="true"
+                          Immediate="true"
+                          Disabled="@_saving" />
+
+            <MudTextField @bind-Value="_avatarUrl"
+                          Label="Avatar URL"
+                          Variant="Variant.Outlined"
+                          Placeholder="https://example.com/avatar.png"
+                          Immediate="true"
+                          Disabled="@(_saving || _uploading)" />
+
+            <MudStack Row Spacing="1" AlignItems="AlignItems.Center">
+                <MudButton Variant="Variant.Outlined"
+                           Size="Size.Small"
+                           Color="Color.Primary"
+                           Disabled="@(_saving || _uploading)"
+                           HtmlTag="label"
+                           StartIcon="@Icons.Material.Filled.Upload">
+                    @(_uploading ? "Uploading..." : "Upload")
+                    <InputFile OnChange="HandleAvatarSelected"
+                               accept="image/*"
+                               style="display:none" />
+                </MudButton>
+                <MudButton Variant="Variant.Text"
+                           Size="Size.Small"
+                           Color="Color.Default"
+                           Disabled="@(_saving || _uploading || string.IsNullOrWhiteSpace(_avatarUrl))"
+                           OnClick="ClearAvatar">
+                    Remove Avatar
+                </MudButton>
+            </MudStack>
+
+            @if (!string.IsNullOrWhiteSpace(_error))
+            {
+                <MudAlert Severity="Severity.Error" Dense="true">@_error</MudAlert>
+            }
+        </MudStack>
+    </DialogContent>
+    <DialogActions>
+        <MudButton Disabled="@(_saving || _uploading)" OnClick="Cancel">Cancel</MudButton>
+        <MudButton Variant="Variant.Filled"
+                   Color="Color.Primary"
+                   Disabled="@(_saving || _uploading)"
+                   OnClick="SaveAsync">
+            Save
+        </MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter] private IMudDialogInstance MudDialog { get; set; } = null!;
+
+    private const long MaxAvatarBytes = 10L * 1024 * 1024;
+
+    private string _displayName = string.Empty;
+    private string? _avatarUrl;
+    private bool _uploading;
+    private bool _saving;
+    private string? _error;
+
+    protected override void OnInitialized()
+    {
+        _displayName = Auth.CurrentUser?.DisplayName ?? string.Empty;
+        _avatarUrl = Auth.CurrentUser?.AvatarUrl;
+    }
+
+    private async Task HandleAvatarSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null)
+        {
+            return;
+        }
+
+        _error = null;
+        if (file.Size <= 0)
+        {
+            _error = "Selected file is empty.";
+            return;
+        }
+
+        if (file.Size > MaxAvatarBytes)
+        {
+            _error = "Avatar image must be 10 MB or smaller.";
+            return;
+        }
+
+        _uploading = true;
+        try
+        {
+            await using var stream = file.OpenReadStream(MaxAvatarBytes);
+            var upload = await Api.UploadFileAsync(stream, file.Name, file.ContentType, file.Size);
+            _avatarUrl = upload.Url;
+        }
+        catch (Exception ex)
+        {
+            _error = $"Avatar upload failed: {ex.Message}";
+        }
+        finally
+        {
+            _uploading = false;
+        }
+    }
+
+    private void ClearAvatar()
+    {
+        _avatarUrl = null;
+    }
+
+    private async Task SaveAsync()
+    {
+        _error = null;
+        var normalizedDisplayName = (_displayName ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalizedDisplayName))
+        {
+            _error = "Display name is required.";
+            return;
+        }
+
+        _saving = true;
+        try
+        {
+            var updatedUser = await Chat.UpdateProfileAsync(new UpdateProfileRequest
+            {
+                DisplayName = normalizedDisplayName,
+                AvatarUrl = string.IsNullOrWhiteSpace(_avatarUrl) ? null : _avatarUrl.Trim()
+            });
+
+            Auth.UpdateCurrentUserProfile(updatedUser.DisplayName, updatedUser.AvatarUrl);
+            Snackbar.Add("Profile updated.", Severity.Success);
+            MudDialog.Close(DialogResult.Ok(updatedUser));
+        }
+        catch (Exception ex)
+        {
+            _error = $"Could not update profile: {ex.Message}";
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private void Cancel() => MudDialog.Cancel();
+
+    private string? GetPreviewAvatarUrl()
+    {
+        if (string.IsNullOrWhiteSpace(_avatarUrl))
+        {
+            return null;
+        }
+
+        return Api.ToAbsoluteUrl(_avatarUrl);
+    }
+
+    private static string GetAvatarInitial(string? displayName, string? userName)
+    {
+        if (!string.IsNullOrWhiteSpace(displayName))
+        {
+            return displayName.Trim()[0].ToString().ToUpperInvariant();
+        }
+
+        if (!string.IsNullOrWhiteSpace(userName))
+        {
+            return userName.Trim()[0].ToString().ToUpperInvariant();
+        }
+
+        return "?";
+    }
+}

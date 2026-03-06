@@ -1,5 +1,7 @@
 using ChatAppBlazor.Services;
+using Microsoft.Maui.Storage;
 using Shared.Models;
+using System.Text.Json;
 
 namespace ChatAppBlazor.State;
 
@@ -7,11 +9,22 @@ namespace ChatAppBlazor.State;
 /// Manages chat room state: room list, selected room, messages, and members.
 /// Components subscribe to OnChange to re-render when state updates.
 /// </summary>
+public enum RoomNotificationMode
+{
+    All = 0,
+    MentionsOnly = 1,
+    Muted = 2
+}
+
 public class ChatRoomStore : IDisposable
 {
+    private const string RoomNotificationModesPrefPrefix = "notifications.room.modes.";
+    private const string LegacyMutedRoomNotificationsPrefPrefix = "notifications.muted.rooms.";
     private readonly ApiClientService _api;
     private readonly ChatClientService _chat;
     private readonly AuthStateProvider _auth;
+    private Dictionary<Guid, RoomNotificationMode> _roomNotificationModes = [];
+    private Guid? _notificationPrefsUserId;
 
     public ChatRoomInfo[] Rooms { get; private set; } = [];
     public Guid? SelectedRoomId { get; private set; }
@@ -38,8 +51,78 @@ public class ChatRoomStore : IDisposable
         _chat.OnUserKicked += HandleUserKicked;
         _chat.OnUserMoved += HandleUserMoved;
         _chat.OnUserRoleChanged += HandleUserRoleChanged;
+        _chat.OnUserProfileUpdated += HandleUserProfileUpdated;
         _chat.OnUserOnlineStatusChanged += HandleUserOnlineStatusChanged;
         _chat.OnConnectionStateChanged += HandleConnectionStateChanged;
+    }
+
+    public bool IsRoomNotificationsMuted(Guid roomId)
+    {
+        return GetRoomNotificationMode(roomId) == RoomNotificationMode.Muted;
+    }
+
+    public bool IsRoomNotificationsMentionsOnly(Guid roomId)
+        => GetRoomNotificationMode(roomId) == RoomNotificationMode.MentionsOnly;
+
+    public RoomNotificationMode GetRoomNotificationMode(Guid roomId)
+    {
+        if (roomId == Guid.Empty) return RoomNotificationMode.All;
+        EnsureNotificationMuteStateLoaded();
+        return _roomNotificationModes.TryGetValue(roomId, out var mode)
+            ? mode
+            : RoomNotificationMode.All;
+    }
+
+    public RoomNotificationMode? SelectedRoomNotificationMode
+        => SelectedRoomId != null ? GetRoomNotificationMode(SelectedRoomId.Value) : null;
+
+    public bool IsSelectedRoomNotificationsMuted
+        => SelectedRoomId != null && IsRoomNotificationsMuted(SelectedRoomId.Value);
+
+    public void SetRoomNotificationsMuted(Guid roomId, bool muted)
+    {
+        SetRoomNotificationMode(roomId, muted ? RoomNotificationMode.Muted : RoomNotificationMode.All);
+    }
+
+    public void ToggleRoomNotificationsMuted(Guid roomId)
+    {
+        if (roomId == Guid.Empty) return;
+        SetRoomNotificationsMuted(roomId, !IsRoomNotificationsMuted(roomId));
+    }
+
+    public void SetRoomNotificationMode(Guid roomId, RoomNotificationMode mode)
+    {
+        if (roomId == Guid.Empty) return;
+        EnsureNotificationMuteStateLoaded();
+
+        var currentMode = GetRoomNotificationMode(roomId);
+        if (currentMode == mode) return;
+
+        if (mode == RoomNotificationMode.All)
+        {
+            _roomNotificationModes.Remove(roomId);
+        }
+        else
+        {
+            _roomNotificationModes[roomId] = mode;
+        }
+
+        SaveRoomNotificationModes();
+        NotifyChanged();
+    }
+
+    public void CycleRoomNotificationMode(Guid roomId)
+    {
+        if (roomId == Guid.Empty) return;
+
+        var nextMode = GetRoomNotificationMode(roomId) switch
+        {
+            RoomNotificationMode.All => RoomNotificationMode.MentionsOnly,
+            RoomNotificationMode.MentionsOnly => RoomNotificationMode.Muted,
+            _ => RoomNotificationMode.All
+        };
+
+        SetRoomNotificationMode(roomId, nextMode);
     }
 
     public async Task LoadRoomsAsync()
@@ -112,7 +195,7 @@ public class ChatRoomStore : IDisposable
         }
     }
 
-    public async Task SendMessageAsync(string content, AttachmentInfo[]? attachments = null)
+    public async Task SendMessageAsync(string content, AttachmentInfo[]? attachments = null, Guid[]? mentionedUserIds = null)
     {
         if (SelectedRoomId == null) return;
         var hasText = !string.IsNullOrWhiteSpace(content);
@@ -121,7 +204,11 @@ public class ChatRoomStore : IDisposable
 
         try
         {
-            await _chat.SendMessageAsync(SelectedRoomId.Value, content.Trim(), attachments: attachments);
+            await _chat.SendMessageAsync(
+                SelectedRoomId.Value,
+                content.Trim(),
+                mentionedUserIds: mentionedUserIds,
+                attachments: attachments);
         }
         catch (Exception ex)
         {
@@ -404,6 +491,38 @@ public class ChatRoomStore : IDisposable
         NotifyChanged();
     }
 
+    private void HandleUserProfileUpdated(UserProfileUpdateInfo profile)
+    {
+        var changed = false;
+
+        var serverMember = ServerMembers.FirstOrDefault(m => m.UserId == profile.UserId);
+        if (serverMember != null)
+        {
+            serverMember.DisplayName = profile.DisplayName;
+            serverMember.AvatarUrl = profile.AvatarUrl;
+            changed = true;
+        }
+
+        var roomMember = Members.FirstOrDefault(m => m.UserId == profile.UserId);
+        if (roomMember != null)
+        {
+            roomMember.DisplayName = profile.DisplayName;
+            roomMember.AvatarUrl = profile.AvatarUrl;
+            changed = true;
+        }
+
+        if (_auth.CurrentUser?.Id == profile.UserId)
+        {
+            _auth.UpdateCurrentUserProfile(profile.DisplayName, profile.AvatarUrl);
+            changed = true;
+        }
+
+        if (changed)
+        {
+            NotifyChanged();
+        }
+    }
+
     /// <summary>
     /// When the gRPC connection drops and reconnects, the server-side hub has a
     /// fresh _joinedRooms set (empty). We must re-join the currently selected room
@@ -462,6 +581,97 @@ public class ChatRoomStore : IDisposable
 
     private void NotifyChanged() => OnChange?.Invoke();
 
+    private void EnsureNotificationMuteStateLoaded()
+    {
+        var userId = _auth.CurrentUser?.Id;
+        if (_notificationPrefsUserId == userId)
+        {
+            return;
+        }
+
+        _notificationPrefsUserId = userId;
+        _roomNotificationModes = LoadRoomNotificationModes();
+    }
+
+    private string GetRoomNotificationModesPrefKey()
+    {
+        var userToken = _auth.CurrentUser?.Id.ToString("D") ?? "anonymous";
+        return $"{RoomNotificationModesPrefPrefix}{userToken}";
+    }
+
+    private string GetLegacyMutedRoomNotificationsPrefKey()
+    {
+        var userToken = _auth.CurrentUser?.Id.ToString("D") ?? "anonymous";
+        return $"{LegacyMutedRoomNotificationsPrefPrefix}{userToken}";
+    }
+
+    private Dictionary<Guid, RoomNotificationMode> LoadRoomNotificationModes()
+    {
+        try
+        {
+            var raw = Preferences.Default.Get(GetRoomNotificationModesPrefKey(), string.Empty);
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                var serializedModes = JsonSerializer.Deserialize<Dictionary<string, int>>(raw) ?? [];
+                var result = new Dictionary<Guid, RoomNotificationMode>();
+
+                foreach (var pair in serializedModes)
+                {
+                    if (!Guid.TryParse(pair.Key, out var roomId) || roomId == Guid.Empty)
+                    {
+                        continue;
+                    }
+
+                    if (!Enum.IsDefined(typeof(RoomNotificationMode), pair.Value))
+                    {
+                        continue;
+                    }
+
+                    var mode = (RoomNotificationMode)pair.Value;
+                    if (mode != RoomNotificationMode.All)
+                    {
+                        result[roomId] = mode;
+                    }
+                }
+
+                return result;
+            }
+
+            // Migration from previous bool mute-only storage.
+            var legacyRaw = Preferences.Default.Get(GetLegacyMutedRoomNotificationsPrefKey(), string.Empty);
+            if (string.IsNullOrWhiteSpace(legacyRaw))
+            {
+                return [];
+            }
+
+            var mutedRoomIds = JsonSerializer.Deserialize<Guid[]>(legacyRaw) ?? [];
+            return mutedRoomIds
+                .Where(id => id != Guid.Empty)
+                .Distinct()
+                .ToDictionary(id => id, _ => RoomNotificationMode.Muted);
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private void SaveRoomNotificationModes()
+    {
+        try
+        {
+            var payload = _roomNotificationModes
+                .Where(pair => pair.Key != Guid.Empty && pair.Value != RoomNotificationMode.All)
+                .ToDictionary(pair => pair.Key.ToString("D"), pair => (int)pair.Value);
+
+            Preferences.Default.Set(GetRoomNotificationModesPrefKey(), JsonSerializer.Serialize(payload));
+        }
+        catch
+        {
+            // Ignore preference persistence failures.
+        }
+    }
+
     public void Dispose()
     {
         _chat.OnMessageReceived -= HandleMessageReceived;
@@ -472,6 +682,7 @@ public class ChatRoomStore : IDisposable
         _chat.OnUserKicked -= HandleUserKicked;
         _chat.OnUserMoved -= HandleUserMoved;
         _chat.OnUserRoleChanged -= HandleUserRoleChanged;
+        _chat.OnUserProfileUpdated -= HandleUserProfileUpdated;
         _chat.OnUserOnlineStatusChanged -= HandleUserOnlineStatusChanged;
         _chat.OnConnectionStateChanged -= HandleConnectionStateChanged;
     }

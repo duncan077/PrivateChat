@@ -246,10 +246,12 @@ public sealed class ChatHubClient : IChatHubReceiver, IAsyncDisposable
     void IChatHubReceiver.OnUserKickedFromVoiceVideo(Guid roomId, Guid userId, string reason) { }
     void IChatHubReceiver.OnUserMoved(Guid sourceRoomId, Guid targetRoomId, Guid userId) { }
     void IChatHubReceiver.OnUserRoleChanged(Guid roomId, Guid userId, UserRole newRole) { }
+    void IChatHubReceiver.OnUserProfileUpdated(UserProfileUpdateInfo profile) { }
     void IChatHubReceiver.OnPrivateMessageReceived(PrivateMessage message) { }
     void IChatHubReceiver.OnPrivateMessagesRead(Guid userId) { }
     void IChatHubReceiver.OnUserOnlineStatusChanged(Guid userId, bool isOnline) { }
     void IChatHubReceiver.OnWebRtcSignalReceived(Guid roomId, Guid fromUserId, string signalType, string payload) { }
+    void IChatHubReceiver.OnPrivateCallIncoming(Guid callerUserId) { }
 
     public async ValueTask DisposeAsync()
     {

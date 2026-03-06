@@ -112,6 +112,12 @@ namespace ChatAppBlazor
             // grant. Ensure the WebView allows inline media playback without a user gesture.
             e.WebView.Settings.MediaPlaybackRequiresUserGesture = false;
             e.WebView.Settings.JavaScriptCanOpenWindowsAutomatically = true;
+            e.WebView.Settings.TextZoom = 100;
+            e.WebView.Settings.UseWideViewPort = true;
+            e.WebView.Settings.LoadWithOverviewMode = false;
+            e.WebView.Settings.BuiltInZoomControls = false;
+            e.WebView.Settings.DisplayZoomControls = false;
+            e.WebView.Settings.SetSupportZoom(false);
             if (Build.VERSION.SdkInt >= BuildVersionCodes.Lollipop)
             {
                 e.WebView.Settings.MixedContentMode = MixedContentHandling.AlwaysAllow;

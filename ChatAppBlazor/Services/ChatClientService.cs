@@ -21,12 +21,14 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
     public event Action<Guid, Guid, string>? OnUserKickedFromVoiceVideo;
     public event Action<Guid, Guid, Guid>? OnUserMoved;
     public event Action<Guid, Guid, UserRole>? OnUserRoleChanged;
+    public event Action<UserProfileUpdateInfo>? OnUserProfileUpdated;
     public event Action<PrivateMessage>? OnPrivateMessageReceived;
     public event Action<Guid>? OnPrivateMessagesRead;
     public event Action<Guid, bool>? OnUserOnlineStatusChanged;
     public event Action<Guid, Guid, string, string>? OnWebRtcSignalReceived;
     public event Action<Guid, Guid>? OnUserJoinedVoiceVideo;
     public event Action<Guid, Guid>? OnUserLeftVoiceVideo;
+    public event Action<Guid>? OnPrivateCallIncoming;
 
     /// <summary>
     /// Fired when connection state changes. True = connected, False = disconnected/reconnecting.
@@ -195,6 +197,12 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
         await _hub!.SetUserRoleAsync(roomId, userId, role);
     }
 
+    public async Task<UserInfo> UpdateProfileAsync(UpdateProfileRequest request)
+    {
+        EnsureConnected();
+        return await _hub!.UpdateProfileAsync(request);
+    }
+
     public async Task SendPrivateMessageAsync(Guid recipientId, string content, Guid[]? mentionedUserIds = null, AttachmentInfo[]? attachments = null)
     {
         EnsureConnected();
@@ -236,6 +244,30 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
         await _hub!.SendWebRtcSignalAsync(roomId, targetUserId, signalType, payload);
     }
 
+    public async Task<JanusSessionInfo> JoinPrivateVoiceVideoAsync(Guid peerUserId)
+    {
+        EnsureConnected();
+        return await _hub!.JoinPrivateVoiceVideoAsync(peerUserId);
+    }
+
+    public async Task LeavePrivateVoiceVideoAsync(Guid peerUserId)
+    {
+        EnsureConnected();
+        await _hub!.LeavePrivateVoiceVideoAsync(peerUserId);
+    }
+
+    public async Task<Guid[]> GetPrivateVoiceVideoParticipantsAsync(Guid peerUserId)
+    {
+        EnsureConnected();
+        return await _hub!.GetPrivateVoiceVideoParticipantsAsync(peerUserId);
+    }
+
+    public async Task SendPrivateWebRtcSignalAsync(Guid peerUserId, Guid targetUserId, string signalType, string payload)
+    {
+        EnsureConnected();
+        await _hub!.SendPrivateWebRtcSignalAsync(peerUserId, targetUserId, signalType, payload);
+    }
+
     void IChatHubReceiver.OnMessageReceived(ChatMessage message) => OnMessageReceived?.Invoke(message);
     void IChatHubReceiver.OnMessageDeleted(Guid roomId, Guid messageId) => OnMessageDeleted?.Invoke(roomId, messageId);
     void IChatHubReceiver.OnRoomDeleted(Guid roomId) => OnRoomDeleted?.Invoke(roomId);
@@ -245,12 +277,14 @@ public class ChatClientService : IChatHubReceiver, IAsyncDisposable
     void IChatHubReceiver.OnUserKickedFromVoiceVideo(Guid roomId, Guid userId, string reason) => OnUserKickedFromVoiceVideo?.Invoke(roomId, userId, reason);
     void IChatHubReceiver.OnUserMoved(Guid sourceRoomId, Guid targetRoomId, Guid userId) => OnUserMoved?.Invoke(sourceRoomId, targetRoomId, userId);
     void IChatHubReceiver.OnUserRoleChanged(Guid roomId, Guid userId, UserRole newRole) => OnUserRoleChanged?.Invoke(roomId, userId, newRole);
+    void IChatHubReceiver.OnUserProfileUpdated(UserProfileUpdateInfo profile) => OnUserProfileUpdated?.Invoke(profile);
     void IChatHubReceiver.OnPrivateMessageReceived(PrivateMessage message) => OnPrivateMessageReceived?.Invoke(message);
     void IChatHubReceiver.OnPrivateMessagesRead(Guid userId) => OnPrivateMessagesRead?.Invoke(userId);
     void IChatHubReceiver.OnUserOnlineStatusChanged(Guid userId, bool isOnline) => OnUserOnlineStatusChanged?.Invoke(userId, isOnline);
     void IChatHubReceiver.OnWebRtcSignalReceived(Guid roomId, Guid fromUserId, string signalType, string payload) => OnWebRtcSignalReceived?.Invoke(roomId, fromUserId, signalType, payload);
     void IChatHubReceiver.OnUserJoinedVoiceVideo(Guid roomId, Guid userId) => OnUserJoinedVoiceVideo?.Invoke(roomId, userId);
     void IChatHubReceiver.OnUserLeftVoiceVideo(Guid roomId, Guid userId) => OnUserLeftVoiceVideo?.Invoke(roomId, userId);
+    void IChatHubReceiver.OnPrivateCallIncoming(Guid callerUserId) => OnPrivateCallIncoming?.Invoke(callerUserId);
 
     private void EnsureConnected()
     {

@@ -4,6 +4,8 @@
 @inject AuthStateProvider Auth
 @inject ApiClientService Api
 @inject IJSRuntime JS
+@inject CallStore Call
+@inject WebRtcBridge WebRtc
 
 <div class="dm-page">
 
@@ -16,8 +18,18 @@
                 <div class="chat-toolbar-content">
                     <div class="chat-toolbar-title-wrap">
                         <MudStack Row AlignItems="AlignItems.Center" Spacing="1">
+                            @{
+                                var selectedAvatarUrl = GetAvatarUrl(Store.SelectedContact.AvatarUrl);
+                            }
                             <MudAvatar Size="Size.Small" Color="Color.Secondary">
-                                @Store.SelectedContact.DisplayName[0]
+                                @if (!string.IsNullOrWhiteSpace(selectedAvatarUrl))
+                                {
+                                    <img src="@selectedAvatarUrl" alt="Profile" class="avatar-image-fill" />
+                                }
+                                else
+                                {
+                                    @GetAvatarInitial(Store.SelectedContact.DisplayName, Store.SelectedContact.UserName)
+                                }
                             </MudAvatar>
                             <div>
                                 <MudText Typo="Typo.subtitle1" Style="font-weight:600">@Store.SelectedContact.DisplayName</MudText>
@@ -25,8 +37,38 @@
                             </div>
                         </MudStack>
                     </div>
+                    <MudStack Row Wrap="Wrap.Wrap" AlignItems="AlignItems.Center" Spacing="1" Class="chat-toolbar-actions">
+                        <MudIconButton Icon="@(Store.IsSelectedContactNotificationsMuted ? Icons.Material.Filled.NotificationsOff : Icons.Material.Filled.NotificationsActive)"
+                                       Size="Size.Small"
+                                       Color="@(Store.IsSelectedContactNotificationsMuted ? Color.Warning : Color.Default)"
+                                       title="@(Store.IsSelectedContactNotificationsMuted ? "Unmute chat notifications" : "Mute chat notifications")"
+                                       OnClick="ToggleSelectedContactNotifications" />
+                        @if (_joiningCall)
+                        {
+                            <MudButton StartIcon="@Icons.Material.Filled.HourglassTop" Size="Size.Small"
+                                       Variant="Variant.Filled" Color="Color.Warning"
+                                       Disabled="true">Joining...</MudButton>
+                        }
+                        else if (IsCallActiveForSelectedContact)
+                        {
+                            <MudChip T="string" Size="Size.Small" Color="Color.Success" Variant="Variant.Filled">In Call</MudChip>
+                        }
+                        else
+                        {
+                            <MudButton StartIcon="@Icons.Material.Filled.Call" Size="Size.Small"
+                                       Variant="Variant.Filled" Color="Color.Success"
+                                       OnClick="JoinPrivateCall">Join Call</MudButton>
+                        }
+                    </MudStack>
                 </div>
             </div>
+
+            @if (IsCallActiveForSelectedContact && Call.ActiveRoomId is Guid activeContextId && activeContextId != Guid.Empty)
+            {
+                <div class="call-panel-host">
+                    <ActiveCallPanel RoomId="activeContextId" RoomName="@(Store.SelectedContact?.DisplayName ?? string.Empty)" />
+                </div>
+            }
 
             <div class="chat-messages-host">
                 <div class="chat-messages-area" @ref="_messagesContainerRef">
@@ -43,12 +85,70 @@
                                 </MudText>
                             </div>
                             <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
+                            @{
+                                var previewUrl = ExtractFirstHttpUrl(msg.Content);
+                                var preview = GetCachedLinkPreview(previewUrl);
+                            }
+                            @if (preview != null && !string.IsNullOrWhiteSpace(preview.Url))
+                            {
+                                var href = !string.IsNullOrWhiteSpace(preview.CanonicalUrl) ? preview.CanonicalUrl : preview.Url;
+                                <a class="chat-link-preview" href="@href" target="_blank" rel="noopener noreferrer">
+                                    @if (!string.IsNullOrWhiteSpace(preview.ImageUrl))
+                                    {
+                                        <img class="chat-link-preview-image" src="@preview.ImageUrl" alt="Link preview image" loading="lazy" />
+                                    }
+                                    <div class="chat-link-preview-content">
+                                        @if (!string.IsNullOrWhiteSpace(preview.SiteName))
+                                        {
+                                            <span class="chat-link-preview-site">@preview.SiteName</span>
+                                        }
+                                        <span class="chat-link-preview-title">@GetPreviewTitle(preview, href)</span>
+                                        @if (!string.IsNullOrWhiteSpace(preview.Description))
+                                        {
+                                            <span class="chat-link-preview-description">@preview.Description</span>
+                                        }
+                                        <span class="chat-link-preview-url">@FormatPreviewUrl(href)</span>
+                                    </div>
+                                </a>
+                            }
                             @if (msg.Attachments.Length > 0)
                             {
                                 <div class="chat-msg-attachments">
                                     @foreach (var att in msg.Attachments)
                                     {
-                                        <MudLink Href="@att.Url" Target="_blank" Typo="Typo.caption">@att.FileName</MudLink>
+                                        var attachmentUrl = GetAttachmentUrl(att);
+                                        if (string.IsNullOrWhiteSpace(attachmentUrl))
+                                        {
+                                            <MudText Typo="Typo.caption">@GetAttachmentLabel(att)</MudText>
+                                        }
+                                        else if (IsImageAttachment(att))
+                                        {
+                                            <a class="chat-attachment-link" href="@attachmentUrl" target="_blank" rel="noopener noreferrer">
+                                                <img class="chat-attachment-image"
+                                                     src="@attachmentUrl"
+                                                     alt="@GetAttachmentLabel(att)"
+                                                     loading="lazy" />
+                                            </a>
+                                        }
+                                        else if (IsVideoAttachment(att))
+                                        {
+                                            <video class="chat-attachment-video"
+                                                   controls
+                                                   preload="metadata"
+                                                   onloadedmetadata="window.webrtcManager?.applyAttachmentVideoVolume(this)"
+                                                   onplay="window.webrtcManager?.applyAttachmentVideoVolume(this)"
+                                                   onvolumechange="window.webrtcManager?.rememberAttachmentVideoVolume(this)">
+                                                <source src="@attachmentUrl" type="@ResolveVideoMime(att)" />
+                                                Your browser does not support inline video playback.
+                                            </video>
+                                            <a class="chat-attachment-link chat-attachment-filename" href="@attachmentUrl" target="_blank" rel="noopener noreferrer">
+                                                @GetAttachmentLabel(att)
+                                            </a>
+                                        }
+                                        else
+                                        {
+                                            <MudLink Href="@attachmentUrl" Target="_blank" Typo="Typo.caption">@GetAttachmentLabel(att)</MudLink>
+                                        }
                                     }
                                 </div>
                             }
@@ -64,7 +164,15 @@
                 </button>
             </div>
 
-            <div class="chat-input-area">
+            <div class="chat-input-area @(_isAttachmentDragActive ? "drag-over" : "")"
+                 @ondragenter="OnAttachmentDragEnter"
+                 @ondragenter:preventDefault
+                 @ondragover="OnAttachmentDragOver"
+                 @ondragover:preventDefault
+                 @ondragleave="OnAttachmentDragLeave"
+                 @ondragleave:preventDefault
+                 @ondrop="OnAttachmentDrop"
+                 @ondrop:preventDefault>
                 @if (_pendingAttachments.Count > 0)
                 {
                     <MudStack Row Wrap="Wrap.Wrap" Spacing="1" Class="mb-2">
@@ -108,6 +216,13 @@
                         Send
                     </MudButton>
                 </MudStack>
+
+                <div class="chat-input-drop-overlay" aria-hidden="@(!_isAttachmentDragActive)">
+                    <InputFile OnChange="HandleAttachmentSelected"
+                               multiple
+                               class="chat-input-drop-file-input" />
+                    <div class="chat-input-drop-hint">Drop files to attach</div>
+                </div>
             </div>
         }
         else
@@ -132,12 +247,24 @@
     private readonly List<AttachmentInfo> _pendingAttachments = [];
     private const long MaxUploadBytes = 50L * 1024 * 1024;
     private InputFile? _fileInput;
+    private bool _isAttachmentDragActive;
+    private int _attachmentDragDepth;
     private Guid? _lastAutoOpenedUserId;
+    private string? _lastAutoJoinCallToken;
+    private bool _joiningCall;
     private ElementReference _messagesContainerRef;
     private ElementReference _jumpLatestButtonRef;
     private bool _forceScrollToBottom;
     private int _lastRenderedMessageCount = -1;
     private Guid? _lastRenderedContactId;
+    private static readonly System.Text.RegularExpressions.Regex UrlRegex = new(
+        "(?i)\\bhttps?://[^\\s<>()]+",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+    private readonly Dictionary<string, LinkPreviewInfo?> _linkPreviewCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _linkPreviewInFlight = new(StringComparer.OrdinalIgnoreCase);
+    private const int MaxLinkPreviewCacheEntries = 300;
+    private bool IsCallActiveForSelectedContact
+        => Store.SelectedContactId != null && Call.IsActiveDirectCallWith(Store.SelectedContactId.Value);
 
     [SupplyParameterFromQuery(Name = "userId")]
     public Guid? RequestedUserId { get; set; }
@@ -148,9 +275,16 @@
     [SupplyParameterFromQuery(Name = "displayName")]
     public string? RequestedDisplayName { get; set; }
 
+    [SupplyParameterFromQuery(Name = "joinCall")]
+    public string? RequestedJoinCall { get; set; }
+
+    [SupplyParameterFromQuery(Name = "callNonce")]
+    public string? RequestedCallNonce { get; set; }
+
     protected override async Task OnInitializedAsync()
     {
         Store.OnChange += OnStoreChanged;
+        Call.OnChange += OnCallChanged;
         await Store.LoadContactsAsync();
         await TryOpenRequestedConversationAsync();
     }
@@ -180,6 +314,8 @@
                 await JS.InvokeVoidAsync("chatScrollManager.onMessagesChanged", _messagesContainerRef, shouldForce);
             }
 
+            QueueVisibleLinkPreviewLoads();
+
             _lastRenderedContactId = contactId;
             _lastRenderedMessageCount = messageCount;
             _forceScrollToBottom = false;
@@ -191,6 +327,62 @@
     }
 
     private async Task SelectContact(UserInfo contact) => await Store.SelectContactAsync(contact);
+
+    private async Task JoinPrivateCall()
+    {
+        if (Store.SelectedContactId == null || _joiningCall)
+        {
+            return;
+        }
+
+        _joiningCall = true;
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            var contactId = Store.SelectedContactId.Value;
+            var session = await Call.JoinPrivateCallAsync(contactId);
+            if (session == null)
+            {
+                return;
+            }
+
+            await WebRtc.InitAsync(
+                session.JanusSessionId,
+                session.JanusHandleId,
+                session.JanusRoomId,
+                session.ServerBaseUrl,
+                Auth.Token!,
+                Auth.CurrentUser!.Id.ToString(),
+                !string.IsNullOrWhiteSpace(Auth.CurrentUser.DisplayName)
+                    ? Auth.CurrentUser.DisplayName
+                    : Auth.CurrentUser.UserName,
+                BuildParticipantDirectory(),
+                BuildParticipantAvatarDirectory(),
+                session.IceServers);
+
+            await WebRtc.ApplyStoredSettingsAsync();
+            await WebRtc.UpdateParticipantProfilesAsync(
+                BuildParticipantDirectory(),
+                BuildParticipantAvatarDirectory());
+            Call.SetUseFloatingOverlayInActiveRoom(false);
+        }
+        catch (Exception ex)
+        {
+            Call.SetError($"Failed to join private call: {ex.Message}");
+        }
+        finally
+        {
+            _joiningCall = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void ToggleSelectedContactNotifications()
+    {
+        if (Store.SelectedContactId == null) return;
+        Store.ToggleContactNotificationsMuted(Store.SelectedContactId.Value);
+    }
 
     private async Task SendMessage()
     {
@@ -225,6 +417,35 @@
         }
     }
 
+    private void OnAttachmentDragEnter(DragEventArgs _)
+    {
+        _attachmentDragDepth++;
+        _isAttachmentDragActive = true;
+    }
+
+    private void OnAttachmentDragOver(DragEventArgs _)
+    {
+        _isAttachmentDragActive = true;
+    }
+
+    private void OnAttachmentDragLeave(DragEventArgs _)
+    {
+        if (_attachmentDragDepth > 0)
+        {
+            _attachmentDragDepth--;
+        }
+
+        if (_attachmentDragDepth == 0)
+        {
+            _isAttachmentDragActive = false;
+        }
+    }
+
+    private void OnAttachmentDrop(DragEventArgs _)
+    {
+        _attachmentDragDepth = 0;
+    }
+
     private async Task JumpToLatestAsync()
     {
         _forceScrollToBottom = false;
@@ -240,6 +461,8 @@
 
     private async Task HandleAttachmentSelected(InputFileChangeEventArgs e)
     {
+        _attachmentDragDepth = 0;
+        _isAttachmentDragActive = false;
         _uploadError = null;
         _uploading = true;
         StateHasChanged();
@@ -278,6 +501,8 @@
         finally
         {
             _uploading = false;
+            _attachmentDragDepth = 0;
+            _isAttachmentDragActive = false;
             StateHasChanged();
         }
     }
@@ -301,6 +526,14 @@
         _forceScrollToBottom = true;
         _lastRenderedMessageCount = -1;
         _lastRenderedContactId = null;
+
+        if (!ShouldAutoJoinRequestedCall(targetUserId))
+        {
+            return;
+        }
+
+        await JoinPrivateCall();
+        _lastAutoJoinCallToken = BuildAutoJoinCallToken(targetUserId);
     }
 
     private UserInfo BuildRequestedContact(Guid userId)
@@ -318,11 +551,346 @@
         };
     }
 
-    private void OnStoreChanged() => InvokeAsync(StateHasChanged);
+    private bool ShouldAutoJoinRequestedCall(Guid targetUserId)
+    {
+        if (targetUserId == Guid.Empty)
+        {
+            return false;
+        }
+
+        if (!IsTruthyQueryFlag(RequestedJoinCall))
+        {
+            return false;
+        }
+
+        if (Call.IsActiveDirectCallWith(targetUserId))
+        {
+            return false;
+        }
+
+        var token = BuildAutoJoinCallToken(targetUserId);
+        if (!string.IsNullOrWhiteSpace(token) && string.Equals(_lastAutoJoinCallToken, token, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private string BuildAutoJoinCallToken(Guid targetUserId)
+    {
+        var nonce = string.IsNullOrWhiteSpace(RequestedCallNonce) ? "none" : RequestedCallNonce.Trim();
+        var joinFlag = string.IsNullOrWhiteSpace(RequestedJoinCall) ? "none" : RequestedJoinCall.Trim();
+        return $"{targetUserId:D}|{joinFlag}|{nonce}";
+    }
+
+    private static bool IsTruthyQueryFlag(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "1" => true,
+            "true" => true,
+            "yes" => true,
+            "y" => true,
+            "on" => true,
+            _ => false
+        };
+    }
+
+    private void QueueVisibleLinkPreviewLoads()
+    {
+        foreach (var message in Store.Messages)
+        {
+            var url = ExtractFirstHttpUrl(message.Content);
+            if (string.IsNullOrWhiteSpace(url)) continue;
+            if (_linkPreviewCache.ContainsKey(url) || _linkPreviewInFlight.Contains(url)) continue;
+
+            _linkPreviewInFlight.Add(url);
+            _ = LoadLinkPreviewAsync(url);
+        }
+    }
+
+    private async Task LoadLinkPreviewAsync(string url)
+    {
+        try
+        {
+            var preview = await Api.GetLinkPreviewAsync(url);
+            _linkPreviewCache[url] = preview;
+            TrimLinkPreviewCacheIfNeeded();
+        }
+        catch
+        {
+            _linkPreviewCache[url] = null;
+        }
+        finally
+        {
+            _linkPreviewInFlight.Remove(url);
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void TrimLinkPreviewCacheIfNeeded()
+    {
+        if (_linkPreviewCache.Count <= MaxLinkPreviewCacheEntries) return;
+
+        var toRemove = _linkPreviewCache.Count - MaxLinkPreviewCacheEntries;
+        foreach (var key in _linkPreviewCache.Keys.Take(toRemove).ToArray())
+        {
+            _linkPreviewCache.Remove(key);
+            _linkPreviewInFlight.Remove(key);
+        }
+    }
+
+    private LinkPreviewInfo? GetCachedLinkPreview(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+        _linkPreviewCache.TryGetValue(url, out var preview);
+        return preview;
+    }
+
+    private static string? ExtractFirstHttpUrl(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+
+        var match = UrlRegex.Match(text);
+        if (!match.Success) return null;
+
+        var raw = match.Value.Trim();
+        raw = raw.TrimEnd('.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'');
+        if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri)) return null;
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return uri.ToString();
+    }
+
+    private static string GetPreviewTitle(LinkPreviewInfo preview, string href)
+    {
+        if (!string.IsNullOrWhiteSpace(preview.Title))
+        {
+            return preview.Title!;
+        }
+
+        return FormatPreviewUrl(href);
+    }
+
+    private static string FormatPreviewUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return string.Empty;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return url.Length > 72 ? url[..72] + "..." : url;
+        }
+
+        var host = uri.Host;
+        var path = uri.AbsolutePath == "/" ? string.Empty : uri.AbsolutePath;
+        var compact = $"{host}{path}";
+        if (compact.Length > 72)
+        {
+            compact = compact[..72] + "...";
+        }
+
+        return compact;
+    }
+
+    private static string GetAttachmentUrl(AttachmentInfo? attachment)
+        => attachment?.Url?.Trim() ?? string.Empty;
+
+    private static string GetAttachmentLabel(AttachmentInfo? attachment)
+        => string.IsNullOrWhiteSpace(attachment?.FileName) ? "attachment" : attachment.FileName;
+
+    private static bool IsImageAttachment(AttachmentInfo? attachment)
+    {
+        var contentType = attachment?.ContentType?.Trim() ?? string.Empty;
+        if (contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var ext = GetAttachmentExtension(attachment);
+        return ext is ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".bmp" or ".svg";
+    }
+
+    private static bool IsVideoAttachment(AttachmentInfo? attachment)
+    {
+        var contentType = attachment?.ContentType?.Trim() ?? string.Empty;
+        if (contentType.StartsWith("video/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var ext = GetAttachmentExtension(attachment);
+        return ext is ".mp4" or ".webm" or ".mov" or ".m4v" or ".ogv" or ".avi" or ".mkv";
+    }
+
+    private static string ResolveVideoMime(AttachmentInfo? attachment)
+    {
+        var contentType = attachment?.ContentType?.Trim() ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(contentType))
+        {
+            return contentType;
+        }
+
+        return GetAttachmentExtension(attachment) switch
+        {
+            ".webm" => "video/webm",
+            ".mov" => "video/quicktime",
+            ".ogv" => "video/ogg",
+            ".m4v" => "video/mp4",
+            _ => "video/mp4"
+        };
+    }
+
+    private static string GetAttachmentExtension(AttachmentInfo? attachment)
+    {
+        var candidate = !string.IsNullOrWhiteSpace(attachment?.FileName)
+            ? attachment.FileName
+            : attachment?.Url ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return string.Empty;
+        }
+
+        if (Uri.TryCreate(candidate, UriKind.Absolute, out var uri))
+        {
+            candidate = uri.AbsolutePath;
+        }
+
+        var queryIndex = candidate.IndexOf('?');
+        if (queryIndex >= 0)
+        {
+            candidate = candidate[..queryIndex];
+        }
+
+        var hashIndex = candidate.IndexOf('#');
+        if (hashIndex >= 0)
+        {
+            candidate = candidate[..hashIndex];
+        }
+
+        return (System.IO.Path.GetExtension(candidate) ?? string.Empty).ToLowerInvariant();
+    }
+
+    private string? GetAvatarUrl(string? avatarUrl)
+    {
+        if (string.IsNullOrWhiteSpace(avatarUrl))
+        {
+            return null;
+        }
+
+        return Api.ToAbsoluteUrl(avatarUrl);
+    }
+
+    private static string GetAvatarInitial(string? displayName, string? userName)
+    {
+        if (!string.IsNullOrWhiteSpace(displayName))
+        {
+            return displayName.Trim()[0].ToString().ToUpperInvariant();
+        }
+
+        if (!string.IsNullOrWhiteSpace(userName))
+        {
+            return userName.Trim()[0].ToString().ToUpperInvariant();
+        }
+
+        return "?";
+    }
+
+    private Dictionary<string, string> BuildParticipantDirectory()
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var contact in Store.Contacts)
+        {
+            if (contact.Id == Guid.Empty) continue;
+            var name = !string.IsNullOrWhiteSpace(contact.DisplayName)
+                ? contact.DisplayName.Trim()
+                : contact.UserName?.Trim();
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            map[contact.Id.ToString()] = name;
+        }
+
+        if (Auth.CurrentUser != null)
+        {
+            var selfName = !string.IsNullOrWhiteSpace(Auth.CurrentUser.DisplayName)
+                ? Auth.CurrentUser.DisplayName.Trim()
+                : Auth.CurrentUser.UserName?.Trim();
+            if (!string.IsNullOrWhiteSpace(selfName))
+            {
+                map[Auth.CurrentUser.Id.ToString()] = selfName;
+            }
+        }
+
+        return map;
+    }
+
+    private Dictionary<string, string> BuildParticipantAvatarDirectory()
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var contact in Store.Contacts)
+        {
+            if (contact.Id == Guid.Empty || string.IsNullOrWhiteSpace(contact.AvatarUrl))
+            {
+                continue;
+            }
+
+            map[contact.Id.ToString()] = Api.ToAbsoluteUrl(contact.AvatarUrl);
+        }
+
+        if (Auth.CurrentUser != null && !string.IsNullOrWhiteSpace(Auth.CurrentUser.AvatarUrl))
+        {
+            map[Auth.CurrentUser.Id.ToString()] = Api.ToAbsoluteUrl(Auth.CurrentUser.AvatarUrl);
+        }
+
+        return map;
+    }
+
+    private void OnStoreChanged()
+    {
+        _ = SyncParticipantProfilesAsync();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnCallChanged()
+    {
+        _ = SyncParticipantProfilesAsync();
+        InvokeAsync(StateHasChanged);
+    }
+
+    private async Task SyncParticipantProfilesAsync()
+    {
+        if (!IsCallActiveForSelectedContact || Store.SelectedContactId == null)
+        {
+            return;
+        }
+
+        try
+        {
+            await WebRtc.UpdateParticipantProfilesAsync(
+                BuildParticipantDirectory(),
+                BuildParticipantAvatarDirectory());
+        }
+        catch
+        {
+            // Ignore transient JS interop errors during rerenders/navigation.
+        }
+    }
 
     public void Dispose()
     {
         Store.OnChange -= OnStoreChanged;
+        Call.OnChange -= OnCallChanged;
     }
 }
 

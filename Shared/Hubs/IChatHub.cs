@@ -15,10 +15,15 @@ public interface IChatHub : IStreamingHub<IChatHub, IChatHubReceiver>
     ValueTask KickUserFromVoiceVideoAsync(Guid roomId, Guid userId, string reason);
     ValueTask MoveUserAsync(Guid sourceRoomId, Guid targetRoomId, Guid userId);
     ValueTask SetUserRoleAsync(Guid roomId, Guid userId, UserRole role);
+    ValueTask<UserInfo> UpdateProfileAsync(UpdateProfileRequest request);
     ValueTask SendPrivateMessageAsync(Guid recipientId, SendMessageRequest request);
     ValueTask MarkPrivateMessageReadAsync(Guid senderId);
     ValueTask<JanusSessionInfo> JoinVoiceVideoAsync(Guid roomId);
     ValueTask LeaveVoiceVideoAsync(Guid roomId);
     ValueTask<Guid[]> GetVoiceVideoParticipantsAsync(Guid roomId);
     ValueTask SendWebRtcSignalAsync(Guid roomId, Guid targetUserId, string signalType, string payload);
+    ValueTask<JanusSessionInfo> JoinPrivateVoiceVideoAsync(Guid peerUserId);
+    ValueTask LeavePrivateVoiceVideoAsync(Guid peerUserId);
+    ValueTask<Guid[]> GetPrivateVoiceVideoParticipantsAsync(Guid peerUserId);
+    ValueTask SendPrivateWebRtcSignalAsync(Guid peerUserId, Guid targetUserId, string signalType, string payload);
 }

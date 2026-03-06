@@ -7,6 +7,12 @@ namespace ChatAppBlazor.State;
 
 public record MediaDeviceInfo(string DeviceId, string Label, string Kind);
 
+public enum CallContextKind
+{
+    Room = 0,
+    DirectMessage = 1
+}
+
 /// <summary>
 /// Manages the WebRTC call lifecycle: join, leave, participants, media state.
 /// Acts as the bridge between ChatClientService hub events and the WebRTC JS layer.
@@ -23,6 +29,7 @@ public class CallStore : IDisposable
     private const string PrefSelectedBitrate = PrefPrefix + "selectedBitrate";
     private const string PrefSelectedVideoCodec = PrefPrefix + "selectedVideoCodec";
     private const string PrefScreenShareAudioEnabled = PrefPrefix + "screenShareAudioEnabled";
+    private const string PrefScreenShareAutoGainEnabled = PrefPrefix + "screenShareAutoGainEnabled";
     private const string PrefGpuAccelerationEnabled = PrefPrefix + "gpuAccelerationEnabled";
     private const string PrefForcePlatformHevcEncoderSupport = PrefPrefix + "forcePlatformHevcEncoderSupport";
     private const string PrefEnableWebRtcH265SendFeature = PrefPrefix + "enableWebRtcH265SendFeature";
@@ -32,9 +39,12 @@ public class CallStore : IDisposable
     private const string PrefPushToTalkEnabled = PrefPrefix + "pushToTalkEnabled";
     private const string PrefPushToTalkKey = PrefPrefix + "pushToTalkKey";
     private const string PrefPushToTalkSoundEnabled = PrefPrefix + "pushToTalkSoundEnabled";
+    private const string PrefNotificationsEnabled = PrefPrefix + "notificationsEnabled";
 
     public bool IsInCall { get; private set; }
     public Guid? ActiveRoomId { get; private set; }
+    public CallContextKind ActiveCallKind { get; private set; } = CallContextKind.Room;
+    public Guid? ActiveDirectPeerUserId { get; private set; }
     public JanusSessionInfo? Session { get; private set; }
     public List<Guid> Participants { get; private set; } = [];
     private readonly Dictionary<Guid, HashSet<Guid>> _roomCallParticipants = [];
@@ -54,6 +64,7 @@ public class CallStore : IDisposable
     public int SelectedBitrate { get; set; } = 2000; // kbps
     public string SelectedVideoCodec { get; set; } = "h264";
     public bool ScreenShareAudioEnabled { get; set; } = true;
+    public bool ScreenShareAutoGainEnabled { get; set; } = true;
     public bool GpuAccelerationEnabled { get; set; } = true;
     public bool ForcePlatformHevcEncoderSupport { get; set; } = true;
     public bool EnableWebRtcH265SendFeature { get; set; } = true;
@@ -65,6 +76,7 @@ public class CallStore : IDisposable
     public bool PushToTalkEnabled { get; set; }
     public string PushToTalkKey { get; set; } = "Space";
     public bool PushToTalkSoundEnabled { get; set; } = true;
+    public bool NotificationsEnabled { get; set; } = true;
 
     public event Action? OnChange;
 
@@ -111,7 +123,7 @@ public class CallStore : IDisposable
         {
             if (IsInCall)
             {
-                if (ActiveRoomId == roomId && Session != null)
+                if (ActiveCallKind == CallContextKind.Room && ActiveRoomId == roomId && Session != null)
                 {
                     return Session;
                 }
@@ -120,7 +132,14 @@ public class CallStore : IDisposable
                 {
                     try
                     {
-                        await _chat.LeaveVoiceVideoAsync(ActiveRoomId.Value);
+                        if (ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId != null)
+                        {
+                            await _chat.LeavePrivateVoiceVideoAsync(ActiveDirectPeerUserId.Value);
+                        }
+                        else
+                        {
+                            await _chat.LeaveVoiceVideoAsync(ActiveRoomId.Value);
+                        }
                     }
                     catch
                     {
@@ -132,6 +151,8 @@ public class CallStore : IDisposable
 
                 Session = null;
                 ActiveRoomId = null;
+                ActiveCallKind = CallContextKind.Room;
+                ActiveDirectPeerUserId = null;
                 IsInCall = false;
                 Participants.Clear();
                 IsScreenSharing = false;
@@ -141,6 +162,8 @@ public class CallStore : IDisposable
             Error = null;
             Session = await _chat.JoinVoiceVideoAsync(roomId);
             ActiveRoomId = roomId;
+            ActiveCallKind = CallContextKind.Room;
+            ActiveDirectPeerUserId = null;
             IsInCall = true;
             IsMuted = true;
             IsCameraOff = true;
@@ -160,6 +183,84 @@ public class CallStore : IDisposable
         }
     }
 
+    public async Task<JanusSessionInfo?> JoinPrivateCallAsync(Guid peerUserId)
+    {
+        if (peerUserId == Guid.Empty || peerUserId == _auth.CurrentUser?.Id) return null;
+        CancelPendingSelfRemovalValidation();
+
+        try
+        {
+            if (IsInCall)
+            {
+                if (ActiveCallKind == CallContextKind.DirectMessage
+                    && ActiveDirectPeerUserId == peerUserId
+                    && Session != null)
+                {
+                    return Session;
+                }
+
+                if (ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId != null)
+                {
+                    try
+                    {
+                        await _chat.LeavePrivateVoiceVideoAsync(ActiveDirectPeerUserId.Value);
+                    }
+                    catch
+                    {
+                        // Continue switching call state even if server-side leave is transiently failing.
+                    }
+                }
+                else if (ActiveRoomId != null)
+                {
+                    try
+                    {
+                        await _chat.LeaveVoiceVideoAsync(ActiveRoomId.Value);
+                    }
+                    catch
+                    {
+                        // Continue switching call state even if server-side leave is transiently failing.
+                    }
+                }
+
+                if (ActiveRoomId != null)
+                {
+                    RemoveRoomParticipant(ActiveRoomId.Value, _auth.CurrentUser?.Id ?? Guid.Empty);
+                }
+
+                Session = null;
+                ActiveRoomId = null;
+                ActiveCallKind = CallContextKind.Room;
+                ActiveDirectPeerUserId = null;
+                IsInCall = false;
+                Participants.Clear();
+                IsScreenSharing = false;
+                UseFloatingOverlayInActiveRoom = false;
+            }
+
+            Error = null;
+            Session = await _chat.JoinPrivateVoiceVideoAsync(peerUserId);
+            ActiveRoomId = Session.RoomId;
+            ActiveCallKind = CallContextKind.DirectMessage;
+            ActiveDirectPeerUserId = peerUserId;
+            IsInCall = true;
+            IsMuted = true;
+            IsCameraOff = true;
+            IsScreenSharing = false;
+            UseFloatingOverlayInActiveRoom = false;
+            Participants.Clear();
+            AddRoomParticipant(Session.RoomId, _auth.CurrentUser?.Id ?? Guid.Empty);
+            await RefreshPrivateParticipantsAsync(peerUserId);
+            NotifyChanged();
+            return Session;
+        }
+        catch (Exception ex)
+        {
+            Error = $"Failed to join private call: {ex.Message}";
+            NotifyChanged();
+            return null;
+        }
+    }
+
     public async Task LeaveCallAsync()
     {
         if (!IsInCall || ActiveRoomId == null) return;
@@ -167,7 +268,14 @@ public class CallStore : IDisposable
 
         try
         {
-            await _chat.LeaveVoiceVideoAsync(roomId);
+            if (ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId != null)
+            {
+                await _chat.LeavePrivateVoiceVideoAsync(ActiveDirectPeerUserId.Value);
+            }
+            else
+            {
+                await _chat.LeaveVoiceVideoAsync(roomId);
+            }
         }
         catch { }
         finally
@@ -175,6 +283,8 @@ public class CallStore : IDisposable
             CancelPendingSelfRemovalValidation();
             IsInCall = false;
             ActiveRoomId = null;
+            ActiveCallKind = CallContextKind.Room;
+            ActiveDirectPeerUserId = null;
             Session = null;
             Participants.Clear();
             IsMuted = false;
@@ -211,7 +321,15 @@ public class CallStore : IDisposable
 
         try
         {
-            Session = await _chat.JoinVoiceVideoAsync(roomId);
+            if (ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId != null)
+            {
+                Session = await _chat.JoinPrivateVoiceVideoAsync(ActiveDirectPeerUserId.Value);
+            }
+            else
+            {
+                Session = await _chat.JoinVoiceVideoAsync(roomId);
+            }
+            ActiveRoomId = Session.RoomId;
             Console.WriteLine($"[CallStore] Got new Janus session: {Session.JanusSessionId}");
             OnJanusReconnect?.Invoke(Session, roomId);
             NotifyChanged();
@@ -276,6 +394,7 @@ public class CallStore : IDisposable
         int bitrateKbps,
         string? videoCodec,
         bool screenShareAudioEnabled,
+        bool screenShareAutoGainEnabled,
         bool gpuAccelerationEnabled,
         bool forcePlatformHevcEncoderSupport,
         bool enableWebRtcH265SendFeature)
@@ -287,6 +406,7 @@ public class CallStore : IDisposable
         SelectedBitrate = ClampBitrate(bitrateKbps);
         SelectedVideoCodec = NormalizeVideoCodec(videoCodec);
         ScreenShareAudioEnabled = screenShareAudioEnabled;
+        ScreenShareAutoGainEnabled = screenShareAutoGainEnabled;
         GpuAccelerationEnabled = gpuAccelerationEnabled;
         ForcePlatformHevcEncoderSupport = forcePlatformHevcEncoderSupport;
         EnableWebRtcH265SendFeature = enableWebRtcH265SendFeature;
@@ -320,6 +440,13 @@ public class CallStore : IDisposable
     {
         PushToTalkSoundEnabled = enabled;
         SavePushToTalkPreferences();
+        NotifyChanged();
+    }
+
+    public void SetNotificationsEnabled(bool enabled)
+    {
+        NotificationsEnabled = enabled;
+        SaveNotificationsPreference();
         NotifyChanged();
     }
 
@@ -365,6 +492,35 @@ public class CallStore : IDisposable
         }
     }
 
+    public async Task RefreshPrivateParticipantsAsync(Guid peerUserId)
+    {
+        if (peerUserId == Guid.Empty || ActiveRoomId == null) return;
+
+        try
+        {
+            var participants = await _chat.GetPrivateVoiceVideoParticipantsAsync(peerUserId);
+            var contextId = ActiveRoomId.Value;
+            _roomCallParticipants[contextId] = participants
+                .Where(id => id != Guid.Empty)
+                .ToHashSet();
+
+            if (IsInCall && ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId == peerUserId)
+            {
+                var myId = _auth.CurrentUser?.Id;
+                Participants = participants
+                    .Where(id => id != Guid.Empty && id != myId)
+                    .Distinct()
+                    .ToList();
+            }
+
+            NotifyChanged();
+        }
+        catch
+        {
+            // Ignore transient fetch failures.
+        }
+    }
+
     public IReadOnlyCollection<Guid> GetRoomParticipants(Guid roomId)
     {
         if (_roomCallParticipants.TryGetValue(roomId, out var users))
@@ -373,6 +529,17 @@ public class CallStore : IDisposable
         }
 
         return [];
+    }
+
+    public bool IsActiveDirectCallWith(Guid userId)
+    {
+        if (!IsInCall || userId == Guid.Empty)
+        {
+            return false;
+        }
+
+        return ActiveCallKind == CallContextKind.DirectMessage
+            && ActiveDirectPeerUserId == userId;
     }
 
     public bool IsUserConnectedInRoom(Guid roomId, Guid userId)
@@ -440,6 +607,28 @@ public class CallStore : IDisposable
         OnWebRtcSignal?.Invoke(fromUserId, signalType, payload);
     }
 
+    public async Task SendWebRtcSignalAsync(
+        Guid targetUserId,
+        string signalType,
+        string payload,
+        CancellationToken cancellationToken = default)
+    {
+        if (!IsInCall || ActiveRoomId == null || targetUserId == Guid.Empty || string.IsNullOrWhiteSpace(signalType))
+        {
+            return;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId != null)
+        {
+            await _chat.SendPrivateWebRtcSignalAsync(ActiveDirectPeerUserId.Value, targetUserId, signalType, payload);
+            return;
+        }
+
+        await _chat.SendWebRtcSignalAsync(ActiveRoomId.Value, targetUserId, signalType, payload);
+    }
+
     private void HandleKickedFromVoiceVideo(Guid roomId, Guid userId, string reason)
     {
         if (roomId != ActiveRoomId || userId != _auth.CurrentUser?.Id)
@@ -485,11 +674,18 @@ public class CallStore : IDisposable
 
     private async void HandleConnectionStateChanged(bool connected)
     {
-        if (!connected || !IsInCall || ActiveRoomId == null) return;
+        if (!connected || !IsInCall) return;
 
-        var roomId = ActiveRoomId.Value;
         try
         {
+            if (ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId != null)
+            {
+                await RefreshPrivateParticipantsAsync(ActiveDirectPeerUserId.Value);
+                return;
+            }
+
+            if (ActiveRoomId == null) return;
+            var roomId = ActiveRoomId.Value;
             await _chat.JoinRoomAsync(roomId);
             await RefreshRoomParticipantsAsync(roomId);
         }
@@ -510,6 +706,7 @@ public class CallStore : IDisposable
         SelectedBitrate = ClampBitrate(prefs.Get(PrefSelectedBitrate, 2000));
         SelectedVideoCodec = NormalizeVideoCodec(prefs.Get(PrefSelectedVideoCodec, "h264"));
         ScreenShareAudioEnabled = prefs.Get(PrefScreenShareAudioEnabled, true);
+        ScreenShareAutoGainEnabled = prefs.Get(PrefScreenShareAutoGainEnabled, true);
         GpuAccelerationEnabled = prefs.Get(PrefGpuAccelerationEnabled, true);
         ForcePlatformHevcEncoderSupport = prefs.Get(
             PrefForcePlatformHevcEncoderSupport,
@@ -520,6 +717,7 @@ public class CallStore : IDisposable
         PushToTalkEnabled = prefs.Get(PrefPushToTalkEnabled, false);
         PushToTalkKey = NormalizePushToTalkKey(prefs.Get(PrefPushToTalkKey, "Space"));
         PushToTalkSoundEnabled = prefs.Get(PrefPushToTalkSoundEnabled, true);
+        NotificationsEnabled = prefs.Get(PrefNotificationsEnabled, true);
     }
 
     private void SaveCallSettingsPreferences()
@@ -532,6 +730,7 @@ public class CallStore : IDisposable
         prefs.Set(PrefSelectedBitrate, SelectedBitrate);
         prefs.Set(PrefSelectedVideoCodec, SelectedVideoCodec);
         prefs.Set(PrefScreenShareAudioEnabled, ScreenShareAudioEnabled);
+        prefs.Set(PrefScreenShareAutoGainEnabled, ScreenShareAutoGainEnabled);
         prefs.Set(PrefGpuAccelerationEnabled, GpuAccelerationEnabled);
         prefs.Set(PrefForcePlatformHevcEncoderSupport, ForcePlatformHevcEncoderSupport);
         prefs.Set(PrefEnableWebRtcH265SendFeature, EnableWebRtcH265SendFeature);
@@ -600,6 +799,11 @@ public class CallStore : IDisposable
         prefs.Set(PrefPushToTalkSoundEnabled, PushToTalkSoundEnabled);
     }
 
+    private void SaveNotificationsPreference()
+    {
+        Preferences.Default.Set(PrefNotificationsEnabled, NotificationsEnabled);
+    }
+
     private static string? NormalizeDeviceId(string? deviceId)
         => string.IsNullOrWhiteSpace(deviceId) ? null : deviceId;
 
@@ -662,6 +866,8 @@ public class CallStore : IDisposable
         Console.WriteLine($"[CallStore] Ending call locally (room={roomId}, source={source}, reason={reason ?? "none"}).");
         IsInCall = false;
         ActiveRoomId = null;
+        ActiveCallKind = CallContextKind.Room;
+        ActiveDirectPeerUserId = null;
         Session = null;
         Participants.Clear();
         IsMuted = false;
@@ -731,7 +937,15 @@ public class CallStore : IDisposable
 
                 try
                 {
-                    var participants = await _chat.GetVoiceVideoParticipantsAsync(roomId);
+                    Guid[] participants;
+                    if (ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId != null)
+                    {
+                        participants = await _chat.GetPrivateVoiceVideoParticipantsAsync(ActiveDirectPeerUserId.Value);
+                    }
+                    else
+                    {
+                        participants = await _chat.GetVoiceVideoParticipantsAsync(roomId);
+                    }
                     hadSuccessfulPresenceCheck = true;
                     if (token.IsCancellationRequested || !IsInCall || ActiveRoomId != roomId)
                     {
@@ -772,7 +986,15 @@ public class CallStore : IDisposable
                 try
                 {
                     Console.WriteLine($"[CallStore] Self absent after validation (room={roomId}, source={source}); attempting soft rejoin before local teardown.");
-                    Session = await _chat.JoinVoiceVideoAsync(roomId);
+                    if (ActiveCallKind == CallContextKind.DirectMessage && ActiveDirectPeerUserId != null)
+                    {
+                        Session = await _chat.JoinPrivateVoiceVideoAsync(ActiveDirectPeerUserId.Value);
+                    }
+                    else
+                    {
+                        Session = await _chat.JoinVoiceVideoAsync(roomId);
+                    }
+                    ActiveRoomId = Session.RoomId;
                     Console.WriteLine($"[CallStore] Soft rejoin succeeded after self-removal validation (session={Session.JanusSessionId}).");
                     OnJanusReconnect?.Invoke(Session, roomId);
                     NotifyChanged();

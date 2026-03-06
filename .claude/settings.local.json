@@ -28,7 +28,9 @@
       "Bash(dotnet-ildasm \"C:/Users/halod/.nuget/packages/sipsorcery/6.2.4/lib/net8.0/SIPSorcery.dll\")",
       "Bash(dotnet build ChatAppBlazor/ChatAppBlazor.csproj -f net9.0-windows10.0.19041.0)",
       "Bash(powershell -Command \"[System.Reflection.Assembly]::LoadFrom\\(''C:\\\\Users\\\\halod\\\\.nuget\\\\packages\\\\sipsorcerymedia.windows\\\\8.0.7\\\\lib\\\\net8.0-windows10.0.17763\\\\SIPSorceryMedia.Windows.dll''\\) | % { $_.GetTypes\\(\\) | Where-Object { $_.IsPublic } | % { Write-Host $_.FullName } }\")",
-      "Bash(dotnet add package SkiaSharp)"
+      "Bash(dotnet add package SkiaSharp)",
+      "Bash(curl:*)",
+      "WebSearch"
     ]
   }
 }

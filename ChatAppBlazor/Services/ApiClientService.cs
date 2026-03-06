@@ -3,14 +3,33 @@ using Shared.Models;
 using Shared.Requests;
 using Shared.Responses;
 using Shared.Services;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace ChatAppBlazor.Services;
 
 public class ApiClientService
 {
+    private const int MaxPreviewBytes = 262_144;
+    private const string PreviewUserAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+    private static readonly Regex TitleRegex = new(
+        "<title[^>]*>(.*?)</title>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex MetaTagRegex = new(
+        "<meta\\s+[^>]*>",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex LinkTagRegex = new(
+        "<link\\s+[^>]*>",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex AttributeRegex = new(
+        "(?<key>[A-Za-z_:][A-Za-z0-9_:\\-.]*)\\s*=\\s*(?:\"(?<v1>[^\"]*)\"|'(?<v2>[^']*)'|(?<v3>[^\\s>]+))",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     private readonly GrpcChannelProvider _channelProvider;
     private readonly AuthStateProvider _auth;
 
@@ -147,6 +166,77 @@ public class ApiClientService
         };
     }
 
+    public async Task<LinkPreviewInfo?> GetLinkPreviewAsync(string url, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return null;
+        }
+
+        if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out var sourceUri))
+        {
+            return null;
+        }
+
+        if (!string.Equals(sourceUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(sourceUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var handler = new HttpClientHandler
+            {
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
+            };
+
+            using var client = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(8)
+            };
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, sourceUri);
+            request.Headers.UserAgent.ParseAdd(PreviewUserAgent);
+            request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,*/*;q=0.2");
+            request.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+
+            using var response = await client.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken);
+
+            var finalUri = response.RequestMessage?.RequestUri ?? sourceUri;
+            if (!response.IsSuccessStatusCode)
+            {
+                return BuildPreviewFallback(finalUri);
+            }
+
+            var mediaType = response.Content.Headers.ContentType?.MediaType ?? string.Empty;
+            if (!mediaType.Contains("html", StringComparison.OrdinalIgnoreCase))
+            {
+                return BuildPreviewFallback(finalUri);
+            }
+
+            var html = await ReadContentWithLimitAsync(
+                response.Content,
+                MaxPreviewBytes,
+                response.Content.Headers.ContentType?.CharSet,
+                cancellationToken);
+
+            if (string.IsNullOrWhiteSpace(html))
+            {
+                return BuildPreviewFallback(finalUri);
+            }
+
+            return ParsePreviewFromHtml(finalUri, html);
+        }
+        catch
+        {
+            return BuildPreviewFallback(sourceUri);
+        }
+    }
+
     public AttachmentInfo[] NormalizeAttachments(AttachmentInfo[] attachments)
     {
         foreach (var attachment in attachments)
@@ -205,6 +295,208 @@ public class ApiClientService
 
         [JsonPropertyName("url")]
         public string Url { get; set; } = string.Empty;
+    }
+
+    private static async Task<string> ReadContentWithLimitAsync(HttpContent content, int maxBytes, string? charset, CancellationToken cancellationToken)
+    {
+        await using var stream = await content.ReadAsStreamAsync(cancellationToken);
+        using var ms = new MemoryStream(Math.Min(maxBytes, 65_536));
+        var buffer = new byte[8192];
+        var remaining = maxBytes;
+
+        while (remaining > 0)
+        {
+            var toRead = Math.Min(buffer.Length, remaining);
+            var read = await stream.ReadAsync(buffer.AsMemory(0, toRead), cancellationToken);
+            if (read <= 0)
+            {
+                break;
+            }
+
+            await ms.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            remaining -= read;
+        }
+
+        var bytes = ms.ToArray();
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(charset))
+            {
+                return Encoding.GetEncoding(charset).GetString(bytes);
+            }
+        }
+        catch
+        {
+            // Fall back to UTF-8 when charset isn't valid.
+        }
+
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    private static LinkPreviewInfo ParsePreviewFromHtml(Uri sourceUri, string html)
+    {
+        var openGraph = BuildOpenGraphMap(html);
+        var title = TryGetDictionaryValue(openGraph, "og:title")
+            ?? FindMetaContent(html, "name", "twitter:title")
+            ?? FindTitle(html)
+            ?? sourceUri.Host;
+        var description = TryGetDictionaryValue(openGraph, "og:description")
+            ?? FindMetaContent(html, "name", "description")
+            ?? FindMetaContent(html, "name", "twitter:description");
+        var siteName = TryGetDictionaryValue(openGraph, "og:site_name") ?? sourceUri.Host;
+        var canonical = TryGetDictionaryValue(openGraph, "og:url")
+            ?? FindLinkHref(html, "canonical")
+            ?? sourceUri.ToString();
+        var image =
+            TryGetDictionaryValue(openGraph, "og:image:secure_url")
+            ?? TryGetDictionaryValue(openGraph, "og:image:url")
+            ?? TryGetDictionaryValue(openGraph, "og:image")
+            ?? FindMetaContent(html, "name", "twitter:image");
+        var icon = FindLinkHref(html, "icon");
+
+        return new LinkPreviewInfo
+        {
+            Url = sourceUri.ToString(),
+            CanonicalUrl = ToAbsoluteUrl(sourceUri, canonical),
+            Title = NormalizeText(title),
+            Description = NormalizeText(description),
+            SiteName = NormalizeText(siteName),
+            ImageUrl = ToAbsoluteUrl(sourceUri, image),
+            IconUrl = ToAbsoluteUrl(sourceUri, icon)
+        };
+    }
+
+    private static Dictionary<string, string> BuildOpenGraphMap(string html)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (Match tag in MetaTagRegex.Matches(html))
+        {
+            var attrs = ParseAttributes(tag.Value);
+            var property =
+                (attrs.TryGetValue("property", out var p) ? p : null)
+                ?? (attrs.TryGetValue("name", out var n) ? n : null);
+
+            if (string.IsNullOrWhiteSpace(property) || !property.StartsWith("og:", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!attrs.TryGetValue("content", out var content) || string.IsNullOrWhiteSpace(content))
+            {
+                continue;
+            }
+
+            if (!result.ContainsKey(property))
+            {
+                result[property] = WebUtility.HtmlDecode(content);
+            }
+        }
+
+        return result;
+    }
+
+    private static string? TryGetDictionaryValue(IReadOnlyDictionary<string, string> values, string key)
+    {
+        if (values.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+
+        return null;
+    }
+
+    private static LinkPreviewInfo BuildPreviewFallback(Uri uri)
+    {
+        var host = uri.Host;
+        return new LinkPreviewInfo
+        {
+            Url = uri.ToString(),
+            CanonicalUrl = uri.ToString(),
+            Title = host,
+            SiteName = host
+        };
+    }
+
+    private static string? FindTitle(string html)
+    {
+        var match = TitleRegex.Match(html);
+        if (!match.Success) return null;
+        return WebUtility.HtmlDecode(match.Groups[1].Value);
+    }
+
+    private static string? FindMetaContent(string html, string attrName, string attrValue)
+    {
+        foreach (Match tag in MetaTagRegex.Matches(html))
+        {
+            var attrs = ParseAttributes(tag.Value);
+            if (!attrs.TryGetValue(attrName, out var value)) continue;
+            if (!string.Equals(value, attrValue, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!attrs.TryGetValue("content", out var content)) continue;
+            return WebUtility.HtmlDecode(content);
+        }
+
+        return null;
+    }
+
+    private static string? FindLinkHref(string html, string relContains)
+    {
+        foreach (Match tag in LinkTagRegex.Matches(html))
+        {
+            var attrs = ParseAttributes(tag.Value);
+            if (!attrs.TryGetValue("rel", out var rel)) continue;
+            if (rel.IndexOf(relContains, StringComparison.OrdinalIgnoreCase) < 0) continue;
+            if (!attrs.TryGetValue("href", out var href)) continue;
+            return WebUtility.HtmlDecode(href);
+        }
+
+        return null;
+    }
+
+    private static Dictionary<string, string> ParseAttributes(string tag)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match match in AttributeRegex.Matches(tag))
+        {
+            var key = match.Groups["key"].Value;
+            if (string.IsNullOrWhiteSpace(key)) continue;
+            var value = match.Groups["v1"].Success
+                ? match.Groups["v1"].Value
+                : match.Groups["v2"].Success
+                    ? match.Groups["v2"].Value
+                    : match.Groups["v3"].Value;
+            result[key] = value;
+        }
+
+        return result;
+    }
+
+    private static string? NormalizeText(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var normalized = Regex.Replace(value, "\\s+", " ").Trim();
+        if (normalized.Length > 320)
+        {
+            normalized = normalized[..320] + "...";
+        }
+
+        return normalized;
+    }
+
+    private static string? ToAbsoluteUrl(Uri sourceUri, string? candidate)
+    {
+        if (string.IsNullOrWhiteSpace(candidate)) return null;
+        if (Uri.TryCreate(candidate, UriKind.Absolute, out var absolute))
+        {
+            return absolute.ToString();
+        }
+
+        if (Uri.TryCreate(sourceUri, candidate, out var combined))
+        {
+            return combined.ToString();
+        }
+
+        return null;
     }
 
 }

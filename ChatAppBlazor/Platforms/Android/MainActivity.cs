@@ -1,8 +1,10 @@
 using Android.App;
 using Android.Content.PM;
 using Android.OS;
+using Android.Views;
 using AndroidX.Core.App;
 using AndroidX.Core.Content;
+using ChatAppBlazor.Services;
 
 namespace ChatAppBlazor
 {
@@ -23,7 +25,30 @@ namespace ChatAppBlazor
         protected override void OnCreate(Bundle? savedInstanceState)
         {
             base.OnCreate(savedInstanceState);
+            EnableFullscreen();
             RequestRuntimePermissionsIfNeeded();
+            HandleNotificationIntent(Intent);
+        }
+
+        protected override void OnResume()
+        {
+            base.OnResume();
+            EnableFullscreen();
+        }
+
+        public override void OnWindowFocusChanged(bool hasFocus)
+        {
+            base.OnWindowFocusChanged(hasFocus);
+            if (hasFocus)
+            {
+                EnableFullscreen();
+            }
+        }
+
+        protected override void OnNewIntent(Android.Content.Intent? intent)
+        {
+            base.OnNewIntent(intent);
+            HandleNotificationIntent(intent);
         }
 
         public override void OnRequestPermissionsResult(
@@ -91,6 +116,56 @@ namespace ChatAppBlazor
             {
                 pendingPermissions.Add(permission);
             }
+        }
+
+        private void EnableFullscreen()
+        {
+            if (Window == null)
+            {
+                return;
+            }
+
+            if (Build.VERSION.SdkInt >= BuildVersionCodes.R)
+            {
+                Window.SetDecorFitsSystemWindows(false);
+                var controller = Window.InsetsController;
+                if (controller != null)
+                {
+                    controller.Hide(WindowInsets.Type.StatusBars() | WindowInsets.Type.NavigationBars());
+                    controller.SystemBarsBehavior = 2; // BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+            else
+            {
+                var decor = Window.DecorView;
+                if (decor != null)
+                {
+                    decor.SystemUiFlags =
+                        SystemUiFlags.LayoutStable |
+                        SystemUiFlags.LayoutHideNavigation |
+                        SystemUiFlags.LayoutFullscreen |
+                        SystemUiFlags.HideNavigation |
+                        SystemUiFlags.Fullscreen |
+                        SystemUiFlags.ImmersiveSticky;
+                }
+            }
+        }
+
+        private static void HandleNotificationIntent(Android.Content.Intent? intent)
+        {
+            if (intent == null)
+            {
+                return;
+            }
+
+            var route = intent.GetStringExtra("navigateUri");
+            if (string.IsNullOrWhiteSpace(route))
+            {
+                return;
+            }
+
+            NotificationNavigationBridge.QueueNavigation(route);
+            intent.RemoveExtra("navigateUri");
         }
     }
 }

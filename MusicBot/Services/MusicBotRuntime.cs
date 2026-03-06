@@ -516,6 +516,8 @@ public sealed class MusicBotRuntime : IAsyncDisposable
             await RequestStopIfActiveRoomAsync(roomState.RoomId);
         }
 
+        await LeaveRoomIfActiveAsync(roomState.RoomId, "stop-command");
+
         await SendRoomMessageAsync(roomState.RoomId, $"Stopped playback and cleared {removed} queued track(s).");
     }
 
@@ -593,6 +595,8 @@ public sealed class MusicBotRuntime : IAsyncDisposable
             removed = roomState.Queue.Count;
             roomState.Queue.Clear();
         }
+
+        await LeaveRoomIfIdleAsync(roomState, "clear-idle");
 
         await SendRoomMessageAsync(roomState.RoomId, $"Cleared {removed} queued track(s).");
     }
@@ -827,8 +831,7 @@ public sealed class MusicBotRuntime : IAsyncDisposable
                 var playbackSucceeded = false;
                 try
                 {
-                    await PlayTrackAsync(roomState, nextTrack);
-                    playbackSucceeded = true;
+                    playbackSucceeded = await PlayTrackAsync(roomState, nextTrack);
                 }
                 catch (OperationCanceledException) when (roomState.Cts.Token.IsCancellationRequested)
                 {
@@ -859,18 +862,19 @@ public sealed class MusicBotRuntime : IAsyncDisposable
                 }
 
                 RaiseStateChanged();
+                await LeaveRoomIfIdleAsync(roomState, "idle-no-stream");
             }
         }
     }
 
-    private async Task PlayTrackAsync(RoomPlaybackState roomState, QueuedTrack queuedTrack)
+    private async Task<bool> PlayTrackAsync(RoomPlaybackState roomState, QueuedTrack queuedTrack)
     {
         await _transportGate.WaitAsync(roomState.Cts.Token);
         try
         {
             if (!_isRunning || roomState.Cts.Token.IsCancellationRequested)
             {
-                return;
+                return false;
             }
 
             await EnsureTransportBoundToRoomLockedAsync(roomState.RoomId, roomState.Cts.Token);
@@ -879,7 +883,7 @@ public sealed class MusicBotRuntime : IAsyncDisposable
             if (candidateUrls.Count == 0)
             {
                 await SendRoomMessageAsync(roomState.RoomId, $"Playback failed for '{queuedTrack.Track.Title}': no playable URLs.");
-                return;
+                return false;
             }
 
             var playback = CreateActivePlayback(roomState.RoomId);
@@ -893,7 +897,7 @@ public sealed class MusicBotRuntime : IAsyncDisposable
             {
                 CompleteActivePlayback(success: false, error: ex);
                 await SendRoomMessageAsync(roomState.RoomId, $"Playback failed: {ex.Message}");
-                return;
+                return false;
             }
 
             var timeout = queuedTrack.Track.Duration > TimeSpan.Zero
@@ -916,7 +920,61 @@ public sealed class MusicBotRuntime : IAsyncDisposable
                 try { await playback.Completion.Task; } catch { }
             }
 
-            CompleteActivePlayback(success: true, error: null);
+            var success = completed != timeoutTask;
+            CompleteActivePlayback(success, error: null);
+            return success;
+        }
+        finally
+        {
+            _transportGate.Release();
+        }
+    }
+
+    private async Task LeaveRoomIfIdleAsync(RoomPlaybackState roomState, string reason)
+    {
+        await _transportGate.WaitAsync();
+        try
+        {
+            if (_webRtc.CurrentRoomId != roomState.RoomId)
+            {
+                return;
+            }
+
+            lock (roomState.Sync)
+            {
+                if (roomState.IsPlaying || roomState.Queue.Count > 0)
+                {
+                    return;
+                }
+            }
+
+            lock (_activePlaybackSync)
+            {
+                if (_activePlayback?.RoomId == roomState.RoomId)
+                {
+                    return;
+                }
+            }
+
+            try
+            {
+                await _webRtc.StopMusicPlaybackAsync();
+            }
+            catch { }
+
+            try
+            {
+                await _chatHub.LeaveVoiceVideoAsync(roomState.RoomId);
+            }
+            catch { }
+
+            try
+            {
+                await _webRtc.StopAsync(reason);
+            }
+            catch { }
+
+            Log($"Released voice transport for room {roomState.RoomId:D} ({reason}).");
         }
         finally
         {

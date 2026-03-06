@@ -1,17 +1,17 @@
-﻿'use strict';
+'use strict';
 
 /**
- * WebRTC Manager â€” First-class Janus SFU integration for Blazor Hybrid.
+ * WebRTC Manager — First-class Janus SFU integration for Blazor Hybrid.
  *
  * Manages the complete Janus videoroom lifecycle:
- *   - Publisher: local media â†’ Janus â†’ SFU
+ *   - Publisher: local media → Janus → SFU
  *   - Subscribers: one handle per remote feed (two-phase via polling)
  *   - Trickle ICE, keepalive, long-poll event loop
  *
  * Communication with C# via DotNetObjectReference (passed in init).
  */
 window.webrtcManager = {
-    // â”€â”€â”€ State â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── State ──────────────────────────────────────────────────────────────────
 
     localStream: null,
     screenStream: null,
@@ -22,30 +22,43 @@ window.webrtcManager = {
     // Janus session (publisher)
     janusSessionId: 0,
     janusHandleId: 0,
+    screenAudioPublisherHandleId: 0,
     janusRoomId: 0,
     myPrivateId: 0,
 
-    // Per-feed subscriber handles: feedId â†’ { handleId, pc }
+    // Per-feed subscriber handles: feedId → { handleId, pc }
     feeds: {},
+    nativeScreenReceivers: {},
+    nativeScreenPendingCandidates: {},
     remoteFeedVolumes: {},
     remoteIdentityVolumes: {},
+    remoteIdentityVolumeStoragePrefix: 'privatechat:remoteIdentityVolumes:v1:',
+    hiddenRemoteFeeds: {},
+    hiddenRemoteFeedMeta: {},
     streamVolume: 1.0,
     publisherStreamHints: {},
+    attachmentVideoVolumeStorageKey: 'privatechat:attachmentVideoVolume:v1',
+    attachmentVideoVolumeCached: null,
 
-    // Pending subscriber joins: handleId â†’ { feedId, display }
+    // Pending subscriber joins: handleId → { feedId, display }
     // Tracks handles waiting for JSEP offer from Janus via polling loop.
     pendingSubscribes: {},
+    pendingSubscribeFeeds: {},
     pendingSubscribeTimeoutMs: 5000,
 
     // Publisher PeerConnection
     publisherPc: null,
+    screenAudioPublisherPc: null,
     publisherConfigured: false,
+    screenAudioPublisherConfigured: false,
+    screenAudioPublisherPendingCandidates: [],
     pendingJanusBitrateBps: 0,
 
     // Auth / server
     userId: '',
     userDisplayName: '',
     participantDirectory: {},
+    participantAvatarDirectory: {},
     serverBaseUrl: '',
     authToken: '',
 
@@ -58,6 +71,8 @@ window.webrtcManager = {
     lastPollActivityAt: 0,
     keepaliveTimer: null,
     participantCheckTimer: null,
+    remoteFeedHealthTimer: null,
+    remoteFeedHealthBusy: false,
     keepaliveFailures: 0,
 
     // C# interop reference
@@ -71,7 +86,8 @@ window.webrtcManager = {
         fps: 30,
         bitrateKbps: 2000,
         preferredVideoCodec: 'h264',
-        screenShareAudioEnabled: true
+        screenShareAudioEnabled: true,
+        screenShareAutoGainEnabled: true
     },
     minPublisherBitrateKbps: 1000,
     maxPublisherBitrateKbps: 20000,
@@ -79,9 +95,9 @@ window.webrtcManager = {
     // Applied to outgoing SDP when H264 is present/selected.
     h264ProfileLevelId: '64e029',
     h264ProfileLevelIdFallbacks: ['4de01f', '42e01f'],
-    receiverAudioJitterBufferTargetMs: 60,
+    receiverAudioJitterBufferTargetMs: 120,
     receiverVideoJitterBufferTargetMs: 90,
-    receiverAudioPlayoutDelayHintS: 0.06,
+    receiverAudioPlayoutDelayHintS: 0.12,
     receiverVideoPlayoutDelayHintS: 0.10,
     audioContext: null,
     remotePlaybackAudioContext: null,
@@ -118,8 +134,14 @@ window.webrtcManager = {
     screenAudioFallbackContext: null,
     screenAudioFallbackDestination: null,
     screenAudioFallbackGain: null,
+    screenAudioFallbackLimiter: null,
     screenAudioFallbackTrack: null,
     screenAudioFallbackNextTime: 0,
+    screenAudioFallbackAutoGain: 1.0,
+    screenAudioFallbackTargetRms: 0.11,
+    screenAudioFallbackNoiseGateRms: 0.002,
+    screenAudioFallbackMinGain: 1.0,
+    screenAudioFallbackMaxGain: 4.5,
     screenShareAudioMixContext: null,
     screenShareAudioMixTrack: null,
 
@@ -128,6 +150,7 @@ window.webrtcManager = {
     openStreamInfoPanels: {},
     streamStatsCache: {},
     selectedSpotlightStreamKey: null,
+    controlOverlayHideTimers: new WeakMap(),
     screenShareSystemAudioSuppressed: false,
     screenShareBitrateWarmupTimers: [],
     publisherVideoPerfGuardIntervalId: null,
@@ -136,7 +159,7 @@ window.webrtcManager = {
     publisherHealthIntervalId: null,
     publisherHealthState: null,
 
-    // â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Helpers ────────────────────────────────────────────────────────────────
 
     /**
      * Find a sender for the given media kind ('audio' or 'video').
@@ -216,6 +239,7 @@ window.webrtcManager = {
         const maxBitrateBps = maxBitrateKbps * 1000;
         const minBitrateBps = minBitrateKbps * 1000;
         const requestedScale = Number(options?.scaleResolutionDownBy);
+        const minRequiredScale = this.getRequiredScreenShareScaleDownBy(videoSender?.track || null);
 
         try {
             const params = videoSender.getParameters() || {};
@@ -231,11 +255,13 @@ window.webrtcManager = {
             if ('networkPriority' in params.encodings[0]) {
                 params.encodings[0].networkPriority = 'high';
             }
+            const currentScale = Number(params.encodings[0].scaleResolutionDownBy);
+            let nextScale = Number.isFinite(currentScale) && currentScale >= 1 ? currentScale : 1;
             if (Number.isFinite(requestedScale) && requestedScale >= 1) {
-                params.encodings[0].scaleResolutionDownBy = requestedScale;
-            } else if (!Number.isFinite(params.encodings[0].scaleResolutionDownBy) || params.encodings[0].scaleResolutionDownBy < 1) {
-                params.encodings[0].scaleResolutionDownBy = 1;
+                nextScale = requestedScale;
             }
+            nextScale = Math.max(minRequiredScale, nextScale);
+            params.encodings[0].scaleResolutionDownBy = nextScale;
 
             await videoSender.setParameters(params);
             this.log(
@@ -319,6 +345,87 @@ window.webrtcManager = {
         );
     },
 
+    getRemoteIdentityVolumeStorageKey() {
+        const normalizedUserId = this.normalizeUserId(this.userId || '');
+        return `${this.remoteIdentityVolumeStoragePrefix}${normalizedUserId || 'anonymous'}`;
+    },
+
+    sanitizeIdentityVolumeMap(raw) {
+        if (!raw || typeof raw !== 'object') return {};
+        const sanitized = {};
+        for (const [identityKey, value] of Object.entries(raw)) {
+            if (!identityKey || typeof value !== 'object' || !value) continue;
+            const mic = Math.max(0, Math.min(200, parseInt(value.mic, 10) || 100));
+            const stream = Math.max(0, Math.min(200, parseInt(value.stream, 10) || mic));
+            sanitized[String(identityKey)] = { mic, stream };
+        }
+        return sanitized;
+    },
+
+    loadPersistedRemoteIdentityVolumes() {
+        try {
+            const storageKey = this.getRemoteIdentityVolumeStorageKey();
+            const raw = window.localStorage?.getItem(storageKey);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            const sanitized = this.sanitizeIdentityVolumeMap(parsed);
+            this.remoteIdentityVolumes = sanitized;
+        } catch {
+            // Ignore storage parsing failures.
+        }
+    },
+
+    savePersistedRemoteIdentityVolumes() {
+        try {
+            const storageKey = this.getRemoteIdentityVolumeStorageKey();
+            const sanitized = this.sanitizeIdentityVolumeMap(this.remoteIdentityVolumes);
+            window.localStorage?.setItem(storageKey, JSON.stringify(sanitized));
+        } catch {
+            // Ignore storage persistence failures.
+        }
+    },
+
+    getAttachmentVideoSavedVolume() {
+        if (typeof this.attachmentVideoVolumeCached === 'number' && Number.isFinite(this.attachmentVideoVolumeCached)) {
+            return Math.max(0, Math.min(1, this.attachmentVideoVolumeCached));
+        }
+        try {
+            const raw = window.localStorage?.getItem(this.attachmentVideoVolumeStorageKey);
+            const parsed = Number.parseFloat(raw ?? '');
+            if (Number.isFinite(parsed)) {
+                this.attachmentVideoVolumeCached = Math.max(0, Math.min(1, parsed));
+                return this.attachmentVideoVolumeCached;
+            }
+        } catch {
+            // Ignore storage parsing failures.
+        }
+        this.attachmentVideoVolumeCached = 1.0;
+        return 1.0;
+    },
+
+    applyAttachmentVideoVolume(videoElement) {
+        if (!videoElement) return;
+        const savedVolume = this.getAttachmentVideoSavedVolume();
+        try {
+            videoElement.volume = Math.max(0, Math.min(1, savedVolume));
+            videoElement.muted = savedVolume <= 0.0001;
+        } catch {
+            // Ignore element update failures.
+        }
+    },
+
+    rememberAttachmentVideoVolume(videoElement) {
+        if (!videoElement) return;
+        const candidate = videoElement.muted ? 0 : (Number(videoElement.volume) || 0);
+        const clamped = Math.max(0, Math.min(1, candidate));
+        this.attachmentVideoVolumeCached = clamped;
+        try {
+            window.localStorage?.setItem(this.attachmentVideoVolumeStorageKey, String(clamped));
+        } catch {
+            // Ignore storage persistence failures.
+        }
+    },
+
     isAndroidWebRtcEnvironment() {
         try {
             const ua = (navigator?.userAgent || '').toString().toLowerCase();
@@ -326,6 +433,25 @@ window.webrtcManager = {
         } catch {
             return false;
         }
+    },
+
+    enforceAndroidHardwareCodecPreference(reason = 'runtime') {
+        if (!this.isAndroidWebRtcEnvironment()) return;
+
+        const support = this.getBrowserVideoCodecSupport();
+        if (!support.has('h264')) {
+            this.log('codec', `${reason}: Android hardware codec preference skipped (H264 not supported by browser)`);
+            return;
+        }
+
+        const current = this.normalizeVideoCodec(this.currentConstraints.preferredVideoCodec);
+        if (current === 'h264') {
+            this.log('codec', `${reason}: Android using H264 (best chance for HW encoder)`);
+            return;
+        }
+
+        // Do not hard-force codec on Android at runtime; some devices fail renegotiation.
+        this.log('codec', `${reason}: keeping preferred codec '${current}' (H264 available but not forced)`);
     },
 
     getEffectiveMinPublisherBitrateKbps() {
@@ -361,6 +487,116 @@ window.webrtcManager = {
         width = Math.max(640, Math.min(3840, width));
         height = Math.max(360, Math.min(2160, height));
         return { width, height };
+    },
+
+    buildCameraVideoConstraint() {
+        const target = this.parseResolutionSetting(this.currentConstraints?.resolution, 1280, 720);
+        const fps = Math.max(1, parseInt(this.currentConstraints?.fps, 10) || 30);
+        const constraint = {
+            width: { ideal: target.width },
+            height: { ideal: target.height },
+            frameRate: { ideal: fps, max: fps }
+        };
+        const cameraDeviceId = (this.currentConstraints?.cameraDeviceId || '').toString().trim();
+        if (cameraDeviceId) {
+            constraint.deviceId = { exact: cameraDeviceId };
+        }
+        return constraint;
+    },
+
+    stopLocalCameraTracks(reason = 'camera-off') {
+        if (!this.localStream) return false;
+        const videoTracks = this.localStream.getVideoTracks();
+        if (!videoTracks.length) return false;
+
+        for (const track of videoTracks) {
+            try { track.enabled = false; } catch { }
+            try { this.localStream.removeTrack(track); } catch { }
+            try { track.stop(); } catch { }
+        }
+
+        if (!this.isScreenSharing) {
+            const localVideo = document.getElementById('localVideo');
+            if (localVideo) {
+                localVideo.srcObject = this.localStream;
+            }
+            this.updateLocalFeedAvatarFallback();
+        }
+
+        this.log('media', `${reason}: disconnected local camera (${videoTracks.length} track(s) stopped)`);
+        return true;
+    },
+
+    async ensureLocalCameraTrack(reason = 'camera-on') {
+        if (!navigator?.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+            throw new Error('getUserMedia unavailable');
+        }
+
+        if (!this.localStream) {
+            this.localStream = new MediaStream();
+        }
+
+        const existing = this.localStream.getVideoTracks().find(t => t && t.readyState === 'live');
+        if (existing) {
+            existing.enabled = true;
+            return existing;
+        }
+
+        const primaryConstraint = this.buildCameraVideoConstraint();
+        let captureStream = null;
+        let lastError = null;
+
+        const attempts = [
+            { label: 'preferred', constraints: { audio: false, video: primaryConstraint } },
+            { label: 'default', constraints: { audio: false, video: true } }
+        ];
+
+        for (const attempt of attempts) {
+            try {
+                captureStream = await navigator.mediaDevices.getUserMedia(attempt.constraints);
+                this.log('media', `${reason}: reacquired camera track (${attempt.label})`);
+                break;
+            } catch (err) {
+                lastError = err;
+                this.log('media', `${reason}: camera reacquire failed (${attempt.label}): ${err.message}`);
+            }
+        }
+
+        const videoTrack = captureStream?.getVideoTracks?.()[0] || null;
+        if (!videoTrack) {
+            throw new Error(lastError?.message || 'No camera video track available');
+        }
+
+        this.applyVideoTrackContentHint(videoTrack, 'camera');
+        this.localStream.addTrack(videoTrack);
+
+        const localVideo = document.getElementById('localVideo');
+        if (localVideo && !this.isScreenSharing) {
+            localVideo.srcObject = this.localStream;
+            const playPromise = localVideo.play?.();
+            if (playPromise?.catch) {
+                playPromise.catch(err => this.log('media', `Local preview play() blocked: ${err.message}`));
+            }
+        }
+        this.updateLocalFeedAvatarFallback();
+
+        return videoTrack;
+    },
+
+    getRequiredScreenShareScaleDownBy(videoTrack) {
+        if (!videoTrack) return 1;
+        const targetResolution = this.parseResolutionSetting(this.currentConstraints?.resolution, 1920, 1080);
+        const settings = videoTrack.getSettings?.() || {};
+        const sourceWidth = Number(settings.width ?? 0);
+        const sourceHeight = Number(settings.height ?? 0);
+        if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight) || sourceWidth <= 0 || sourceHeight <= 0) {
+            return 1;
+        }
+
+        const widthRatio = sourceWidth / Math.max(1, targetResolution.width);
+        const heightRatio = sourceHeight / Math.max(1, targetResolution.height);
+        const requiredScale = Math.max(1, widthRatio, heightRatio);
+        return Math.max(1, Math.min(4, Math.round(requiredScale * 100) / 100));
     },
 
     clearScreenShareBitrateWarmupTimers() {
@@ -475,12 +711,14 @@ window.webrtcManager = {
         const recoveryFpsThreshold = Math.max(12, targetFps * 0.9);
         const isEncoderLimited = qualityLimitationReason === 'cpu' || qualityLimitationReason === 'other';
         const hasLowFps = Number.isFinite(measuredFps) && measuredFps > 0 && measuredFps < lowFpsThreshold;
+        const minRequiredScale = this.getRequiredScreenShareScaleDownBy(videoSender.track);
 
         const senderParams = videoSender.getParameters?.() || {};
         const senderScale = Number(senderParams?.encodings?.[0]?.scaleResolutionDownBy);
         if (Number.isFinite(senderScale) && senderScale >= 1) {
-            state.scaleResolutionDownBy = senderScale;
+            state.scaleResolutionDownBy = Math.max(minRequiredScale, senderScale);
         }
+        state.scaleResolutionDownBy = Math.max(minRequiredScale, Number(state.scaleResolutionDownBy) || 1);
 
         if (isEncoderLimited && hasLowFps) {
             state.lowFpsStreak += 1;
@@ -498,7 +736,7 @@ window.webrtcManager = {
 
         if (state.lowFpsStreak >= 3) {
             state.lowFpsStreak = 0;
-            const nextScale = Math.min(2.5, Math.round((state.scaleResolutionDownBy + 0.25) * 100) / 100);
+            const nextScale = Math.max(minRequiredScale, Math.min(2.5, Math.round((state.scaleResolutionDownBy + 0.25) * 100) / 100));
             if (nextScale > state.scaleResolutionDownBy + 0.001) {
                 state.scaleResolutionDownBy = nextScale;
                 await this.tuneScreenShareVideoSenderForPerformance(
@@ -515,9 +753,9 @@ window.webrtcManager = {
             return;
         }
 
-        if (state.recoveryStreak >= 5 && state.scaleResolutionDownBy > 1.01) {
+        if (state.recoveryStreak >= 5 && state.scaleResolutionDownBy > (minRequiredScale + 0.01)) {
             state.recoveryStreak = 0;
-            const nextScale = Math.max(1, Math.round((state.scaleResolutionDownBy - 0.25) * 100) / 100);
+            const nextScale = Math.max(minRequiredScale, Math.round((state.scaleResolutionDownBy - 0.25) * 100) / 100);
             if (nextScale < state.scaleResolutionDownBy - 0.001) {
                 state.scaleResolutionDownBy = nextScale;
                 await this.tuneScreenShareVideoSenderForPerformance(
@@ -886,6 +1124,35 @@ window.webrtcManager = {
         return stream;
     },
 
+    mergeRemotePlaybackStreams(existingStream, incomingStream, feedId, preferredTrack = null) {
+        const normalizedIncoming = this.normalizeRemotePlaybackStream(incomingStream, feedId, preferredTrack);
+        if (!existingStream) return normalizedIncoming;
+        if (!normalizedIncoming || normalizedIncoming === existingStream) {
+            return this.normalizeRemotePlaybackStream(existingStream, feedId, preferredTrack);
+        }
+
+        const existingTracks = existingStream.getTracks?.() || [];
+        const existingTrackIds = new Set(existingTracks.map(t => t?.id).filter(Boolean));
+
+        const incomingTracks = normalizedIncoming.getTracks?.() || [];
+        for (const track of incomingTracks) {
+            if (!track || track.readyState === 'ended') continue;
+            if (existingTrackIds.has(track.id)) continue;
+            try {
+                existingStream.addTrack(track);
+                existingTrackIds.add(track.id);
+            } catch { }
+        }
+
+        if (preferredTrack && preferredTrack.readyState !== 'ended' && !existingTrackIds.has(preferredTrack.id)) {
+            try {
+                existingStream.addTrack(preferredTrack);
+            } catch { }
+        }
+
+        return this.normalizeRemotePlaybackStream(existingStream, feedId, preferredTrack);
+    },
+
     normalizeVideoCodec(codec) {
         const normalized = (codec || 'h264').toString().trim().toLowerCase();
         if (normalized === 'auto') return 'h264';
@@ -1022,6 +1289,50 @@ window.webrtcManager = {
         }
     },
 
+    getAudioMlineInfoFromSdp(sdp) {
+        const mids = new Set();
+        if (!sdp) return { mids };
+        const lines = sdp.split(/\r?\n/);
+        let currentKind = '';
+        for (const line of lines) {
+            if (!line) continue;
+            if (line.startsWith('m=')) {
+                currentKind = line.startsWith('m=audio ') ? 'audio' : (line.startsWith('m=video ') ? 'video' : '');
+                continue;
+            }
+            if (currentKind !== 'audio') continue;
+            const midMatch = /^a=mid:([^\s]+)/i.exec(line);
+            if (midMatch?.[1]) {
+                mids.add(midMatch[1].trim());
+            }
+        }
+        return { mids };
+    },
+
+    enforceSubscriberVideoOnlyTransceivers(pc, remoteSdp, scope) {
+        if (!pc || typeof pc.getTransceivers !== 'function') return;
+        const audioInfo = this.getAudioMlineInfoFromSdp(remoteSdp);
+        const transceivers = pc.getTransceivers() || [];
+        let changed = 0;
+        for (let i = 0; i < transceivers.length; i++) {
+            const transceiver = transceivers[i];
+            if (!transceiver) continue;
+            const receiverKind = (transceiver.receiver?.track?.kind || '').toString().toLowerCase();
+            const mid = (transceiver.mid || '').toString().trim();
+            const isAudio = receiverKind === 'audio' || (mid && audioInfo.mids.has(mid));
+            if (!isAudio) continue;
+            try {
+                if (transceiver.direction !== 'inactive') {
+                    transceiver.direction = 'inactive';
+                    changed++;
+                }
+            } catch (err) {
+                this.log('subscribe', `${scope}: failed to set audio transceiver inactive (mid=${mid || 'n/a'}, idx=${i}): ${err.message}`);
+            }
+        }
+        this.log('subscribe', `${scope}: video-only transceiver gate changed=${changed}/${transceivers.length}, audioMids=[${Array.from(audioInfo.mids).join(',')}]`);
+    },
+
     tryResumeRemoteVideo(vid, feedId, reason) {
         if (!vid) return;
 
@@ -1086,6 +1397,7 @@ window.webrtcManager = {
 
     normalizeSubscribeStreams(streamsHint, fallbackFeedId) {
         const out = [];
+        const dedupe = new Set();
         const feedNum = Number(fallbackFeedId);
         if (Array.isArray(streamsHint)) {
             for (const s of streamsHint) {
@@ -1098,8 +1410,17 @@ window.webrtcManager = {
                 if (!Number.isFinite(feed)) continue;
 
                 const entry = { feed };
-                const mid = (s.mid || '').toString().trim();
+                const mid = (s.feed_mid ?? s.feedMid ?? s.publisher_mid ?? s.publisherMid ?? s.mid ?? '')
+                    .toString()
+                    .trim();
                 if (mid) entry.mid = mid;
+                const type = (s.type ?? '').toString().trim().toLowerCase();
+                if (type === 'audio' || type === 'video') {
+                    entry.type = type;
+                }
+                const key = `${entry.feed}:${entry.mid || ''}:${entry.type || ''}`;
+                if (dedupe.has(key)) continue;
+                dedupe.add(key);
                 out.push(entry);
             }
         }
@@ -1107,6 +1428,58 @@ window.webrtcManager = {
         if (out.length > 0) return out;
         if (Number.isFinite(feedNum)) return [{ feed: feedNum }];
         return [];
+    },
+
+    isAudioSubscribeStream(streamInfo) {
+        if (!streamInfo || typeof streamInfo !== 'object') return false;
+        const type = (streamInfo.type || '').toString().trim().toLowerCase();
+        if (type === 'audio') return true;
+
+        const mid = (streamInfo.mid || '').toString().trim().toLowerCase();
+        if (!mid) return false;
+        if (mid.startsWith('a')) return true;
+        if (mid === 'audio') return true;
+        return false;
+    },
+
+    filterVideoOnlySubscribeStreams(streams) {
+        if (!Array.isArray(streams)) return [];
+        return streams.filter(s => !this.isAudioSubscribeStream(s));
+    },
+
+    selectVideoPreferredSubscribeStreams(streams, fallbackFeedId) {
+        const normalized = this.normalizeSubscribeStreams(streams, fallbackFeedId);
+        if (normalized.length === 0) {
+            const feedNum = Number(fallbackFeedId);
+            return Number.isFinite(feedNum) ? [{ feed: feedNum }] : [];
+        }
+
+        const explicitVideo = normalized.filter(streamInfo => {
+            if (!streamInfo || typeof streamInfo !== 'object') return false;
+            const type = (streamInfo.type || '').toString().trim().toLowerCase();
+            if (type === 'video') return true;
+            const mid = (streamInfo.mid || '').toString().trim().toLowerCase();
+            return mid === 'video' || mid.startsWith('v');
+        });
+        if (explicitVideo.length > 0) {
+            return explicitVideo;
+        }
+
+        const nonAudio = normalized.filter(streamInfo => !this.isAudioSubscribeStream(streamInfo));
+        if (nonAudio.length === 1) {
+            return nonAudio;
+        }
+        if (nonAudio.length > 1) {
+            const withMid = nonAudio.filter(streamInfo => ((streamInfo?.mid || '').toString().trim().length > 0));
+            if (withMid.length === 1) {
+                return withMid;
+            }
+            return [nonAudio[0]];
+        }
+
+        // Janus occasionally omits or mislabels stream type metadata. For native-screen
+        // feeds we still force a single stream request to avoid drifting into audio-only.
+        return [normalized[0]];
     },
 
     findPendingSubscribeByFeed(feedId) {
@@ -1123,8 +1496,10 @@ window.webrtcManager = {
 
     updatePublisherStreamHint(feedId, streams) {
         const key = String(feedId);
+        const previous = this.publisherStreamHints[key] || {};
         const normalized = this.normalizeSubscribeStreams(streams, feedId);
-        let hasVideo = false;
+        let hasVideo = !!previous.hasVideo;
+        let hasAudio = !!previous.hasAudio;
         if (Array.isArray(streams)) {
             hasVideo = streams.some(s =>
                 s
@@ -1132,8 +1507,19 @@ window.webrtcManager = {
                 && s.disabled !== true
                 && s.active !== false
                 && s.send !== false);
+            hasAudio = streams.some(s =>
+                s
+                && s.type === 'audio'
+                && s.disabled !== true
+                && s.active !== false
+                && s.send !== false);
         }
-        this.publisherStreamHints[key] = { streams: normalized, raw: Array.isArray(streams) ? streams : [], hasVideo };
+        this.publisherStreamHints[key] = {
+            streams: normalized,
+            raw: Array.isArray(streams) ? streams : [],
+            hasVideo,
+            hasAudio
+        };
     },
 
     hasIncomingVideoTrack(pc) {
@@ -1141,9 +1527,17 @@ window.webrtcManager = {
         return pc.getReceivers().some(r => r?.track?.kind === 'video' && r.track.readyState === 'live');
     },
 
-    scheduleExistingSubscriberRefresh(feedId, delayMs, reason) {
+    hasIncomingAudioTrack(pc) {
+        if (!pc || typeof pc.getReceivers !== 'function') return false;
+        return pc.getReceivers().some(r => r?.track?.kind === 'audio' && r.track.readyState === 'live');
+    },
+
+    scheduleExistingSubscriberRefresh(feedId, delayMs, reason, options = null) {
         const feed = this.feeds[feedId];
         if (!feed?.handleId) return;
+        if (feed.preferVideoOnly === true && options?.requireVideo !== true) {
+            return;
+        }
 
         const delay = Math.max(0, parseInt(delayMs, 10) || 0);
         const now = Date.now();
@@ -1151,21 +1545,40 @@ window.webrtcManager = {
         feed.nextRefreshAt = now + delay + 400;
 
         setTimeout(() => {
-            this.requestExistingSubscriberRefresh(feedId, reason).catch(() => { });
+            this.requestExistingSubscriberRefresh(feedId, reason, options).catch(() => { });
         }, delay);
     },
 
-    async requestExistingSubscriberRefresh(feedId, reason) {
+    async requestExistingSubscriberRefresh(feedId, reason, options = null) {
         const feed = this.feeds[feedId];
         if (!feed?.handleId) return;
         if (!feed.pc) return;
-        if (this.hasIncomingVideoTrack(feed.pc)) return;
+        const preferVideoOnly = feed.preferVideoOnly === true;
+        const requireAudio = options?.requireAudio === true;
+        const requireVideo = options?.requireVideo === true;
+        const force = options?.force === true;
+        const shouldCheckAudio = requireAudio || (!requireAudio && !requireVideo);
+        const shouldCheckVideo = requireVideo || (!requireAudio && !requireVideo);
+
+        const missingAudio = shouldCheckAudio && !this.hasIncomingAudioTrack(feed.pc);
+        const missingVideo = shouldCheckVideo && !this.hasIncomingVideoTrack(feed.pc);
+        if (!missingAudio && !missingVideo) return;
+        if (preferVideoOnly && missingAudio && !missingVideo) return;
 
         const hint = this.publisherStreamHints[String(feedId)];
-        if (!hint?.hasVideo) return;
+        if (!force) {
+            if (missingVideo && !hint?.hasVideo) return;
+            if (missingAudio && hint && hint.hasAudio === false) return;
+        }
 
-        const streams = this.normalizeSubscribeStreams(hint.streams, feedId);
-        this.log('subscribe', `Requesting subscriber refresh for feed ${feedId} (handle ${feed.handleId}), reason=${reason}`);
+        let streams = this.normalizeSubscribeStreams(hint.streams, feedId);
+        if (preferVideoOnly) {
+            streams = this.selectVideoPreferredSubscribeStreams(streams, feedId);
+        }
+        this.log(
+            'subscribe',
+            `Requesting subscriber refresh for feed ${feedId} (handle ${feed.handleId}), reason=${reason}, missingAudio=${missingAudio}, missingVideo=${missingVideo}`
+        );
 
         const result = await this.apiPost(
             `/api/janus/session/${this.janusSessionId}/handle/${feed.handleId}/message-nowait`,
@@ -1173,7 +1586,7 @@ window.webrtcManager = {
                 body: {
                     request: 'subscribe',
                     streams,
-                    offer_audio: true,
+                    offer_audio: !preferVideoOnly,
                     offer_video: true,
                     offer_data: false
                 }
@@ -1196,8 +1609,14 @@ window.webrtcManager = {
         return this.participantDirectory[key] || '';
     },
 
+    getParticipantAvatarUrl(userId) {
+        const key = this.normalizeUserId(userId);
+        if (!key) return '';
+        return this.participantAvatarDirectory[key] || '';
+    },
+
     parsePublisherDisplay(display) {
-        const fallback = { userId: '', displayName: '' };
+        const fallback = { userId: '', displayName: '', role: '' };
         if (!display || typeof display !== 'string') return fallback;
 
         const trimmed = display.trim();
@@ -1208,7 +1627,8 @@ window.webrtcManager = {
                 const parsed = JSON.parse(trimmed);
                 return {
                     userId: (parsed.userId || '').toString(),
-                    displayName: (parsed.displayName || parsed.name || '').toString()
+                    displayName: (parsed.displayName || parsed.name || '').toString(),
+                    role: (parsed.role || '').toString().trim().toLowerCase()
                 };
             } catch {
                 // Fall through to legacy parsing.
@@ -1217,22 +1637,132 @@ window.webrtcManager = {
 
         // Legacy mode: plain display string was either a GUID or a raw label.
         if (/^[0-9a-fA-F-]{20,}$/.test(trimmed)) {
-            return { userId: trimmed, displayName: '' };
+            return { userId: trimmed, displayName: '', role: '' };
         }
 
-        return { userId: '', displayName: trimmed };
+        return { userId: '', displayName: trimmed, role: '' };
     },
 
-    buildPublisherDisplay() {
+    getDisplayIdentityKey(display) {
+        const parsed = this.parsePublisherDisplay(display);
+        if (parsed.userId) {
+            const normalizedUser = this.normalizeUserId(parsed.userId);
+            if (normalizedUser) return `uid:${normalizedUser}`;
+        }
+        if (parsed.displayName) {
+            const normalizedDisplay = parsed.displayName.trim().toLowerCase();
+            if (normalizedDisplay) return `name:${normalizedDisplay}`;
+        }
+        const normalizedRaw = (display || '').toString().trim().toLowerCase();
+        return normalizedRaw ? `raw:${normalizedRaw}` : '';
+    },
+
+    getDisplayRole(display) {
+        const parsed = this.parsePublisherDisplay(display);
+        return (parsed.role || '').toString().trim().toLowerCase();
+    },
+
+    collapsePublisherCandidates(publishers) {
+        if (!Array.isArray(publishers) || publishers.length <= 1) {
+            return Array.isArray(publishers) ? publishers : [];
+        }
+
+        const deduped = [];
+        const seenNativeScreen = new Set();
+        for (let i = publishers.length - 1; i >= 0; i--) {
+            const pub = publishers[i];
+            if (!pub) continue;
+
+            const role = this.getDisplayRole(pub.display);
+            const identityKey = this.getDisplayIdentityKey(pub.display);
+            if (role === 'native-screen' && identityKey) {
+                const dedupeKey = `${role}:${identityKey}`;
+                if (seenNativeScreen.has(dedupeKey)) continue;
+                seenNativeScreen.add(dedupeKey);
+            }
+
+            deduped.push(pub);
+        }
+
+        deduped.reverse();
+        return deduped;
+    },
+
+    replaceDuplicateNativeScreenFeeds(targetFeedId, display) {
+        if (this.getDisplayRole(display) !== 'native-screen') return;
+        const identityKey = this.getDisplayIdentityKey(display);
+        if (!identityKey) return;
+
+        const targetKey = String(targetFeedId);
+
+        for (const existingFeedId of Object.keys(this.feeds || {})) {
+            const existingKey = String(existingFeedId);
+            if (existingKey === targetKey) continue;
+            const existingFeed = this.feeds[existingKey];
+            if (!existingFeed) continue;
+            if (this.getDisplayRole(existingFeed.display) !== 'native-screen') continue;
+            if (this.getFeedIdentityKey(existingKey) !== identityKey) continue;
+
+            this.log('subscribe', `Replacing duplicate native-screen feed ${existingKey} with ${targetKey} for ${identityKey}`);
+            this.removeFeed(existingKey);
+        }
+
+        for (const pendingFeedKey of Object.keys(this.pendingSubscribeFeeds || {})) {
+            const pendingKey = String(pendingFeedKey);
+            if (pendingKey === targetKey) continue;
+            const pending = this.pendingSubscribeFeeds[pendingKey];
+            if (!pending) continue;
+            if (this.getDisplayRole(pending.display) !== 'native-screen') continue;
+            if (this.getDisplayIdentityKey(pending.display) !== identityKey) continue;
+
+            delete this.pendingSubscribeFeeds[pendingKey];
+            this.log('subscribe', `Dropped duplicate pending native-screen subscribe feed ${pendingKey} in favor of ${targetKey}`);
+        }
+
+        for (const [handleId, pending] of Object.entries(this.pendingSubscribes || {})) {
+            if (!pending) continue;
+            if (String(pending.feedId) === targetKey) continue;
+            if (this.getDisplayRole(pending.display) !== 'native-screen') continue;
+            if (this.getDisplayIdentityKey(pending.display) !== identityKey) continue;
+
+            delete this.pendingSubscribes[handleId];
+            this.log('subscribe', `Dropped duplicate pending native-screen handle ${handleId} (feed ${pending.feedId}) in favor of ${targetKey}`);
+        }
+    },
+
+    buildPublisherDisplay(role = '') {
         const userId = (this.userId || '').toString();
         const displayName = (this.userDisplayName || userId || 'Unknown').toString();
+        const normalizedRole = (role || '').toString().trim().toLowerCase();
+        if (normalizedRole) {
+            return JSON.stringify({ userId, displayName, role: normalizedRole });
+        }
         return JSON.stringify({ userId, displayName });
     },
 
     isSelfPublisherDisplay(display) {
         const parsed = this.parsePublisherDisplay(display);
-        if (parsed.userId && this.userId && this.normalizeUserId(parsed.userId) === this.normalizeUserId(this.userId)) return true;
+        if (parsed.userId && this.userId && this.normalizeUserId(parsed.userId) === this.normalizeUserId(this.userId)) {
+            const role = (parsed.role || '').toString().trim().toLowerCase();
+            if (role === 'native-screen') {
+                // Allow self-subscribe for native Windows screen publisher preview.
+                return false;
+            }
+            return true;
+        }
         return display === this.userId;
+    },
+
+    isSelfNativeScreenDisplay(display) {
+        const parsed = this.parsePublisherDisplay(display);
+        if (!parsed.userId || !this.userId) return false;
+        return this.normalizeUserId(parsed.userId) === this.normalizeUserId(this.userId)
+            && (parsed.role || '').toString().trim().toLowerCase() === 'native-screen';
+    },
+
+    isNativeScreenDisplay(display) {
+        const parsed = this.parsePublisherDisplay(display);
+        return (parsed.role || '').toString().trim().toLowerCase() === 'native-screen';
     },
 
     maybeNotifyRemoteParticipant(display) {
@@ -1254,6 +1784,29 @@ window.webrtcManager = {
         }
         this.participantDirectory = next;
         this.refreshRemoteFeedLabels();
+        this.refreshRemoteFeedAvatarFallbacks();
+        this.updateLocalFeedAvatarFallback();
+    },
+
+    updateParticipantAvatarDirectory(directory) {
+        const next = {};
+        if (directory && typeof directory === 'object') {
+            for (const [userId, avatarUrl] of Object.entries(directory)) {
+                const key = this.normalizeUserId(userId);
+                const value = (avatarUrl || '').toString().trim();
+                if (!key || !value) continue;
+                next[key] = value;
+            }
+        }
+
+        this.participantAvatarDirectory = next;
+        this.refreshRemoteFeedAvatarFallbacks();
+        this.updateLocalFeedAvatarFallback();
+    },
+
+    applyParticipantProfiles(participantDirectory, participantAvatarDirectory) {
+        this.updateParticipantDirectory(participantDirectory || {});
+        this.updateParticipantAvatarDirectory(participantAvatarDirectory || {});
     },
 
     refreshRemoteFeedLabels() {
@@ -1265,6 +1818,68 @@ window.webrtcManager = {
             const feedId = cell.dataset.feedId || (cell.id || '').replace('remote-', '');
             label.textContent = this.getRemoteFeedDisplayName(feedId, display);
         });
+    },
+
+    refreshRemoteFeedAvatarFallbacks() {
+        const cells = document.querySelectorAll('.video-cell[id^="remote-"]');
+        cells.forEach(cell => {
+            const feedId = cell.dataset.feedId || (cell.id || '').replace('remote-', '');
+            const display = cell.dataset.display || '';
+            this.ensureRemoteFeedAvatarFallback(cell, feedId, display);
+        });
+    },
+
+    clearCellOverlayHideTimer(cell) {
+        if (!cell) return;
+        const timer = this.controlOverlayHideTimers.get(cell);
+        if (timer) {
+            clearTimeout(timer);
+            this.controlOverlayHideTimers.delete(cell);
+        }
+    },
+
+    showCellOverlayControls(cell, scheduleAutoHide = true) {
+        if (!cell) return;
+        cell.classList.add('controls-visible');
+        if (scheduleAutoHide) {
+            this.scheduleCellOverlayHide(cell);
+        }
+    },
+
+    scheduleCellOverlayHide(cell, delayMs = 5000) {
+        if (!cell) return;
+        this.clearCellOverlayHideTimer(cell);
+        const hideDelay = Math.max(400, parseInt(delayMs, 10) || 5000);
+        const timer = setTimeout(() => {
+            this.controlOverlayHideTimers.delete(cell);
+            if (!cell.isConnected) return;
+            const activeElement = document.activeElement;
+            if (activeElement && cell.contains(activeElement)) return;
+            cell.classList.remove('controls-visible');
+        }, hideDelay);
+        this.controlOverlayHideTimers.set(cell, timer);
+    },
+
+    bindCellOverlayAutoHide(cell) {
+        if (!cell || cell.dataset.overlayAutoHideBound === '1') return;
+
+        const reveal = () => this.showCellOverlayControls(cell, true);
+        const hideNow = () => {
+            this.clearCellOverlayHideTimer(cell);
+            cell.classList.remove('controls-visible');
+        };
+
+        cell.addEventListener('mouseenter', reveal);
+        cell.addEventListener('mousemove', reveal);
+        cell.addEventListener('pointermove', reveal);
+        cell.addEventListener('pointerdown', reveal);
+        cell.addEventListener('touchstart', reveal, { passive: true });
+        cell.addEventListener('focusin', () => this.showCellOverlayControls(cell, false));
+        cell.addEventListener('focusout', () => this.scheduleCellOverlayHide(cell, 1500));
+        cell.addEventListener('mouseleave', hideNow);
+
+        cell.dataset.overlayAutoHideBound = '1';
+        this.showCellOverlayControls(cell, true);
     },
 
     bindSpotlightInteraction(cell, streamKey, allowTileClick = true) {
@@ -1363,6 +1978,134 @@ window.webrtcManager = {
         });
     },
 
+    getDisplayInitial(displayName, fallback = '?') {
+        const normalized = (displayName || '').toString().trim();
+        if (!normalized) return fallback;
+        return normalized[0].toUpperCase();
+    },
+
+    localHasVisibleVideoTrack() {
+        const activeStream = this.isScreenSharing && this.screenStream ? this.screenStream : this.localStream;
+        if (!activeStream) return false;
+
+        const hasLiveVideo = activeStream.getVideoTracks().some(track =>
+            track && track.readyState === 'live' && track.enabled !== false
+        );
+
+        if (!hasLiveVideo) return false;
+        if (!this.isScreenSharing && this.isCameraOff) return false;
+        return true;
+    },
+
+    ensureLocalFeedAvatarFallback() {
+        const cell = document.querySelector('#videoGrid .local-cell');
+        if (!cell) return null;
+
+        let fallback = cell.querySelector('.video-avatar-fallback.local-avatar-fallback');
+        if (!fallback) {
+            fallback = document.createElement('div');
+            fallback.className = 'video-avatar-fallback local-avatar-fallback';
+
+            const avatarImage = document.createElement('img');
+            avatarImage.className = 'video-avatar-image';
+            avatarImage.alt = 'Local profile picture';
+            avatarImage.decoding = 'async';
+            avatarImage.loading = 'lazy';
+
+            const avatarInitial = document.createElement('span');
+            avatarInitial.className = 'video-avatar-initial';
+
+            fallback.append(avatarImage, avatarInitial);
+            cell.appendChild(fallback);
+        }
+
+        const avatarImage = fallback.querySelector('.video-avatar-image');
+        const avatarInitial = fallback.querySelector('.video-avatar-initial');
+        const avatarUrl = this.getParticipantAvatarUrl(this.userId || '');
+        const displayName = (this.userDisplayName || this.getParticipantDisplayName(this.userId || '') || 'You').toString();
+
+        if (avatarImage) {
+            if (avatarUrl) {
+                avatarImage.src = avatarUrl;
+                avatarImage.hidden = false;
+            } else {
+                avatarImage.hidden = true;
+                avatarImage.removeAttribute('src');
+            }
+        }
+
+        if (avatarInitial) {
+            avatarInitial.textContent = this.getDisplayInitial(displayName, 'Y');
+            avatarInitial.hidden = !!avatarUrl;
+        }
+
+        return fallback;
+    },
+
+    updateLocalFeedAvatarFallback() {
+        const cell = document.querySelector('#videoGrid .local-cell');
+        if (!cell) return;
+
+        const fallback = this.ensureLocalFeedAvatarFallback();
+        if (!fallback) return;
+
+        const hasVideo = this.localHasVisibleVideoTrack();
+        fallback.classList.toggle('visible', !hasVideo);
+        cell.classList.toggle('video-cell-no-video', !hasVideo);
+    },
+
+    ensureRemoteFeedAvatarFallback(cell, feedId, display) {
+        if (!cell) return null;
+
+        let fallback = cell.querySelector('.video-avatar-fallback.remote-avatar-fallback');
+        if (!fallback) {
+            fallback = document.createElement('div');
+            fallback.className = 'video-avatar-fallback remote-avatar-fallback';
+
+            const avatarImage = document.createElement('img');
+            avatarImage.className = 'video-avatar-image';
+            avatarImage.alt = 'Participant profile picture';
+            avatarImage.decoding = 'async';
+            avatarImage.loading = 'lazy';
+
+            const avatarInitial = document.createElement('span');
+            avatarInitial.className = 'video-avatar-initial';
+
+            fallback.append(avatarImage, avatarInitial);
+            cell.appendChild(fallback);
+        }
+
+        const parsed = this.parsePublisherDisplay((display || '').toString());
+        const userId = this.normalizeUserId(parsed.userId || '');
+        const displayName = this.getRemoteFeedDisplayName(feedId, display);
+        const avatarUrl = userId ? this.getParticipantAvatarUrl(userId) : '';
+
+        const avatarImage = fallback.querySelector('.video-avatar-image');
+        const avatarInitial = fallback.querySelector('.video-avatar-initial');
+
+        if (avatarImage) {
+            if (avatarUrl) {
+                avatarImage.src = avatarUrl;
+                avatarImage.hidden = false;
+            } else {
+                avatarImage.hidden = true;
+                avatarImage.removeAttribute('src');
+            }
+        }
+
+        if (avatarInitial) {
+            avatarInitial.textContent = this.getDisplayInitial(displayName, '?');
+            avatarInitial.hidden = !!avatarUrl;
+        }
+
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        const feed = normalizedFeedId ? this.feeds[normalizedFeedId] : null;
+        const hasVideo = this.feedHasLiveTrack(feed, 'video');
+        fallback.classList.toggle('visible', !hasVideo);
+        cell.classList.toggle('video-cell-no-video', !hasVideo);
+        return fallback;
+    },
+
     ensureLocalFeedCellControls() {
         const cell = document.querySelector('#videoGrid .local-cell');
         if (!cell) return;
@@ -1370,6 +2113,7 @@ window.webrtcManager = {
         // Local stream should stay in the side list by default; only the explicit
         // Center button can promote it to spotlight.
         this.bindSpotlightInteraction(cell, 'local', false);
+        this.bindCellOverlayAutoHide(cell);
 
         let controls = cell.querySelector('.video-controls');
         if (!controls) {
@@ -1397,6 +2141,7 @@ window.webrtcManager = {
             cell.appendChild(infoPanel);
         }
 
+        this.updateLocalFeedAvatarFallback();
         this.applySpotlightLayout();
     },
 
@@ -2233,7 +2978,14 @@ window.webrtcManager = {
     },
 
     async updateParticipantNames(participantDirectory) {
-        this.updateParticipantDirectory(participantDirectory || {});
+        this.applyParticipantProfiles(participantDirectory || {}, this.participantAvatarDirectory || {});
+    },
+
+    async updateParticipantProfiles(participantDirectory, participantAvatarDirectory) {
+        this.applyParticipantProfiles(
+            participantDirectory || {},
+            participantAvatarDirectory || {}
+        );
     },
 
     async apiPost(path, body) {
@@ -2247,7 +2999,7 @@ window.webrtcManager = {
         });
         if (!resp.ok) {
             const text = await resp.text();
-            throw new Error(`POST ${path} â†’ ${resp.status}: ${text}`);
+            throw new Error(`POST ${path} → ${resp.status}: ${text}`);
         }
         // Some endpoints (keepalive, trickle) return 200 with empty body
         const text = await resp.text();
@@ -2261,7 +3013,7 @@ window.webrtcManager = {
         };
         if (signal) opts.signal = signal;
         const resp = await fetch(this.serverBaseUrl + path, opts);
-        if (!resp.ok) throw new Error(`GET ${path} â†’ ${resp.status}`);
+        if (!resp.ok) throw new Error(`GET ${path} → ${resp.status}`);
         const text = await resp.text();
         if (!text) return null;
         return JSON.parse(text);
@@ -2452,7 +3204,7 @@ window.webrtcManager = {
         }
     },
 
-    // â”€â”€â”€ Init â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Init ───────────────────────────────────────────────────────────────────
 
     async init(config) {
         this.janusSessionId = config.janusSessionId;
@@ -2462,10 +3214,14 @@ window.webrtcManager = {
         this.authToken = config.authToken;
         this.userId = config.userId;
         this.userDisplayName = config.userDisplayName || config.userId || '';
-        this.updateParticipantDirectory(config.participantDirectory || {});
+        this.applyParticipantProfiles(
+            config.participantDirectory || {},
+            config.participantAvatarDirectory || {}
+        );
         this.dotNetRef = config.dotNetRef;
         this.installHostMessageListener();
         this.ensureFullscreenSyncListener();
+        this.loadPersistedRemoteIdentityVolumes();
 
         if (config.iceServers) {
             try { this.iceServers = JSON.parse(config.iceServers); } catch { }
@@ -2474,18 +3230,25 @@ window.webrtcManager = {
         this.isMuted = true;
         this.isCameraOff = true;
         this.isScreenSharing = false;
+        this.screenAudioPublisherHandleId = 0;
+        this.screenAudioPublisherPc = null;
+        this.screenAudioPublisherConfigured = false;
+        this.screenAudioPublisherPendingCandidates = [];
         this.pendingSubscribes = {};
+        this.pendingSubscribeFeeds = {};
         this.publisherStreamHints = {};
         this.publisherConfigured = false;
         this.pendingJanusBitrateBps = 0;
         this.stopPublisherVideoPerformanceGuard();
         this.stopPublisherHealthWatchdog();
         this.clearScreenShareBitrateWarmupTimers();
+        this.controlOverlayHideTimers = new WeakMap();
 
         this.log('init', `session=${config.janusSessionId}, handle=${config.janusHandleId}, room=${config.janusRoomId}`);
         this.log('init', `serverBaseUrl=${config.serverBaseUrl}`);
+        this.enforceAndroidHardwareCodecPreference('init');
 
-        // Connectivity test â€” verify the server API is reachable
+        // Connectivity test — verify the server API is reachable
         try {
             await this.apiPost(
                 `/api/janus/session/${this.janusSessionId}/keepalive`, {});
@@ -2508,18 +3271,24 @@ window.webrtcManager = {
             // Publish uses the sync /message endpoint (polling hasn't started, no competition)
             const existingPublishers = await this.publishOwnFeed();
 
-            // Start polling FIRST â€” it will handle subscriber JSEP responses
+            // Start polling FIRST — it will handle subscriber JSEP responses
             this.startPolling();
             this.startKeepalive();
             this.startParticipantCheck();
+            this.startRemoteFeedHealthWatchdog();
 
             // Apply initial bitrate to publisher (deferred until configured if needed)
             await this.applyBitrate(this.currentConstraints.bitrateKbps);
 
             // Now initiate subscribes for any existing publishers (fire-and-forget)
             if (existingPublishers.length > 0) {
-                this.log('init', `Subscribing to ${existingPublishers.length} existing publisher(s)...`);
-                for (const pub of existingPublishers) {
+                const dedupedPublishers = this.collapsePublisherCandidates(existingPublishers);
+                this.log('init', `Subscribing to ${dedupedPublishers.length} existing publisher(s)...`);
+                for (const pub of dedupedPublishers) {
+                    if (this.isSelfPublisherDisplay(pub?.display)) {
+                        this.log('init', `Skip self existing publisher feed ${pub?.id} (${pub?.display || 'unknown'})`);
+                        continue;
+                    }
                     await this.initiateSubscribe(pub.id, pub.display, pub.streams);
                 }
             }
@@ -2528,7 +3297,7 @@ window.webrtcManager = {
         }
     },
 
-    // â”€â”€â”€ Media â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Media ──────────────────────────────────────────────────────────────────
 
     async startLocalStream(constraints) {
         if (this.localStream) {
@@ -2541,7 +3310,9 @@ window.webrtcManager = {
         }
         const c = this.currentConstraints;
         c.preferredVideoCodec = this.normalizeVideoCodec(c.preferredVideoCodec);
+        this.enforceAndroidHardwareCodecPreference('startLocalStream');
         c.screenShareAudioEnabled = c.screenShareAudioEnabled !== false;
+        c.screenShareAutoGainEnabled = c.screenShareAutoGainEnabled !== false;
         c.bitrateKbps = this.clampPublisherBitrateKbps(c.bitrateKbps);
 
         // Parse resolution
@@ -2645,6 +3416,7 @@ window.webrtcManager = {
                 playPromise.catch(err => this.log('media', `Local preview play() blocked: ${err.message}`));
             }
         }
+        this.updateLocalFeedAvatarFallback();
 
         // Ensure the local cell has controls/info panel after each re-render or stream refresh.
         this.ensureLocalFeedCellControls();
@@ -2654,7 +3426,12 @@ window.webrtcManager = {
 
         // Apply current mute/camera state
         this.localStream.getAudioTracks().forEach(t => t.enabled = !this.isMuted);
-        this.localStream.getVideoTracks().forEach(t => t.enabled = !this.isCameraOff);
+        if (this.isCameraOff) {
+            this.stopLocalCameraTracks('startLocalStream-camera-off');
+        } else {
+            this.localStream.getVideoTracks().forEach(t => t.enabled = true);
+        }
+        this.updateLocalFeedAvatarFallback();
     },
 
     setupAudioPipeline() {
@@ -2697,7 +3474,7 @@ window.webrtcManager = {
             }
         }
 
-        this.log('audio', 'Audio pipeline set up (gain â†’ MediaStreamDestination, no echo)');
+        this.log('audio', 'Audio pipeline set up (gain → MediaStreamDestination, no echo)');
     },
 
     async ensureAudioContextActive() {
@@ -2817,12 +3594,9 @@ window.webrtcManager = {
 
     async buildBaseOutgoingAudioTrack() {
         if (this.isScreenSharing) {
-            return await this.buildScreenShareOutgoingAudioTrack(
-                this.screenStream?.getAudioTracks?.()[0] || null,
-                this.localStream?.getAudioTracks?.()[0] || null
-            );
+            // During screen share, keep the primary publisher on microphone audio only.
+            return this.localStream?.getAudioTracks?.()[0] || null;
         }
-
         return this.localStream?.getAudioTracks?.()[0] || null;
     },
 
@@ -3027,9 +3801,23 @@ window.webrtcManager = {
         }
 
         const gain = context.createGain();
+        const limiter = context.createDynamicsCompressor();
         const destination = context.createMediaStreamDestination();
-        gain.connect(destination);
-        gain.gain.value = 1.0;
+        gain.connect(limiter);
+        limiter.connect(destination);
+        const autoGainEnabled = this.currentConstraints.screenShareAutoGainEnabled !== false;
+        const initialGain = autoGainEnabled
+            ? Math.max(
+                this.screenAudioFallbackMinGain,
+                Math.min(this.screenAudioFallbackMaxGain, Number(this.screenAudioFallbackAutoGain) || 1.0)
+            )
+            : 1.0;
+        gain.gain.value = initialGain;
+        limiter.threshold.value = -2;
+        limiter.knee.value = 0;
+        limiter.ratio.value = 20;
+        limiter.attack.value = 0.003;
+        limiter.release.value = 0.12;
 
         const track = destination.stream.getAudioTracks()[0];
         if (!track) {
@@ -3039,8 +3827,30 @@ window.webrtcManager = {
 
         this.screenAudioFallbackContext = context;
         this.screenAudioFallbackGain = gain;
+        this.screenAudioFallbackLimiter = limiter;
         this.screenAudioFallbackDestination = destination;
         this.screenAudioFallbackTrack = track;
+    },
+
+    applyWindowsScreenAudioFallbackGainMode(reason = 'settings') {
+        if (!this.screenAudioFallbackGain || !this.screenAudioFallbackContext) return;
+
+        const autoGainEnabled = this.currentConstraints.screenShareAutoGainEnabled !== false;
+        const minGain = Math.max(0.1, Number(this.screenAudioFallbackMinGain) || 1.0);
+        const maxGain = Math.max(minGain, Number(this.screenAudioFallbackMaxGain) || 4.5);
+        const targetGain = autoGainEnabled
+            ? Math.max(minGain, Math.min(maxGain, Number(this.screenAudioFallbackAutoGain) || 1.0))
+            : 1.0;
+
+        const now = this.screenAudioFallbackContext.currentTime;
+        try {
+            this.screenAudioFallbackGain.gain.cancelScheduledValues(now);
+            this.screenAudioFallbackGain.gain.setTargetAtTime(targetGain, now, 0.06);
+        } catch {
+            this.screenAudioFallbackGain.gain.value = targetGain;
+        }
+
+        this.log('screenshare', `Screen-share fallback auto gain ${autoGainEnabled ? 'enabled' : 'disabled'} (${reason})`);
     },
 
     decodeBase64ToBytes(base64Data) {
@@ -3050,6 +3860,58 @@ window.webrtcManager = {
             out[i] = raw.charCodeAt(i);
         }
         return out;
+    },
+
+    getInterleavedAudioStats(samples) {
+        if (!samples || samples.length === 0) return { rms: 0, peak: 0 };
+        let sumSquares = 0;
+        let peak = 0;
+        for (let i = 0; i < samples.length; i++) {
+            const value = samples[i];
+            const absValue = Math.abs(value);
+            if (absValue > peak) peak = absValue;
+            sumSquares += value * value;
+        }
+        const rms = Math.sqrt(sumSquares / samples.length);
+        return { rms, peak };
+    },
+
+    updateWindowsScreenAudioAutoGain(rms, peak) {
+        if (!this.screenAudioFallbackGain || !this.screenAudioFallbackContext) return;
+        if (this.currentConstraints.screenShareAutoGainEnabled === false) return;
+        if (!Number.isFinite(rms) || !Number.isFinite(peak)) return;
+        if (rms <= 0 || peak <= 0) return;
+
+        const noiseGateRms = Math.max(0, Number(this.screenAudioFallbackNoiseGateRms) || 0.002);
+        if (rms < noiseGateRms && peak < noiseGateRms * 3) {
+            return;
+        }
+
+        const minGain = Math.max(0.1, Number(this.screenAudioFallbackMinGain) || 1.0);
+        const maxGain = Math.max(minGain, Number(this.screenAudioFallbackMaxGain) || 4.5);
+        const targetRms = Math.max(0.005, Number(this.screenAudioFallbackTargetRms) || 0.11);
+        let desiredGain = targetRms / Math.max(rms, 0.0001);
+        desiredGain = Math.max(minGain, Math.min(maxGain, desiredGain));
+
+        if (peak * desiredGain > 0.98 && peak > 0.0001) {
+            desiredGain = Math.max(minGain, Math.min(maxGain, 0.98 / peak));
+        }
+
+        const previousGain = Math.max(minGain, Math.min(maxGain, Number(this.screenAudioFallbackAutoGain) || 1.0));
+        const smoothing = desiredGain >= previousGain ? 0.35 : 0.12;
+        const smoothedGain = previousGain + (desiredGain - previousGain) * smoothing;
+        const nextGain = Math.max(minGain, Math.min(maxGain, smoothedGain));
+
+        if (!Number.isFinite(nextGain)) return;
+        this.screenAudioFallbackAutoGain = nextGain;
+
+        const now = this.screenAudioFallbackContext.currentTime;
+        try {
+            this.screenAudioFallbackGain.gain.cancelScheduledValues(now);
+            this.screenAudioFallbackGain.gain.setTargetAtTime(nextGain, now, 0.06);
+        } catch {
+            this.screenAudioFallbackGain.gain.value = nextGain;
+        }
     },
 
     ingestWindowsScreenAudioChunk(chunk) {
@@ -3075,6 +3937,8 @@ window.webrtcManager = {
         }
 
         const interleaved = new Float32Array(rawBytes.buffer, rawBytes.byteOffset, frameCount * channels);
+        const stats = this.getInterleavedAudioStats(interleaved);
+        this.updateWindowsScreenAudioAutoGain(stats.rms, stats.peak);
         const buffer = this.screenAudioFallbackContext.createBuffer(channels, frameCount, sampleRate);
 
         for (let ch = 0; ch < channels; ch++) {
@@ -3112,6 +3976,8 @@ window.webrtcManager = {
         this.screenAudioFallbackTrack = null;
         this.screenAudioFallbackDestination = null;
         this.screenAudioFallbackGain = null;
+        this.screenAudioFallbackLimiter = null;
+        this.screenAudioFallbackAutoGain = 1.0;
 
         if (this.screenAudioFallbackContext) {
             try { await this.screenAudioFallbackContext.close(); } catch { }
@@ -3119,7 +3985,7 @@ window.webrtcManager = {
         this.screenAudioFallbackContext = null;
     },
 
-    // â”€â”€â”€ Publisher â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Publisher ──────────────────────────────────────────────────────────────
 
     /**
      * Publishes own feed to Janus. Uses the sync /message endpoint because
@@ -3131,17 +3997,22 @@ window.webrtcManager = {
         this.publisherPc = pc;
         this.publisherConfigured = false;
 
-        // Monitor publisher connection state â€” detect ICE/DTLS failures
+        // Monitor publisher connection state — detect ICE/DTLS failures
         pc.oniceconnectionstatechange = () => {
             const state = pc.iceConnectionState;
             this.log('publish', `ICE connection state: ${state}`);
             if (state === 'failed') {
-                this.logError('publish', 'Publisher ICE connection FAILED â€” Janus cannot receive our media');
+                this.logError('publish', 'Publisher ICE connection FAILED — Janus cannot receive our media');
                 this.notifyDotNet('OnPublisherConnectionFailed');
             } else if (state === 'disconnected') {
-                this.log('publish', 'Publisher ICE disconnected â€” may recover or fail');
+                this.log('publish', 'Publisher ICE disconnected — may recover or fail');
             } else if (state === 'connected' || state === 'completed') {
                 this.log('publish', 'Publisher ICE connected to Janus');
+                if (this.isAndroidWebRtcEnvironment()) {
+                    setTimeout(() => {
+                        this.checkVideoEncoder(pc).catch(() => { });
+                    }, 2500);
+                }
             }
         };
         pc.onconnectionstatechange = () => {
@@ -3157,17 +4028,17 @@ window.webrtcManager = {
             const hasVideo = stream.getVideoTracks().length > 0;
             if (!hasAudio) {
                 pc.addTransceiver('audio', { direction: 'recvonly' });
-                this.log('publish', 'No audio track â€” added recvonly audio transceiver');
+                this.log('publish', 'No audio track — added recvonly audio transceiver');
             }
             if (!hasVideo) {
                 pc.addTransceiver('video', { direction: 'recvonly' });
-                this.log('publish', 'No video track â€” added recvonly video transceiver');
+                this.log('publish', 'No video track — added recvonly video transceiver');
             }
         } else {
-            // No local media at all â€” add recvonly so Janus gets a valid SDP
+            // No local media at all — add recvonly so Janus gets a valid SDP
             pc.addTransceiver('audio', { direction: 'recvonly' });
             pc.addTransceiver('video', { direction: 'recvonly' });
-            this.log('publish', 'No local media â€” added recvonly transceivers');
+            this.log('publish', 'No local media — added recvonly transceivers');
         }
 
         // Buffer ICE candidates until after joinandconfigure completes
@@ -3194,7 +4065,7 @@ window.webrtcManager = {
         this.logCodecSummary(pc, 'publish-offer');
         this.log('publish', 'Created SDP offer, sending joinandconfigure...');
 
-        // Join as publisher with SDP offer (sync â€” polling not started yet)
+        // Join as publisher with SDP offer (sync — polling not started yet)
         let joinResult;
         const preferredJanusCodec = this.getJanusRequestedVideoCodec();
         let requestedJanusCodec = this.getJanusVideoCodecForSdp(offer.sdp, preferredJanusCodec);
@@ -3203,7 +4074,7 @@ window.webrtcManager = {
                 request: 'joinandconfigure',
                 room: this.janusRoomId,
                 ptype: 'publisher',
-                display: this.buildPublisherDisplay()
+                display: this.buildPublisherDisplay('primary')
             };
             if (videocodec) {
                 body.videocodec = videocodec;
@@ -3370,6 +4241,147 @@ window.webrtcManager = {
         return [];
     },
 
+    isScreenAudioPublisherHandle(handleId) {
+        return !!handleId && String(handleId) === String(this.screenAudioPublisherHandleId || '');
+    },
+
+    async ensureScreenAudioPublisher(screenAudioTrack) {
+        const liveTrack = (screenAudioTrack && screenAudioTrack.readyState === 'live') ? screenAudioTrack : null;
+        if (!liveTrack) {
+            await this.stopScreenAudioPublisher('no-screen-audio-track');
+            return false;
+        }
+        if (!this.janusSessionId || !this.janusRoomId) return false;
+
+        if (this.screenAudioPublisherPc && this.screenAudioPublisherHandleId) {
+            const sender = this.findSenderByKind(this.screenAudioPublisherPc, 'audio');
+            if (!sender) return false;
+            await sender.replaceTrack(liveTrack);
+            this.log('screenshare', 'Updated separate screen-audio publisher track');
+            return true;
+        }
+
+        let handleId = 0;
+        try {
+            const attachResult = await this.apiPost(
+                `/api/janus/session/${this.janusSessionId}/attach`, {});
+            handleId = attachResult?.handleId || 0;
+            if (!handleId) {
+                throw new Error('No screen-audio publisher handleId returned');
+            }
+        } catch (err) {
+            this.log('screenshare', `Unable to attach screen-audio publisher handle: ${err.message}`);
+            return false;
+        }
+
+        const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+        this.screenAudioPublisherHandleId = handleId;
+        this.screenAudioPublisherPc = pc;
+        this.screenAudioPublisherConfigured = false;
+        this.screenAudioPublisherPendingCandidates = [];
+
+        pc.oniceconnectionstatechange = () => {
+            this.log('screenshare', `Screen-audio publisher ICE state: ${pc.iceConnectionState}`);
+        };
+        pc.onconnectionstatechange = () => {
+            this.log('screenshare', `Screen-audio publisher PC state: ${pc.connectionState}`);
+        };
+
+        pc.onicecandidate = async ({ candidate }) => {
+            if (!this.screenAudioPublisherConfigured) {
+                this.screenAudioPublisherPendingCandidates.push(candidate);
+                return;
+            }
+            try {
+                await this.apiPost(
+                    `/api/janus/session/${this.janusSessionId}/handle/${this.screenAudioPublisherHandleId}/trickle`,
+                    candidate
+                );
+            } catch (err) {
+                this.log('screenshare', `Screen-audio trickle failed: ${err.message}`);
+            }
+        };
+
+        pc.addTrack(liveTrack, new MediaStream([liveTrack]));
+
+        try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            this.log('screenshare', 'Created screen-audio publisher offer, sending joinandconfigure...');
+
+            const joinResult = await this.apiPost(
+                `/api/janus/session/${this.janusSessionId}/handle/${this.screenAudioPublisherHandleId}/message-nowait`,
+                {
+                    body: {
+                        request: 'joinandconfigure',
+                        room: this.janusRoomId,
+                        ptype: 'publisher',
+                        display: this.buildPublisherDisplay('screen-audio')
+                    },
+                    jsep: { type: (offer?.type || 'offer'), sdp: offer.sdp }
+                }
+            );
+
+            if (joinResult?.janus === 'error') {
+                const janusError = joinResult?.error?.reason
+                    || joinResult?.plugindata?.data?.error
+                    || 'Janus returned error';
+                throw new Error(janusError);
+            }
+
+            this.screenAudioPublisherConfigured = true;
+
+            if (joinResult?.jsep) {
+                await pc.setRemoteDescription(new RTCSessionDescription(joinResult.jsep));
+                this.log('screenshare', 'Screen-audio publisher configured (joinandconfigure response)');
+            } else {
+                this.log('screenshare', 'Screen-audio publisher waiting for async JSEP via polling');
+            }
+
+            for (const buffered of this.screenAudioPublisherPendingCandidates) {
+                try {
+                    await this.apiPost(
+                        `/api/janus/session/${this.janusSessionId}/handle/${this.screenAudioPublisherHandleId}/trickle`,
+                        buffered
+                    );
+                } catch { }
+            }
+            this.screenAudioPublisherPendingCandidates = [];
+            return true;
+        } catch (err) {
+            this.log('screenshare', `Failed to start screen-audio publisher: ${err.message}`);
+            await this.stopScreenAudioPublisher('start-failed');
+            return false;
+        }
+    },
+
+    async stopScreenAudioPublisher(reason = '') {
+        const handleId = this.screenAudioPublisherHandleId;
+        const pc = this.screenAudioPublisherPc;
+        if (!handleId && !pc) return;
+
+        this.log('screenshare', `Stopping separate screen-audio publisher${reason ? ` (${reason})` : ''}`);
+
+        this.screenAudioPublisherConfigured = false;
+        this.screenAudioPublisherPendingCandidates = [];
+
+        if (this.janusSessionId && handleId) {
+            try {
+                await this.apiPost(
+                    `/api/janus/session/${this.janusSessionId}/handle/${handleId}/message-nowait`,
+                    { body: { request: 'unpublish' } }
+                );
+            } catch { }
+        }
+
+        if (pc) {
+            try { pc.close(); } catch { }
+        }
+
+        this.screenAudioPublisherPc = null;
+        this.screenAudioPublisherHandleId = 0;
+    },
+
     /**
      * Applies the desired bitrate to the publisher PeerConnection via
      * RTCRtpSender.setParameters() AND sends a Janus "configure" message
@@ -3423,7 +4435,7 @@ window.webrtcManager = {
      */
     async renegotiatePublisher(tag) {
         if (!this.publisherPc || !this.janusSessionId || !this.janusHandleId) {
-            this.log(tag, 'Cannot renegotiate â€” no publisher PC or Janus session');
+            this.log(tag, 'Cannot renegotiate — no publisher PC or Janus session');
             return;
         }
         try {
@@ -3444,122 +4456,168 @@ window.webrtcManager = {
                     jsep: { type: (offer?.type || 'offer'), sdp: offer.sdp }
                 }
             );
-            this.log(tag, 'Configure sent â€” waiting for JSEP answer via polling loop');
+            this.log(tag, 'Configure sent — waiting for JSEP answer via polling loop');
         } catch (err) {
             this.logError(tag, `Renegotiation failed: ${err.message}`);
         }
     },
 
-    // â”€â”€â”€ Subscriber (two-phase: initiate â†’ complete via polling) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Subscriber (two-phase: initiate → complete via polling) ────────────────
 
     /**
      * Phase 1: Attach a subscriber handle and send the join message
      * using the fire-and-forget endpoint (/message-nowait) so we do NOT
      * consume events from the Janus event queue.
-     * The JSEP offer will arrive via the polling loop â†’ completeSubscribe.
+     * The JSEP offer will arrive via the polling loop → completeSubscribe.
      */
     async initiateSubscribe(feedId, display, streamsHint) {
-        if (this.feeds[feedId]) return;
-        const alreadyPending = this.findPendingSubscribeByFeed(feedId);
-        if (alreadyPending) {
-            const mergedStreams = this.normalizeSubscribeStreams(streamsHint, feedId);
-            if (mergedStreams.length > 0) {
-                alreadyPending.pending.streams = mergedStreams;
-            }
-            if (display) {
-                alreadyPending.pending.display = display;
-            }
-            this.log('subscribe', `Skip duplicate subscribe for feed ${feedId}; already pending on handle ${alreadyPending.handleId}`);
-            return;
-        }
-        this.log('subscribe', `Initiating subscribe to feed ${feedId} (${display || 'unknown'})`);
-        this.maybeNotifyRemoteParticipant(display);
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        const feedKey = String(feedId);
+        const preferVideoOnly = this.isNativeScreenDisplay(display);
+        this.replaceDuplicateNativeScreenFeeds(feedId, display);
+        const incomingStreams = this.normalizeSubscribeStreams(streamsHint, feedId);
 
-        // Attach a dedicated handle for this subscriber (synchronous Janus op)
-        let subHandleId;
-        try {
-            const result = await this.apiPost(
-                `/api/janus/session/${this.janusSessionId}/attach`, {});
-            subHandleId = result?.handleId;
-            if (!subHandleId) throw new Error('No handleId returned');
-            this.log('subscribe', `Attached subscriber handle ${subHandleId} for feed ${feedId}`);
-        } catch (err) {
-            this.logError('subscribe', `Failed to attach subscriber handle for feed ${feedId}: ${err.message}`);
+        if (this.isRemoteFeedHidden(normalizedFeedId)) {
+            this.rememberHiddenRemoteFeedMeta(normalizedFeedId, display || '', incomingStreams);
+            this.log('subscribe', `Skip subscribe for hidden feed ${normalizedFeedId}`);
             return;
         }
 
-        // Track this pending subscribe so the polling loop can match the response
-        const normalizedStreams = this.normalizeSubscribeStreams(streamsHint, feedId);
-        this.pendingSubscribes[subHandleId] = {
-            feedId,
-            display,
-            createdAt: Date.now(),
-            subscribeRequested: false,
-            subscribeAttempts: 0,
-            lastSubscribeRequestAt: 0,
-            waitingForJsepUntil: 0,
-            streams: normalizedStreams
+        const inFlight = this.pendingSubscribeFeeds[feedKey];
+        if (inFlight) {
+            if (incomingStreams.length > 0) {
+                inFlight.streams = this.normalizeSubscribeStreams(
+                    [...(inFlight.streams || []), ...incomingStreams],
+                    feedId
+                );
+            }
+            if (display) inFlight.display = display;
+            this.log('subscribe', `Skip duplicate subscribe for feed ${feedId}; handle attach already in-flight`);
+            return;
+        }
+        this.pendingSubscribeFeeds[feedKey] = {
+            streams: incomingStreams,
+            display: display || '',
+            preferVideoOnly
         };
 
-        // Send join message via fire-and-forget (no event queue competition!)
         try {
-            const joinBody = {
-                request: 'join',
-                room: this.janusRoomId,
-                ptype: 'subscriber',
-                feed: feedId,
-                // Janus multistream expects selected streams; keep legacy feed for compatibility.
-                streams: normalizedStreams,
-                offer_audio: true,
-                offer_video: true,
-                offer_data: false
-            };
-            if (this.myPrivateId && this.myPrivateId > 0) {
-                joinBody.private_id = this.myPrivateId;
-            } else {
-                this.log('subscribe', `No private_id available yet for feed ${feedId}; sending subscriber join without private_id`);
-            }
-
-            const joinResult = await this.apiPost(
-                `/api/janus/session/${this.janusSessionId}/handle/${subHandleId}/message-nowait`,
-                {
-                    body: joinBody
-                }
-            );
-            this.log(
-                'subscribe',
-                `Subscriber join response for feed ${feedId} (handle ${subHandleId}): janus=${joinResult?.janus || 'n/a'}, videoroom=${joinResult?.plugindata?.data?.videoroom || 'n/a'}, hasJsep=${!!joinResult?.jsep}`
-            );
-
-            // Janus may return the subscriber offer inline instead of queueing it for poll.
-            if (joinResult?.jsep) {
-                this.log('subscribe', `Subscriber join returned immediate JSEP for feed ${feedId} (handle ${subHandleId})`);
-                await this.completeSubscribe(subHandleId, joinResult.jsep);
-                return;
-            }
-
-            const joinData = joinResult?.plugindata?.data;
-            if (joinData?.error || joinData?.error_code) {
-                delete this.pendingSubscribes[subHandleId];
-                this.logError(
-                    'subscribe',
-                    `Subscriber join failed for feed ${feedId} (handle ${subHandleId}): ${joinData.error || 'unknown'} (${joinData.error_code || 'n/a'})`
+            if (this.feeds[feedId]) return;
+            const alreadyPending = this.findPendingSubscribeByFeed(feedId);
+            if (alreadyPending) {
+                const mergedStreams = this.normalizeSubscribeStreams(
+                    [...(alreadyPending.pending.streams || []), ...(this.pendingSubscribeFeeds[feedKey]?.streams || incomingStreams)],
+                    feedId
                 );
+                if (mergedStreams.length > 0) {
+                    alreadyPending.pending.streams = mergedStreams;
+                }
+                if (display) {
+                    alreadyPending.pending.display = display;
+                }
+                this.log('subscribe', `Skip duplicate subscribe for feed ${feedId}; already pending on handle ${alreadyPending.handleId}`);
+                return;
+            }
+            this.log('subscribe', `Initiating subscribe to feed ${feedId} (${display || 'unknown'})`);
+            this.maybeNotifyRemoteParticipant(display);
+
+            // Attach a dedicated handle for this subscriber (synchronous Janus op)
+            let subHandleId;
+            try {
+                const result = await this.apiPost(
+                    `/api/janus/session/${this.janusSessionId}/attach`, {});
+                subHandleId = result?.handleId;
+                if (!subHandleId) throw new Error('No handleId returned');
+                this.log('subscribe', `Attached subscriber handle ${subHandleId} for feed ${feedId}`);
+            } catch (err) {
+                this.logError('subscribe', `Failed to attach subscriber handle for feed ${feedId}: ${err.message}`);
                 return;
             }
 
-            // Janus multistream can acknowledge join without an SDP offer.
-            // Give Janus a moment to emit attached+jsep; if it doesn't, nudge with subscribe.
-            const pending = this.pendingSubscribes[subHandleId];
-            if (pending) {
-                pending.waitingForJsepUntil = Date.now() + 2200;
+            // Track this pending subscribe so the polling loop can match the response
+            let normalizedStreams = this.normalizeSubscribeStreams(
+                this.pendingSubscribeFeeds[feedKey]?.streams || incomingStreams,
+                feedId
+            );
+            const effectivePreferVideoOnly = this.pendingSubscribeFeeds[feedKey]?.preferVideoOnly === true;
+            if (effectivePreferVideoOnly) {
+                normalizedStreams = this.selectVideoPreferredSubscribeStreams(normalizedStreams, feedId);
             }
-            this.schedulePendingSubscribeNudge(subHandleId, 2200, 'join-no-jsep-timeout');
+            const effectiveDisplay = display || this.pendingSubscribeFeeds[feedKey]?.display || '';
+            this.pendingSubscribes[subHandleId] = {
+                feedId,
+                display: effectiveDisplay,
+                preferVideoOnly: effectivePreferVideoOnly,
+                createdAt: Date.now(),
+                subscribeRequested: false,
+                subscribeAttempts: 0,
+                lastSubscribeRequestAt: 0,
+                waitingForJsepUntil: 0,
+                streams: normalizedStreams
+            };
 
-            this.log('subscribe', `Sent subscriber join for feed ${feedId} (handle ${subHandleId}), awaiting JSEP via poll...`);
-        } catch (err) {
-            delete this.pendingSubscribes[subHandleId];
-            this.logError('subscribe', `Subscriber join send failed for feed ${feedId}: ${err.message}`);
+            // Send join message via fire-and-forget (no event queue competition!)
+            try {
+                const joinBody = {
+                    request: 'join',
+                    room: this.janusRoomId,
+                    ptype: 'subscriber',
+                    feed: feedId,
+                    // Janus multistream expects selected streams; keep legacy feed for compatibility.
+                    streams: normalizedStreams,
+                    offer_audio: !effectivePreferVideoOnly,
+                    offer_video: true,
+                    offer_data: false
+                };
+                if (this.myPrivateId && this.myPrivateId > 0) {
+                    joinBody.private_id = this.myPrivateId;
+                } else {
+                    this.log('subscribe', `No private_id available yet for feed ${feedId}; sending subscriber join without private_id`);
+                }
+
+                const joinResult = await this.apiPost(
+                    `/api/janus/session/${this.janusSessionId}/handle/${subHandleId}/message-nowait`,
+                    {
+                        body: joinBody
+                    }
+                );
+                this.log(
+                    'subscribe',
+                    `Subscriber join response for feed ${feedId} (handle ${subHandleId}): janus=${joinResult?.janus || 'n/a'}, videoroom=${joinResult?.plugindata?.data?.videoroom || 'n/a'}, hasJsep=${!!joinResult?.jsep}`
+                );
+
+                // Janus may return the subscriber offer inline instead of queueing it for poll.
+                if (joinResult?.jsep) {
+                    this.log('subscribe', `Subscriber join returned immediate JSEP for feed ${feedId} (handle ${subHandleId})`);
+                    await this.completeSubscribe(subHandleId, joinResult.jsep);
+                    return;
+                }
+
+                const joinData = joinResult?.plugindata?.data;
+                if (joinData?.error || joinData?.error_code) {
+                    delete this.pendingSubscribes[subHandleId];
+                    this.logError(
+                        'subscribe',
+                        `Subscriber join failed for feed ${feedId} (handle ${subHandleId}): ${joinData.error || 'unknown'} (${joinData.error_code || 'n/a'})`
+                    );
+                    return;
+                }
+
+                // Janus multistream can acknowledge join without an SDP offer.
+                // Give Janus a moment to emit attached+jsep; if it doesn't, nudge with subscribe.
+                const pending = this.pendingSubscribes[subHandleId];
+                if (pending) {
+                    pending.waitingForJsepUntil = Date.now() + 2200;
+                }
+                this.schedulePendingSubscribeNudge(subHandleId, 2200, 'join-no-jsep-timeout');
+
+                this.log('subscribe', `Sent subscriber join for feed ${feedId} (handle ${subHandleId}), awaiting JSEP via poll...`);
+            } catch (err) {
+                delete this.pendingSubscribes[subHandleId];
+                this.logError('subscribe', `Subscriber join send failed for feed ${feedId}: ${err.message}`);
+            }
+        } finally {
+            delete this.pendingSubscribeFeeds[feedKey];
         }
     },
 
@@ -3567,6 +4625,7 @@ window.webrtcManager = {
         const pending = this.pendingSubscribes[subHandleId];
         if (!pending) return;
         const effectiveFeedId = pending.feedId || feedId;
+        const preferVideoOnly = pending.preferVideoOnly === true;
         const now = Date.now();
         if (now < (pending.waitingForJsepUntil || 0)) return;
         if (pending.subscribeRequested && (now - (pending.lastSubscribeRequestAt || 0)) < 1200) return;
@@ -3579,7 +4638,10 @@ window.webrtcManager = {
         pending.subscribeAttempts = (pending.subscribeAttempts || 0) + 1;
         pending.lastSubscribeRequestAt = now;
         pending.createdAt = now;
-        const streams = this.normalizeSubscribeStreams(pending.streams, effectiveFeedId);
+        let streams = this.normalizeSubscribeStreams(pending.streams, effectiveFeedId);
+        if (preferVideoOnly) {
+            streams = this.selectVideoPreferredSubscribeStreams(streams, effectiveFeedId);
+        }
         pending.streams = streams;
 
         try {
@@ -3590,7 +4652,7 @@ window.webrtcManager = {
                     body: {
                         request: 'subscribe',
                         streams,
-                        offer_audio: true,
+                        offer_audio: !preferVideoOnly,
                         offer_video: true,
                         offer_data: false
                     }
@@ -3636,18 +4698,37 @@ window.webrtcManager = {
         this.log('subscribe', `Completing subscribe for feed ${feedId} (handle ${subHandleId})`);
 
         const subPc = new RTCPeerConnection({ iceServers: this.iceServers });
-        this.feeds[feedId] = { handleId: subHandleId, pc: subPc, display, stream: null };
+        this.feeds[feedId] = {
+            handleId: subHandleId,
+            pc: subPc,
+            display,
+            stream: null,
+            preferVideoOnly: pending.preferVideoOnly === true
+        };
 
         // Monitor subscriber connection state
         subPc.oniceconnectionstatechange = () => {
             const state = subPc.iceConnectionState;
             this.log('subscribe', `Feed ${feedId} ICE state: ${state}`);
             if (state === 'failed') {
-                this.logError('subscribe', `Feed ${feedId} ICE FAILED â€” cannot receive their media`);
+                this.logError('subscribe', `Feed ${feedId} ICE FAILED — cannot receive their media`);
+                this.scheduleFeedHardRecovery(feedId, 'ice-failed', 250);
+            } else if (state === 'disconnected') {
+                this.scheduleFeedHardRecovery(feedId, 'ice-disconnected-timeout', 4500);
+            } else if (state === 'connected' || state === 'completed') {
+                this.cancelFeedHardRecovery(feedId);
             }
         };
         subPc.onconnectionstatechange = () => {
-            this.log('subscribe', `Feed ${feedId} PC state: ${subPc.connectionState}`);
+            const state = subPc.connectionState;
+            this.log('subscribe', `Feed ${feedId} PC state: ${state}`);
+            if (state === 'failed') {
+                this.scheduleFeedHardRecovery(feedId, 'pc-failed', 250);
+            } else if (state === 'disconnected') {
+                this.scheduleFeedHardRecovery(feedId, 'pc-disconnected-timeout', 4500);
+            } else if (state === 'connected') {
+                this.cancelFeedHardRecovery(feedId);
+            }
         };
 
         // Handle remote tracks
@@ -3657,12 +4738,18 @@ window.webrtcManager = {
             if (track?.kind === 'video') {
                 this.enforceVideoReceiverPlayoutDelay(subPc, `feed ${feedId}`);
             }
-            const streamForPlayback = this.normalizeRemotePlaybackStream(
-                streams[0] || this.feeds[feedId]?.stream || null,
+            const feedState = this.feeds[feedId];
+            const incomingPlaybackStream = this.normalizeRemotePlaybackStream(
+                streams[0] || null,
                 feedId,
                 track || null
             );
-            const feedState = this.feeds[feedId];
+            const streamForPlayback = this.mergeRemotePlaybackStreams(
+                feedState?.stream || null,
+                incomingPlaybackStream,
+                feedId,
+                track || null
+            );
             if (feedState) {
                 const now = Date.now();
                 feedState.lastTrackAt = now;
@@ -3670,16 +4757,21 @@ window.webrtcManager = {
                 if (track?.kind === 'video') feedState.lastVideoTrackAt = now;
                 feedState.display = display;
                 feedState.stream = streamForPlayback || feedState.stream || null;
+                const parsedDisplay = this.parsePublisherDisplay((display || '').toString());
 
-                const trackLabel = (track?.label || '').toString();
-                if (/(screen|share|window|display|monitor|present|slides|application)/i.test(trackLabel)) {
+                if (parsedDisplay.role === 'screen-audio' || parsedDisplay.role === 'native-screen') {
                     feedState.roleHint = 'stream';
                 } else {
-                    const identityKey = this.getFeedIdentityKey(feedId);
-                    if (!feedState.roleHint && identityKey) {
-                        const siblingFeeds = this.listIdentityFeeds(identityKey, false).filter(id => id !== String(feedId));
-                        if (siblingFeeds.length > 0 && track?.kind === 'video') {
-                            feedState.roleHint = 'stream';
+                    const trackLabel = (track?.label || '').toString();
+                    if (/(screen|share|window|display|monitor|present|slides|application)/i.test(trackLabel)) {
+                        feedState.roleHint = 'stream';
+                    } else {
+                        const identityKey = this.getFeedIdentityKey(feedId);
+                        if (!feedState.roleHint && identityKey) {
+                            const siblingFeeds = this.listIdentityFeeds(identityKey, false).filter(id => id !== String(feedId));
+                            if (siblingFeeds.length > 0 && track?.kind === 'video') {
+                                feedState.roleHint = 'stream';
+                            }
                         }
                     }
                 }
@@ -3688,12 +4780,20 @@ window.webrtcManager = {
             if (cell) {
                 const vid = cell.querySelector('video');
                 this.configureRemoteVideoElement(vid, feedId);
-                if (streamForPlayback) {
+                const currentPlaybackStream = vid?.srcObject || null;
+                const currentHasLiveVideo = !!currentPlaybackStream?.getVideoTracks?.().some(t => t && t.readyState === 'live');
+                const shouldReloadStream =
+                    !!streamForPlayback
+                    && (!currentPlaybackStream || currentPlaybackStream !== streamForPlayback)
+                    && (track?.kind === 'video' || !currentHasLiveVideo);
+                if (shouldReloadStream) {
                     vid.srcObject = streamForPlayback;
                     const playPromise = vid.play?.();
                     if (playPromise?.catch) {
                         playPromise.catch(err => this.log('subscribe', `Remote play() blocked for feed ${feedId}: ${err.message}`));
                     }
+                } else if (track?.kind === 'video') {
+                    this.tryResumeRemoteVideo(vid, feedId, 'video-track-arrived');
                 }
                 this.applyRemoteFeedVolume(feedId, vid);
             }
@@ -3714,17 +4814,31 @@ window.webrtcManager = {
         // Set Janus's offer and create answer
         await subPc.setRemoteDescription(new RTCSessionDescription(jsep));
         this.tunePeerReceiversPlayout(subPc, `feed ${feedId}`);
+        if (pending.preferVideoOnly === true) {
+            this.enforceSubscriberVideoOnlyTransceivers(subPc, jsep?.sdp || '', `feed ${feedId}`);
+        }
         const answer = await subPc.createAnswer();
         await subPc.setLocalDescription(answer);
         this.logCodecSummary(subPc, `subscribe-feed-${feedId}`);
+        const remoteAudioCodec = this.getCodecFromSdp(jsep?.sdp || '', 'audio');
         const remoteVideoCodec = this.getCodecFromSdp(jsep?.sdp || '', 'video');
         const hint = this.publisherStreamHints[String(feedId)];
+        const feedRole = this.getFeedRole(feedId);
+        const likelyMicFeed = feedRole !== 'stream';
+        const preferVideoOnly = pending.preferVideoOnly === true;
         if (remoteVideoCodec === 'none' && hint?.hasVideo) {
             this.log('subscribe', `Feed ${feedId} attached audio-only but publisher hints include video; scheduling subscriber refresh`);
-            this.scheduleExistingSubscriberRefresh(feedId, 1500, 'attached-audio-only');
+            this.scheduleExistingSubscriberRefresh(feedId, 1500, 'attached-audio-only', { requireVideo: true });
+        }
+        if (!preferVideoOnly && remoteAudioCodec === 'none' && (hint?.hasAudio || likelyMicFeed)) {
+            this.log('subscribe', `Feed ${feedId} attached without audio but publisher likely has audio; scheduling subscriber refresh`);
+            this.scheduleExistingSubscriberRefresh(feedId, 1200, 'attached-video-only', {
+                requireAudio: true,
+                force: !hint || hint.hasAudio !== true
+            });
         }
 
-        // Send "start" with answer â€” fire-and-forget (no event competition)
+        // Send "start" with answer — fire-and-forget (no event competition)
         try {
             await this.apiPost(
                 `/api/janus/session/${this.janusSessionId}/handle/${subHandleId}/message-nowait`,
@@ -3736,6 +4850,15 @@ window.webrtcManager = {
             this.log('subscribe', `Subscriber started for feed ${feedId}`);
         } catch (err) {
             this.logError('subscribe', `Subscriber start failed for feed ${feedId}: ${err.message}`);
+        }
+
+        // Recovery nudge for intermittent reconnect races where the mic m-line
+        // is missing from the first subscriber offer despite an audio publisher.
+        if (!preferVideoOnly && likelyMicFeed) {
+            this.scheduleExistingSubscriberRefresh(feedId, 2000, 'post-subscribe-audio-check', {
+                requireAudio: true,
+                force: true
+            });
         }
     },
 
@@ -3757,6 +4880,9 @@ window.webrtcManager = {
         try {
             await feed.pc.setRemoteDescription(new RTCSessionDescription(jsep));
             this.tunePeerReceiversPlayout(feed.pc, `feed ${feedId} renegotiate`);
+            if (feed.preferVideoOnly === true) {
+                this.enforceSubscriberVideoOnlyTransceivers(feed.pc, jsep?.sdp || '', `feed ${feedId} renegotiate`);
+            }
             const answer = await feed.pc.createAnswer();
             await feed.pc.setLocalDescription(answer);
             this.logCodecSummary(feed.pc, `subscribe-renegotiate-feed-${feedId}`);
@@ -3782,6 +4908,10 @@ window.webrtcManager = {
         const removedIdentityKey = this.getFeedIdentityKey(feedId);
         const feed = this.feeds[feedId];
         if (feed) {
+            if (feed.hardRecoveryTimer) {
+                clearTimeout(feed.hardRecoveryTimer);
+                feed.hardRecoveryTimer = null;
+            }
             feed.pc.close();
             delete this.pendingSubscribes[feed.handleId];
             delete this.feeds[feedId];
@@ -3793,8 +4923,11 @@ window.webrtcManager = {
             this.selectedSpotlightStreamKey = null;
         }
         delete this.remoteFeedVolumes[feedId];
+        delete this.hiddenRemoteFeeds[feedId];
+        delete this.hiddenRemoteFeedMeta[feedId];
         const el = document.getElementById('remote-' + feedId);
         if (el) {
+            this.clearCellOverlayHideTimer(el);
             const vid = el.querySelector('video');
             if (vid) {
                 this.detachRemoteFeedElementGain(vid);
@@ -3806,9 +4939,7 @@ window.webrtcManager = {
 
         if (removedIdentityKey) {
             const remainingIdentityFeeds = this.listIdentityFeeds(removedIdentityKey, false);
-            if (remainingIdentityFeeds.length === 0) {
-                delete this.remoteIdentityVolumes[removedIdentityKey];
-            } else {
+            if (remainingIdentityFeeds.length > 0) {
                 for (const remainingFeedId of remainingIdentityFeeds) {
                     const remainingCell = document.getElementById('remote-' + remainingFeedId);
                     if (remainingCell) {
@@ -3834,6 +4965,155 @@ window.webrtcManager = {
         this.log('subscribe', `Removed feed ${feedId}`);
     },
 
+    getNativeScreenFeedId(userId) {
+        const normalized = this.normalizeUserId(userId);
+        return `native-screen-${normalized || userId}`;
+    },
+
+    parseNativeScreenPayload(payload) {
+        if (!payload) return null;
+        if (typeof payload === 'object') return payload;
+        if (typeof payload !== 'string') return null;
+        try {
+            return JSON.parse(payload);
+        } catch {
+            return null;
+        }
+    },
+
+    sendNativeScreenSignal(targetUserId, signalType, payloadObj) {
+        try {
+            const payloadJson = JSON.stringify(payloadObj || {});
+            this.notifyDotNet('OnNativeScreenSignal', String(targetUserId || ''), String(signalType || ''), payloadJson);
+        } catch (err) {
+            this.logError('native-screen', `Failed to send native signal ${signalType}: ${err.message}`);
+        }
+    },
+
+    cleanupNativeScreenReceiver(userId, removeCell = true) {
+        const key = this.normalizeUserId(userId);
+        if (!key) return;
+
+        const existing = this.nativeScreenReceivers[key];
+        if (existing?.pc) {
+            try { existing.pc.onicecandidate = null; } catch { }
+            try { existing.pc.ontrack = null; } catch { }
+            try { existing.pc.close(); } catch { }
+        }
+        delete this.nativeScreenReceivers[key];
+        delete this.nativeScreenPendingCandidates[key];
+
+        if (removeCell) {
+            const feedId = this.getNativeScreenFeedId(key);
+            this.removeFeed(feedId);
+        }
+    },
+
+    async handleNativeScreenSignal(fromUserId, signalType, payload) {
+        const key = this.normalizeUserId(fromUserId);
+        if (!key) return;
+
+        const parsed = this.parseNativeScreenPayload(payload);
+        const normalizedType = (signalType || '').toString().trim().toLowerCase();
+
+        if (normalizedType === 'native-screen-stop') {
+            this.cleanupNativeScreenReceiver(key, true);
+            return;
+        }
+
+        if (normalizedType === 'native-screen-offer') {
+            const sdp = parsed?.sdp || parsed?.Sdp;
+            if (!sdp) return;
+
+            this.cleanupNativeScreenReceiver(key, true);
+
+            const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+            this.nativeScreenReceivers[key] = { pc, stream: null };
+
+            pc.onicecandidate = (event) => {
+                const c = event?.candidate;
+                if (!c || !c.candidate) return;
+                this.sendNativeScreenSignal(key, 'native-screen-candidate', {
+                    mid: c.sdpMid || '',
+                    candidate: c.candidate
+                });
+            };
+
+            pc.ontrack = (event) => {
+                let stream = event?.streams?.[0] || null;
+                if (!stream && event?.track) {
+                    stream = new MediaStream([event.track]);
+                }
+                if (!stream) return;
+
+                const displayName = this.getParticipantDisplayName(key) || key;
+                const feedId = this.getNativeScreenFeedId(key);
+                const cell = this.ensureRemoteFeedCell(feedId, `Screen • ${displayName}`);
+                if (!cell) return;
+
+                const vid = cell.querySelector('video');
+                if (!vid) return;
+                this.configureRemoteVideoElement(vid, feedId);
+                vid.srcObject = stream;
+                vid.play?.().catch(() => { });
+                this.nativeScreenReceivers[key].stream = stream;
+            };
+
+            pc.onconnectionstatechange = () => {
+                const state = pc.connectionState;
+                if (state === 'failed' || state === 'closed') {
+                    this.cleanupNativeScreenReceiver(key, true);
+                }
+            };
+
+            await pc.setRemoteDescription({ type: 'offer', sdp });
+            const pending = this.nativeScreenPendingCandidates[key];
+            if (Array.isArray(pending) && pending.length > 0) {
+                for (const queued of pending) {
+                    const cnd = queued?.candidate || '';
+                    const mid = queued?.mid || null;
+                    if (!cnd) continue;
+                    try {
+                        await pc.addIceCandidate({ candidate: cnd, sdpMid: mid });
+                    } catch (err) {
+                        this.log('native-screen', `Queued candidate add failed for ${key}: ${err.message}`);
+                    }
+                }
+            }
+            delete this.nativeScreenPendingCandidates[key];
+
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            this.sendNativeScreenSignal(key, 'native-screen-answer', {
+                type: 'answer',
+                sdp: answer?.sdp || ''
+            });
+            return;
+        }
+
+        if (normalizedType === 'native-screen-candidate') {
+            const entry = this.nativeScreenReceivers[key];
+            const candidate = parsed?.candidate || parsed?.Candidate;
+            const mid = parsed?.mid || parsed?.Mid || '';
+            if (!candidate) return;
+
+            if (!entry?.pc) {
+                if (!Array.isArray(this.nativeScreenPendingCandidates[key])) {
+                    this.nativeScreenPendingCandidates[key] = [];
+                }
+                this.nativeScreenPendingCandidates[key].push({ candidate, mid });
+                return;
+            }
+
+            try {
+                await entry.pc.addIceCandidate({ candidate, sdpMid: mid || null });
+            } catch (err) {
+                this.log('native-screen', `Ignoring candidate add failure for ${key}: ${err.message}`);
+            }
+        }
+    },
+
     ensureRemoteFeedCell(feedId, display) {
         const videoGrid = document.getElementById('videoGrid');
         if (!videoGrid) return null;
@@ -3843,16 +5123,21 @@ window.webrtcManager = {
         if (cell) {
             cell.dataset.feedId = String(feedId);
             cell.dataset.display = (display || '').toString();
+            cell.classList.toggle('remote-audio-only-feed', this.isFeedTaggedScreenAudio(feedId));
             this.bindSpotlightInteraction(cell, streamKey, true);
+            this.bindCellOverlayAutoHide(cell);
             const existingVideo = cell.querySelector('video');
             this.configureRemoteVideoElement(existingVideo, feedId);
             const label = cell.querySelector('.video-label');
             if (label) {
                 label.textContent = this.getRemoteFeedDisplayName(feedId, display);
             }
+            this.ensureRemoteFeedAvatarFallback(cell, feedId, display);
             const controls = cell.querySelector('.video-controls');
             this.ensureSpotlightButton(controls, streamKey);
             this.ensureRemoteFeedVolumeControl(cell, feedId);
+            this.ensureRemoteFeedVisibilityControl(cell, feedId);
+            this.applyRemoteFeedVisibilityState(cell, feedId);
             this.refreshIdentityVolumeControls(this.getFeedIdentityKey(feedId));
             this.applySpotlightLayout();
             return cell;
@@ -3863,7 +5148,9 @@ window.webrtcManager = {
         cell.id = 'remote-' + feedId;
         cell.dataset.feedId = String(feedId);
         cell.dataset.display = (display || '').toString();
+        cell.classList.toggle('remote-audio-only-feed', this.isFeedTaggedScreenAudio(feedId));
         this.bindSpotlightInteraction(cell, streamKey, true);
+        this.bindCellOverlayAutoHide(cell);
 
         const vid = document.createElement('video');
         this.configureRemoteVideoElement(vid, feedId);
@@ -3897,7 +5184,10 @@ window.webrtcManager = {
 
         const infoPanel = this.createStreamInfoPanel(streamKey);
         cell.append(vid, label, controls, infoPanel);
+        this.ensureRemoteFeedAvatarFallback(cell, feedId, display);
         this.ensureRemoteFeedVolumeControl(cell, feedId);
+        this.ensureRemoteFeedVisibilityControl(cell, feedId);
+        this.applyRemoteFeedVisibilityState(cell, feedId);
         videoGrid.appendChild(cell);
 
         const initialVolume = this.getFeedVolumePercent(feedId);
@@ -3905,6 +5195,251 @@ window.webrtcManager = {
         this.refreshIdentityVolumeControls(this.getFeedIdentityKey(feedId));
         this.applySpotlightLayout();
         return cell;
+    },
+
+    canToggleRemoteFeedVisibility(feedId) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return false;
+        if (this.hiddenRemoteFeeds[normalizedFeedId]) return true;
+
+        const feed = this.feeds[normalizedFeedId];
+        if (!feed) return false;
+        if (this.feedHasLiveTrack(feed, 'video')) return true;
+        return this.getFeedRole(normalizedFeedId) === 'stream';
+    },
+
+    rememberHiddenRemoteFeedMeta(feedId, display, streamsHint) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+
+        const previous = this.hiddenRemoteFeedMeta[normalizedFeedId] || {};
+        const mergedStreams = this.normalizeSubscribeStreams(
+            [...(previous.streams || []), ...(streamsHint || [])],
+            normalizedFeedId
+        );
+        this.hiddenRemoteFeedMeta[normalizedFeedId] = {
+            display: display || previous.display || '',
+            streams: mergedStreams
+        };
+    },
+
+    cancelPendingSubscribeForFeed(feedId, reason = 'cancelled') {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+
+        for (const [handleId, pending] of Object.entries(this.pendingSubscribes || {})) {
+            if (!pending || this.normalizeFeedId(pending.feedId) !== normalizedFeedId) continue;
+            delete this.pendingSubscribes[handleId];
+            this.log('subscribe', `Cancelled pending subscribe for feed ${normalizedFeedId} (handle ${handleId}, reason=${reason})`);
+        }
+
+        if (this.pendingSubscribeFeeds[normalizedFeedId]) {
+            delete this.pendingSubscribeFeeds[normalizedFeedId];
+        }
+    },
+
+    suspendRemoteFeedSubscription(feedId, reason = 'hidden-preference') {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+
+        const feed = this.feeds[normalizedFeedId];
+        if (!feed) {
+            this.cancelPendingSubscribeForFeed(normalizedFeedId, reason);
+            return;
+        }
+
+        this.rememberHiddenRemoteFeedMeta(normalizedFeedId, feed.display || '', this.publisherStreamHints[normalizedFeedId]?.streams || []);
+        this.cancelPendingSubscribeForFeed(normalizedFeedId, reason);
+
+        if (feed.hardRecoveryTimer) {
+            clearTimeout(feed.hardRecoveryTimer);
+            feed.hardRecoveryTimer = null;
+        }
+
+        try { feed.pc.onicecandidate = null; } catch { }
+        try { feed.pc.ontrack = null; } catch { }
+        try { feed.pc.close(); } catch { }
+        delete this.pendingSubscribes[feed.handleId];
+        delete this.feeds[normalizedFeedId];
+        const streamKey = `remote-${normalizedFeedId}`;
+        delete this.openStreamInfoPanels[streamKey];
+        this.clearStreamStatsCache(streamKey);
+        this.stopStreamInfoLoopIfIdle();
+
+        const cell = document.getElementById('remote-' + normalizedFeedId);
+        if (cell) {
+            const video = cell.querySelector('video');
+            if (video) {
+                this.detachRemoteFeedElementGain(video);
+                try { video.pause?.(); } catch { }
+                try { video.srcObject = null; } catch { }
+            }
+            this.applyRemoteFeedVisibilityState(cell, normalizedFeedId);
+        }
+
+        const floatVideo = document.getElementById('floatLocalVideo');
+        if (floatVideo && floatVideo.dataset.feedId === String(normalizedFeedId)) {
+            this.detachRemoteFeedElementGain(floatVideo);
+            try { floatVideo.pause?.(); } catch { }
+            try { floatVideo.srcObject = null; } catch { }
+            delete floatVideo.dataset.feedId;
+            floatVideo.muted = true;
+            floatVideo.volume = 0;
+        }
+
+        this.refreshRemoteAudioRouting();
+        this.refreshFloatContainerIfPresent();
+        this.log('subscribe', `Unsubscribed from feed ${normalizedFeedId} (reason=${reason})`);
+    },
+
+    requestHiddenFeedResubscribe(feedId, reason = 'show-preference') {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+        if (this.hiddenRemoteFeeds[normalizedFeedId]) return;
+        if (this.feeds[normalizedFeedId]) return;
+
+        const pending = this.findPendingSubscribeByFeed(normalizedFeedId);
+        if (pending) return;
+
+        const meta = this.hiddenRemoteFeedMeta[normalizedFeedId] || {};
+        const subscribeFeedId = Number.isFinite(Number(normalizedFeedId)) ? Number(normalizedFeedId) : normalizedFeedId;
+        this.log('subscribe', `Re-subscribing feed ${normalizedFeedId} after unhide (reason=${reason})`);
+        this.initiateSubscribe(subscribeFeedId, meta.display || '', meta.streams || [])
+            .catch(err => this.logError('subscribe', `Failed to re-subscribe feed ${normalizedFeedId}: ${err.message}`));
+    },
+
+    isRemoteFeedHidden(feedId) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        return !!(normalizedFeedId && this.hiddenRemoteFeeds[normalizedFeedId]);
+    },
+
+    setRemoteFeedHidden(feedId, hidden) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+
+        const nextHidden = !!hidden;
+        const targetFeed = this.feeds[normalizedFeedId] || null;
+        const targetIsStreamLike = !!targetFeed && (
+            this.feedHasLiveTrack(targetFeed, 'video')
+            || this.isFeedTaggedScreenAudio(normalizedFeedId)
+            || this.getFeedRole(normalizedFeedId) === 'stream'
+            || this.feedLooksLikeStreamShare(normalizedFeedId)
+        );
+
+        const affectedFeedIds = new Set([normalizedFeedId]);
+        const identityKey = this.getFeedIdentityKey(normalizedFeedId);
+        if (identityKey && targetIsStreamLike) {
+            const siblings = this.listIdentityFeeds(identityKey, false);
+            for (const siblingId of siblings) {
+                const normalizedSibling = this.normalizeFeedId(siblingId);
+                if (!normalizedSibling || normalizedSibling === normalizedFeedId) continue;
+                const siblingFeed = this.feeds[normalizedSibling];
+                if (!siblingFeed) continue;
+
+                const siblingIsStreamLike =
+                    this.isFeedTaggedScreenAudio(normalizedSibling)
+                    || this.feedHasLiveTrack(siblingFeed, 'video')
+                    || this.getFeedRole(normalizedSibling) === 'stream'
+                    || this.feedLooksLikeStreamShare(normalizedSibling);
+                if (siblingIsStreamLike) {
+                    affectedFeedIds.add(normalizedSibling);
+                }
+            }
+        }
+
+        let changed = false;
+        for (const affectedId of affectedFeedIds) {
+            const currentHidden = !!this.hiddenRemoteFeeds[affectedId];
+            if (nextHidden === currentHidden) continue;
+            changed = true;
+            if (nextHidden) {
+                this.hiddenRemoteFeeds[affectedId] = true;
+            } else {
+                delete this.hiddenRemoteFeeds[affectedId];
+            }
+        }
+        if (!changed) return;
+
+        for (const affectedId of affectedFeedIds) {
+            if (nextHidden) {
+                this.suspendRemoteFeedSubscription(affectedId, 'hidden-preference');
+            } else {
+                this.requestHiddenFeedResubscribe(affectedId, 'show-preference');
+            }
+        }
+
+        for (const affectedId of affectedFeedIds) {
+            const cell = document.getElementById('remote-' + affectedId);
+            if (cell) {
+                this.applyRemoteFeedVisibilityState(cell, affectedId);
+            }
+        }
+        if (identityKey) {
+            this.refreshIdentityVolumeControls(identityKey);
+        }
+
+        this.refreshRemoteAudioRouting();
+        this.refreshFloatContainerIfPresent();
+        const affectedList = Array.from(affectedFeedIds.values()).join(',');
+        this.log('subscribe', `Feed ${normalizedFeedId} ${nextHidden ? 'hidden' : 'shown'} by local preference (affected: ${affectedList})`);
+    },
+
+    toggleRemoteFeedHidden(feedId) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+        this.setRemoteFeedHidden(normalizedFeedId, !this.isRemoteFeedHidden(normalizedFeedId));
+    },
+
+    ensureRemoteFeedVisibilityControl(cell, feedId) {
+        if (!cell) return;
+        const controls = cell.querySelector('.video-controls');
+        if (!controls) return;
+
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        const canToggle = this.canToggleRemoteFeedVisibility(normalizedFeedId);
+        let button = controls.querySelector('.video-visibility-btn');
+
+        if (!canToggle) {
+            if (button) button.remove();
+            cell.classList.remove('video-cell-stream-hidden');
+            return;
+        }
+
+        if (!button) {
+            button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'video-control-btn video-visibility-btn';
+            button.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                const targetFeedId = ev.currentTarget?.dataset?.feedId || normalizedFeedId;
+                this.toggleRemoteFeedHidden(targetFeedId);
+            });
+            controls.insertBefore(button, controls.firstChild || null);
+        }
+
+        button.dataset.feedId = String(normalizedFeedId);
+        const hidden = this.isRemoteFeedHidden(normalizedFeedId);
+        button.textContent = hidden ? 'Show' : 'Hide';
+        button.classList.toggle('active', hidden);
+    },
+
+    applyRemoteFeedVisibilityState(cell, feedId) {
+        if (!cell) return;
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        const hidden = this.isRemoteFeedHidden(normalizedFeedId);
+        cell.classList.toggle('video-cell-stream-hidden', hidden);
+
+        const video = cell.querySelector('video');
+        if (video) {
+            video.style.visibility = hidden ? 'hidden' : '';
+            video.style.opacity = hidden ? '0' : '';
+            video.style.pointerEvents = hidden ? 'none' : '';
+            if (!hidden) {
+                this.tryResumeRemoteVideo(video, normalizedFeedId, 'show-hidden-stream');
+            }
+        }
+
+        this.ensureRemoteFeedVisibilityControl(cell, normalizedFeedId);
     },
 
     refreshIdentityVolumeControls(identityKey) {
@@ -3920,33 +5455,68 @@ window.webrtcManager = {
 
     ensureRemoteFeedVolumeControl(cell, feedId) {
         if (!cell) return;
+        const normalizedFeedId = this.normalizeFeedId(feedId);
 
         let volumePanel = cell.querySelector('.remote-volume-panel');
         if (!volumePanel) {
             volumePanel = document.createElement('div');
             volumePanel.className = 'remote-volume-panel';
 
-            const row = document.createElement('div');
-            row.className = 'remote-volume-row';
+            const micRow = document.createElement('div');
+            micRow.className = 'remote-volume-row remote-volume-row-mic';
 
-            const caption = document.createElement('span');
-            caption.className = 'remote-volume-caption';
-            caption.textContent = 'Vol';
+            const micCaption = document.createElement('span');
+            micCaption.className = 'remote-volume-caption';
+            micCaption.textContent = 'Mic';
 
-            const slider = document.createElement('input');
-            slider.type = 'range';
-            slider.min = '0';
-            slider.max = '200';
-            slider.step = '1';
-            slider.value = '100';
-            slider.className = 'video-volume-slider video-volume-slider-main';
-            slider.addEventListener('input', () => {
-                this.setRemoteFeedVolume(feedId, slider.value);
+            const micSlider = document.createElement('input');
+            micSlider.type = 'range';
+            micSlider.min = '0';
+            micSlider.max = '200';
+            micSlider.step = '1';
+            micSlider.value = '100';
+            micSlider.className = 'video-volume-slider video-volume-slider-mic';
+            micSlider.addEventListener('input', () => {
+                const targetFeedId = volumePanel.dataset.feedId || normalizedFeedId;
+                const identityKey = this.getFeedIdentityKey(targetFeedId);
+                if (identityKey) {
+                    this.setIdentityRoleVolume(identityKey, 'mic', micSlider.value);
+                } else {
+                    this.setRemoteFeedVolume(targetFeedId, micSlider.value);
+                }
             });
 
-            const value = document.createElement('span');
-            value.className = 'video-volume-label video-volume-label-main';
-            value.textContent = '100%';
+            const micValue = document.createElement('span');
+            micValue.className = 'video-volume-label video-volume-label-mic';
+            micValue.textContent = '100%';
+
+            const streamRow = document.createElement('div');
+            streamRow.className = 'remote-volume-row remote-volume-row-stream';
+
+            const streamCaption = document.createElement('span');
+            streamCaption.className = 'remote-volume-caption';
+            streamCaption.textContent = 'Stream';
+
+            const streamSlider = document.createElement('input');
+            streamSlider.type = 'range';
+            streamSlider.min = '0';
+            streamSlider.max = '200';
+            streamSlider.step = '1';
+            streamSlider.value = '100';
+            streamSlider.className = 'video-volume-slider video-volume-slider-stream';
+            streamSlider.addEventListener('input', () => {
+                const targetFeedId = volumePanel.dataset.feedId || normalizedFeedId;
+                const identityKey = this.getFeedIdentityKey(targetFeedId);
+                if (identityKey) {
+                    this.setIdentityRoleVolume(identityKey, 'stream', streamSlider.value);
+                } else {
+                    this.setRemoteFeedVolume(targetFeedId, streamSlider.value);
+                }
+            });
+
+            const streamValue = document.createElement('span');
+            streamValue.className = 'video-volume-label video-volume-label-stream';
+            streamValue.textContent = '100%';
 
             // Prevent tile click/double-click handlers from stealing interaction.
             const stopPropagation = (ev) => ev.stopPropagation();
@@ -3955,17 +5525,33 @@ window.webrtcManager = {
             volumePanel.addEventListener('mousedown', stopPropagation);
             volumePanel.addEventListener('pointerdown', stopPropagation);
 
-            row.append(caption, slider, value);
-            volumePanel.append(row);
+            micRow.append(micCaption, micSlider, micValue);
+            streamRow.append(streamCaption, streamSlider, streamValue);
+            volumePanel.append(micRow, streamRow);
             cell.appendChild(volumePanel);
         }
 
-        const currentVolume = this.getFeedVolumePercent(feedId);
+        volumePanel.dataset.feedId = String(normalizedFeedId);
+        const identityKey = this.getFeedIdentityKey(normalizedFeedId);
+        const micVolume = identityKey
+            ? this.getIdentityRoleVolumePercent(identityKey, 'mic')
+            : this.getFeedVolumePercent(normalizedFeedId);
+        const streamVolume = identityKey
+            ? this.getIdentityRoleVolumePercent(identityKey, 'stream')
+            : micVolume;
+        const streamVisible = !!identityKey && this.isStreamVolumeSliderVisible(identityKey);
 
-        const slider = volumePanel.querySelector('.video-volume-slider-main');
-        const label = volumePanel.querySelector('.video-volume-label-main');
-        if (slider) slider.value = String(currentVolume);
-        if (label) label.textContent = `${currentVolume}%`;
+        const micSlider = volumePanel.querySelector('.video-volume-slider-mic');
+        const micLabel = volumePanel.querySelector('.video-volume-label-mic');
+        if (micSlider) micSlider.value = String(micVolume);
+        if (micLabel) micLabel.textContent = `${micVolume}%`;
+
+        const streamRow = volumePanel.querySelector('.remote-volume-row-stream');
+        if (streamRow) streamRow.hidden = !streamVisible;
+        const streamSlider = volumePanel.querySelector('.video-volume-slider-stream');
+        const streamLabel = volumePanel.querySelector('.video-volume-label-stream');
+        if (streamSlider) streamSlider.value = String(streamVolume);
+        if (streamLabel) streamLabel.textContent = `${streamVolume}%`;
     },
 
     getRemoteFeedDisplayName(feedId, display) {
@@ -4066,6 +5652,15 @@ window.webrtcManager = {
         return normalizedRaw ? `raw:${normalizedRaw}` : '';
     },
 
+    isFeedTaggedScreenAudio(feedId) {
+        const key = this.normalizeFeedId(feedId);
+        if (!key) return false;
+        const feed = this.feeds[key];
+        if (!feed) return false;
+        const parsed = this.parsePublisherDisplay((feed.display || '').toString());
+        return parsed.role === 'screen-audio';
+    },
+
     feedHasLiveTrack(feed, kind) {
         if (!feed) return false;
 
@@ -4140,11 +5735,27 @@ window.webrtcManager = {
         const feed = this.feeds[key];
         if (!feed) return 'mic';
 
+        const parsedDisplay = this.parsePublisherDisplay((feed.display || '').toString());
+        if (parsedDisplay.role === 'screen-audio' || parsedDisplay.role === 'native-screen') {
+            return 'stream';
+        }
+
+        const identityKey = this.getFeedIdentityKey(key);
+        if (parsedDisplay.role === 'primary' && identityKey) {
+            const hasDedicatedScreenAudioSibling = this.listIdentityFeeds(identityKey, true).some(otherFeedId => {
+                const otherKey = String(otherFeedId);
+                if (otherKey === key) return false;
+                return this.isFeedTaggedScreenAudio(otherKey);
+            });
+            if (hasDedicatedScreenAudioSibling) {
+                return 'mic';
+            }
+        }
+
         if (feed.roleHint === 'mic' || feed.roleHint === 'stream') {
             return feed.roleHint;
         }
 
-        const identityKey = this.getFeedIdentityKey(key);
         if (!identityKey) return 'mic';
 
         const identityAudioFeeds = this.listIdentityFeeds(identityKey, true);
@@ -4192,6 +5803,9 @@ window.webrtcManager = {
             return this.remoteFeedVolumes[key] ?? 100;
         }
         const state = this.getIdentityVolumeState(identityKey);
+        if (this.isFeedTaggedScreenAudio(key)) {
+            return state.stream;
+        }
         const role = this.getFeedRole(key);
         if (role === 'stream') {
             return state.stream;
@@ -4199,11 +5813,43 @@ window.webrtcManager = {
         return state.mic;
     },
 
+    getIdentityRoleVolumePercent(identityKey, role) {
+        const state = this.getIdentityVolumeState(identityKey);
+        return role === 'stream' ? state.stream : state.mic;
+    },
+
     identityHasStreamAudioFeed(identityKey) {
         if (!identityKey) return false;
         const identityAudioFeeds = this.listIdentityFeeds(identityKey, true);
-        if (identityAudioFeeds.length <= 1) return false;
-        return identityAudioFeeds.some(feedId => this.getFeedRole(feedId) === 'stream');
+        return identityAudioFeeds.some(feedId =>
+            this.getFeedRole(feedId) === 'stream'
+            || this.isFeedTaggedScreenAudio(feedId)
+            || this.feedLooksLikeStreamShare(feedId));
+    },
+
+    isStreamVolumeSliderVisible(identityKey) {
+        if (!identityKey) return false;
+        if (!this.identityHasStreamAudioFeed(identityKey)) return false;
+
+        const identityFeeds = this.listIdentityFeeds(identityKey, false);
+        const streamFeeds = identityFeeds.filter(feedId => {
+            const feed = this.feeds[String(feedId)];
+            if (!feed || !this.feedHasLiveTrack(feed, 'audio')) return false;
+            return this.getFeedRole(feedId) === 'stream'
+                || this.isFeedTaggedScreenAudio(feedId)
+                || this.feedLooksLikeStreamShare(feedId);
+        });
+        if (streamFeeds.length === 0) return false;
+
+        const hiddenStreamByFeed = streamFeeds.some(feedId => this.isRemoteFeedHidden(feedId));
+        if (hiddenStreamByFeed) return false;
+
+        const hiddenStreamByVideoSibling = identityFeeds.some(feedId => {
+            if (!this.isRemoteFeedHidden(feedId)) return false;
+            const feed = this.feeds[String(feedId)];
+            return !!feed && this.feedHasLiveTrack(feed, 'video');
+        });
+        return !hiddenStreamByVideoSibling;
     },
 
     resolvePrimaryAudibleFeedForIdentity(identityKey, role = null) {
@@ -4252,6 +5898,53 @@ window.webrtcManager = {
         return !!primaryFeedId && primaryFeedId !== key;
     },
 
+    isFeedAudioSuppressedByVisibilityPreference(feedId) {
+        const key = this.normalizeFeedId(feedId);
+        if (!key) return false;
+
+        const feed = this.feeds[key];
+        if (!feed) return false;
+        if (!this.feedHasLiveTrack(feed, 'audio')) return false;
+
+        const role = this.getFeedRole(key);
+        const hasVideoTrack = this.feedHasLiveTrack(feed, 'video');
+        const looksLikeStream = this.feedLooksLikeStreamShare(key);
+        const taggedScreenAudio = this.isFeedTaggedScreenAudio(key);
+        const likelyScreenAudio = taggedScreenAudio || (role === 'stream' && !hasVideoTrack && looksLikeStream);
+
+        // Direct hide of this specific feed only suppresses dedicated/likely screen-audio tracks.
+        if (this.isRemoteFeedHidden(key)) {
+            return likelyScreenAudio;
+        }
+
+        const identityKey = this.getFeedIdentityKey(key);
+        if (!identityKey) return false;
+
+        // If any sibling feed is hidden, always suppress dedicated screen-audio feeds.
+        // This keeps Hide behavior intuitive when stream audio is published on a separate feed.
+        if (taggedScreenAudio) {
+            const hiddenSiblingExists = this.listIdentityFeeds(identityKey, false).some(otherFeedId => {
+                const normalizedOther = this.normalizeFeedId(otherFeedId);
+                if (!normalizedOther || normalizedOther === key) return false;
+                return this.isRemoteFeedHidden(normalizedOther);
+            });
+            if (hiddenSiblingExists) return true;
+        }
+
+        // If any stream/video sibling is hidden, suppress sibling screen-audio tracks.
+        const hiddenStreamSiblingExists = this.listIdentityFeeds(identityKey, false).some(otherFeedId => {
+            if (!this.isRemoteFeedHidden(otherFeedId)) return false;
+            const other = this.feeds[String(otherFeedId)];
+            if (!other) return false;
+            if (this.isFeedTaggedScreenAudio(otherFeedId)) return true;
+            if (this.feedHasLiveTrack(other, 'video')) return true;
+            return this.getFeedRole(otherFeedId) === 'stream' || this.feedLooksLikeStreamShare(otherFeedId);
+        });
+        if (!hiddenStreamSiblingExists) return false;
+
+        return likelyScreenAudio;
+    },
+
     syncVolumeAcrossIdentity(feedId, volumePercent) {
         const key = this.normalizeFeedId(feedId);
         if (!key) return;
@@ -4259,24 +5952,38 @@ window.webrtcManager = {
         const identityKey = this.getFeedIdentityKey(key);
         if (!identityKey) return;
 
+        const role = (this.isFeedTaggedScreenAudio(key) || this.getFeedRole(key) === 'stream')
+            ? 'stream'
+            : 'mic';
+        this.setIdentityRoleVolume(identityKey, role, volumePercent);
+    },
+
+    setIdentityRoleVolume(identityKey, role, value) {
+        if (!identityKey) return;
+
+        const normalizedRole = role === 'stream' ? 'stream' : 'mic';
+        const volumePercent = Math.max(0, Math.min(200, parseInt(value, 10) || 0));
         const volumeState = this.getIdentityVolumeState(identityKey);
-        const role = this.getFeedRole(key);
-        if (role === 'stream') {
+
+        if (normalizedRole === 'stream') {
             volumeState.stream = volumePercent;
         } else {
             volumeState.mic = volumePercent;
-            // Keep stream tied to mic unless stream-specific volume was explicitly changed.
+            // Keep stream tied to mic unless stream-specific volume is available.
             if (!this.identityHasStreamAudioFeed(identityKey)) {
                 volumeState.stream = volumePercent;
             }
         }
         this.remoteIdentityVolumes[identityKey] = volumeState;
+        this.savePersistedRemoteIdentityVolumes();
 
         for (const [otherFeedId] of Object.entries(this.feeds)) {
             const normalizedOther = String(otherFeedId);
             if (this.getFeedIdentityKey(normalizedOther) !== identityKey) continue;
 
-            const otherRole = this.getFeedRole(normalizedOther);
+            const otherRole = this.isFeedTaggedScreenAudio(normalizedOther)
+                ? 'stream'
+                : this.getFeedRole(normalizedOther);
             this.remoteFeedVolumes[normalizedOther] =
                 otherRole === 'stream' ? volumeState.stream : volumeState.mic;
         }
@@ -4294,6 +6001,7 @@ window.webrtcManager = {
                 this.applyRemoteFeedVolumeToElement(otherVideo, normalizedOther, this.getFeedVolumePercent(normalizedOther));
             }
         }
+        this.refreshRemoteAudioRouting();
     },
 
     refreshRemoteAudioRouting() {
@@ -4303,6 +6011,10 @@ window.webrtcManager = {
                 if (!feedId) return;
                 const volumePercent = this.getFeedVolumePercent(feedId);
                 this.applyRemoteFeedVolumeToElement(vid, feedId, volumePercent);
+                const cell = vid.closest('.video-cell');
+                if (cell) {
+                    this.ensureRemoteFeedAvatarFallback(cell, feedId, cell.dataset.display || '');
+                }
             });
     },
 
@@ -4310,9 +6022,23 @@ window.webrtcManager = {
         return !!videoElement && videoElement.id === 'floatLocalVideo';
     },
 
+    setElementAudioTrackEnabled(videoElement, enabled) {
+        if (!videoElement) return;
+        const stream = videoElement.srcObject;
+        if (!stream || typeof stream.getAudioTracks !== 'function') return;
+        const nextEnabled = !!enabled;
+        for (const track of stream.getAudioTracks()) {
+            if (!track) continue;
+            try {
+                track.enabled = nextEnabled;
+            } catch { }
+        }
+    },
+
     applyRemoteFeedVolumeToElement(videoElement, feedId, volumePercent) {
         if (!videoElement) return;
         if (this.isSilentFloatPreviewVideo(videoElement)) {
+            this.setElementAudioTrackEnabled(videoElement, false);
             videoElement.muted = true;
             videoElement.volume = 0;
             this.setRemoteFeedElementGain(videoElement, 0);
@@ -4320,10 +6046,33 @@ window.webrtcManager = {
         }
 
         const normalizedFeedId = this.normalizeFeedId(feedId);
-        if (normalizedFeedId && this.isFeedAudioSuppressedByDuplicateRouting(normalizedFeedId)) {
+        const feed = normalizedFeedId ? this.feeds[normalizedFeedId] : null;
+        const forceElementVolume = !!normalizedFeedId && (
+            this.isFeedTaggedScreenAudio(normalizedFeedId)
+            || (!!feed && !this.feedHasLiveTrack(feed, 'video') && this.getFeedRole(normalizedFeedId) === 'stream')
+        );
+
+        if (normalizedFeedId && this.isFeedAudioSuppressedByVisibilityPreference(normalizedFeedId)) {
+            this.setElementAudioTrackEnabled(videoElement, false);
             videoElement.muted = true;
             videoElement.volume = 0;
-            this.setRemoteFeedElementGain(videoElement, 0);
+            if (forceElementVolume) {
+                this.detachRemoteFeedElementGain(videoElement);
+            } else {
+                this.setRemoteFeedElementGain(videoElement, 0);
+            }
+            return;
+        }
+
+        if (normalizedFeedId && this.isFeedAudioSuppressedByDuplicateRouting(normalizedFeedId)) {
+            this.setElementAudioTrackEnabled(videoElement, false);
+            videoElement.muted = true;
+            videoElement.volume = 0;
+            if (forceElementVolume) {
+                this.detachRemoteFeedElementGain(videoElement);
+            } else {
+                this.setRemoteFeedElementGain(videoElement, 0);
+            }
             return;
         }
 
@@ -4333,12 +6082,27 @@ window.webrtcManager = {
         const effectiveGain = Math.max(0, Math.min(2, linearGain * streamGain));
 
         if (this.screenShareSystemAudioSuppressed && this.isScreenSharing) {
+            this.setElementAudioTrackEnabled(videoElement, false);
             videoElement.muted = true;
             videoElement.volume = 0;
-            this.setRemoteFeedElementGain(videoElement, 0);
+            if (forceElementVolume) {
+                this.detachRemoteFeedElementGain(videoElement);
+            } else {
+                this.setRemoteFeedElementGain(videoElement, 0);
+            }
             return;
         }
 
+        if (forceElementVolume) {
+            this.detachRemoteFeedElementGain(videoElement);
+            const shouldMute = effectiveGain <= 0.0001;
+            this.setElementAudioTrackEnabled(videoElement, !shouldMute);
+            videoElement.muted = shouldMute;
+            videoElement.volume = shouldMute ? 0 : Math.min(1, effectiveGain);
+            return;
+        }
+
+        this.setElementAudioTrackEnabled(videoElement, effectiveGain > 0.0001);
         const gainApplied = this.setRemoteFeedElementGain(videoElement, effectiveGain);
         if (gainApplied) {
             // Stream-source gain active: keep element muted and drive loudness from WebAudio.
@@ -4403,8 +6167,43 @@ window.webrtcManager = {
     },
 
     getPrimaryRemoteFeedForFloat() {
+        if (this.selectedSpotlightStreamKey) {
+            if (this.selectedSpotlightStreamKey === 'local') {
+                const localSpotlight = this.isScreenSharing && this.screenStream ? this.screenStream : this.localStream;
+                if (localSpotlight) {
+                    return { feedId: 'local', stream: localSpotlight, isLocal: true };
+                }
+            } else if (this.selectedSpotlightStreamKey.startsWith('remote-')) {
+                const spotlightFeedId = this.selectedSpotlightStreamKey.substring('remote-'.length);
+                const spotlightFeed = this.feeds[spotlightFeedId];
+                if (
+                    spotlightFeed &&
+                    !this.isRemoteFeedHidden(spotlightFeedId) &&
+                    !this.isFeedTaggedScreenAudio(spotlightFeedId) &&
+                    this.feedHasLiveTrack(spotlightFeed, 'video')
+                ) {
+                    let spotlightStream = spotlightFeed.stream || null;
+                    if (!spotlightStream && spotlightFeed.pc) {
+                        const tracks = spotlightFeed.pc.getReceivers()
+                            .map(r => r.track)
+                            .filter(t => t && t.readyState === 'live');
+                        if (tracks.length > 0) {
+                            spotlightStream = new MediaStream(tracks);
+                            spotlightFeed.stream = spotlightStream;
+                        }
+                    }
+                    if (spotlightStream) {
+                        return { feedId: spotlightFeedId, stream: spotlightStream, isLocal: false };
+                    }
+                }
+            }
+        }
+
         for (const [feedId, feed] of Object.entries(this.feeds)) {
             if (!feed) continue;
+            if (this.isRemoteFeedHidden(feedId)) continue;
+            if (this.isFeedTaggedScreenAudio(feedId)) continue;
+            if (!this.feedHasLiveTrack(feed, 'video')) continue;
 
             let stream = feed.stream || null;
             if (!stream && feed.pc) {
@@ -4418,7 +6217,7 @@ window.webrtcManager = {
             }
 
             if (stream) {
-                return { feedId, stream };
+                return { feedId, stream, isLocal: false };
             }
         }
 
@@ -4431,7 +6230,7 @@ window.webrtcManager = {
         this.moveVideoToFloat('floatVideoContainer');
     },
 
-    // â”€â”€â”€ Event polling loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Event polling loop ─────────────────────────────────────────────────────
 
     async startPolling() {
         this.polling = true;
@@ -4474,8 +6273,11 @@ window.webrtcManager = {
                 if (type === 'event') {
                     const sender = event.sender;
                     const data = event?.plugindata?.data;
+                    const eventFromMainPublisherHandle =
+                        !!sender && String(sender) === String(this.janusHandleId || '');
+                    const eventFromScreenAudioPublisherHandle = this.isScreenAudioPublisherHandle(sender);
 
-                    // â”€â”€ Check for pending subscriber JSEP response â”€â”€
+                    // ── Check for pending subscriber JSEP response ──
                     // When we fire-and-forget a subscriber join, the JSEP offer
                     // arrives here with the subscriber handle as the sender.
                     this.cleanupStalePendingSubscribes();
@@ -4522,51 +6324,84 @@ window.webrtcManager = {
                     }
 
                     if (data) {
-                        if (typeof data.private_id === 'number' && data.private_id > 0 && data.private_id !== this.myPrivateId) {
+                        if (eventFromMainPublisherHandle
+                            && typeof data.private_id === 'number'
+                            && data.private_id > 0
+                            && data.private_id !== this.myPrivateId) {
                             this.myPrivateId = data.private_id;
                             this.log('publish', `Updated private_id=${this.myPrivateId}`);
                         }
                         // New or updated remote publishers
                         if (Array.isArray(data.publishers) && data.publishers.length > 0) {
-                            this.log('poll', `Publisher(s) event: ${data.publishers.length}`,
-                                data.publishers.map(p => ({ id: p.id, display: p.display })));
-
-                            for (const pub of data.publishers) {
-                                this.updatePublisherStreamHint(pub.id, pub.streams);
-                                const existingPending = this.findPendingSubscribeByFeed(pub.id);
-                                if (existingPending) {
-                                    const mergedStreams = this.normalizeSubscribeStreams(pub.streams, pub.id);
-                                    if (mergedStreams.length > 0) {
-                                        existingPending.pending.streams = mergedStreams;
-                                    }
-                                    if (pub.display) {
-                                        existingPending.pending.display = pub.display;
-                                    }
-                                    this.log('poll', `Publisher ${pub.id} update received while subscribe is pending on handle ${existingPending.handleId}; skipping duplicate subscribe`);
-                                    continue;
+                            if (!eventFromMainPublisherHandle) {
+                                if (eventFromScreenAudioPublisherHandle) {
+                                    this.log('poll', `Ignoring publisher list from screen-audio handle ${sender}`);
+                                } else {
+                                    this.log('poll', `Ignoring publisher list from non-main handle ${sender}`);
                                 }
-                                const subscribedFeed = this.feeds[pub.id];
-                                if (subscribedFeed) {
-                                    const hint = this.publisherStreamHints[String(pub.id)];
-                                    const hasVideo = this.hasIncomingVideoTrack(subscribedFeed?.pc);
-                                    if (hint?.hasVideo && !hasVideo) {
-                                        this.log('poll', `Publisher ${pub.id} reports video but subscriber is audio-only; requesting refresh on existing handle`);
-                                        this.scheduleExistingSubscriberRefresh(pub.id, 250, 'publisher-event-audio-only');
+                                // Keep processing this event: it may also carry JSEP for the screen-audio publisher.
+                            } else {
+                                const publisherCandidates = this.collapsePublisherCandidates(data.publishers);
+                                this.log('poll', `Publisher(s) event: ${publisherCandidates.length}`,
+                                    publisherCandidates.map(p => ({ id: p.id, display: p.display })));
+
+                                for (const pub of publisherCandidates) {
+                                    if (this.isSelfPublisherDisplay(pub?.display)) {
+                                        this.log('poll', `Skip self publisher event feed ${pub?.id} (${pub?.display || 'unknown'})`);
                                         continue;
                                     }
+                                    if (this.isRemoteFeedHidden(pub?.id)) {
+                                        this.updatePublisherStreamHint(pub.id, pub.streams);
+                                        this.rememberHiddenRemoteFeedMeta(pub.id, pub.display || '', pub.streams || []);
+                                        this.log('poll', `Skip hidden publisher feed ${pub?.id} (${pub?.display || 'unknown'})`);
+                                        continue;
+                                    }
+                                    this.updatePublisherStreamHint(pub.id, pub.streams);
+                                    const existingPending = this.findPendingSubscribeByFeed(pub.id);
+                                    if (existingPending) {
+                                        const mergedStreams = this.normalizeSubscribeStreams(pub.streams, pub.id);
+                                        if (mergedStreams.length > 0) {
+                                            existingPending.pending.streams = mergedStreams;
+                                        }
+                                        if (pub.display) {
+                                            existingPending.pending.display = pub.display;
+                                        }
+                                        this.log('poll', `Publisher ${pub.id} update received while subscribe is pending on handle ${existingPending.handleId}; skipping duplicate subscribe`);
+                                        continue;
+                                    }
+                                    const subscribedFeed = this.feeds[pub.id];
+                                    if (subscribedFeed) {
+                                        const hint = this.publisherStreamHints[String(pub.id)];
+                                        const hasAudio = this.hasIncomingAudioTrack(subscribedFeed?.pc);
+                                        const hasVideo = this.hasIncomingVideoTrack(subscribedFeed?.pc);
+                                        const preferVideoOnly = subscribedFeed.preferVideoOnly === true;
+                                        const needAudioRefresh = !preferVideoOnly && !!hint?.hasAudio && !hasAudio;
+                                        const needVideoRefresh = !!hint?.hasVideo && !hasVideo;
+                                        if (needAudioRefresh || needVideoRefresh) {
+                                            this.log(
+                                                'poll',
+                                                `Publisher ${pub.id} stream mismatch on subscriber (needAudio=${needAudioRefresh}, needVideo=${needVideoRefresh}); requesting refresh on existing handle`
+                                            );
+                                            this.scheduleExistingSubscriberRefresh(pub.id, 250, 'publisher-event-stream-mismatch', {
+                                                requireAudio: needAudioRefresh,
+                                                requireVideo: needVideoRefresh
+                                            });
+                                            continue;
+                                        }
+                                    }
+                                    if (this.feeds[pub.id]) {
+                                        // Already subscribed — publisher updated their streams
+                                        // (e.g. started screen share, enabled video).
+                                        // Re-subscribe to pick up the new media.
+                                        this.log('poll', `Publisher ${pub.id} updated streams — re-subscribing`);
+                                        this.removeFeed(pub.id);
+                                        await this.initiateSubscribe(pub.id, pub.display, pub.streams);
+                                    } else {
+                                        await this.initiateSubscribe(pub.id, pub.display, pub.streams);
+                                    }
                                 }
-                                if (this.feeds[pub.id]) {
-                                    // Already subscribed â€” publisher updated their streams
-                                    // (e.g. started screen share, enabled video).
-                                    // Re-subscribe to pick up the new media.
-                                    this.log('poll', `Publisher ${pub.id} updated streams â€” re-subscribing`);
-                                    this.removeFeed(pub.id);
-                                    await this.initiateSubscribe(pub.id, pub.display, pub.streams);
-                                } else {
-                                    await this.initiateSubscribe(pub.id, pub.display, pub.streams);
-                                }
+                                continue;
                             }
-                            continue;
                         }
 
                         // listparticipants response (fallback publisher discovery)
@@ -4575,6 +6410,10 @@ window.webrtcManager = {
                             for (const p of data.participants) {
                                 // Skip ourselves
                                 if (p.id == this.janusHandleId || this.isSelfPublisherDisplay(p.display)) continue;
+                                if (this.isRemoteFeedHidden(p.id)) {
+                                    this.rememberHiddenRemoteFeedMeta(p.id, p.display || '', p.streams || []);
+                                    continue;
+                                }
                                 // Skip already-subscribed feeds
                                 if (this.feeds[p.id]) continue;
                                 // Skip feeds we're already subscribing to
@@ -4614,6 +6453,15 @@ window.webrtcManager = {
                         if (!wasConfigured) {
                             await this.markPublisherConfigured('polling event');
                         }
+                    } else if (event.jsep && this.isScreenAudioPublisherHandle(sender) && this.screenAudioPublisherPc) {
+                        const wasConfigured = this.screenAudioPublisherConfigured;
+                        this.log('poll', wasConfigured
+                            ? 'Re-negotiation JSEP received for screen-audio publisher'
+                            : 'Initial screen-audio publisher JSEP received via polling');
+                        await this.screenAudioPublisherPc.setRemoteDescription(
+                            new RTCSessionDescription(event.jsep)
+                        );
+                        this.screenAudioPublisherConfigured = true;
                     }
                 } else if (type === 'trickle') {
                     // Handle Janus trickle ICE candidates (sent when full_trickle is enabled)
@@ -4628,6 +6476,17 @@ window.webrtcManager = {
                                 await this.publisherPc.addIceCandidate(new RTCIceCandidate(candidate));
                             } catch (err) {
                                 this.log('poll', `Failed to add trickle candidate: ${err.message}`);
+                            }
+                        }
+                    } else if (candidate && this.isScreenAudioPublisherHandle(sender) && this.screenAudioPublisherPc) {
+                        if (candidate.completed) {
+                            this.log('poll', 'Janus trickle: end-of-candidates for screen-audio publisher');
+                        } else if (candidate.candidate) {
+                            this.log('poll', 'Janus trickle: adding remote candidate for screen-audio publisher');
+                            try {
+                                await this.screenAudioPublisherPc.addIceCandidate(new RTCIceCandidate(candidate));
+                            } catch (err) {
+                                this.log('poll', `Failed to add screen-audio trickle candidate: ${err.message}`);
                             }
                         }
                     } else if (candidate && sender) {
@@ -4650,6 +6509,12 @@ window.webrtcManager = {
                         this.logError('poll', `Publisher handle ${sender} ${type}${reason}; requesting Janus session recovery`);
                         this.notifyDotNet('OnJanusSessionLost');
                         break;
+                    }
+
+                    if (sender && this.isScreenAudioPublisherHandle(sender)) {
+                        this.log('poll', `Screen-audio publisher handle ${sender} ${type}${reason}`);
+                        await this.stopScreenAudioPublisher(`poll-${type}`);
+                        continue;
                     }
 
                     if (sender && this.pendingSubscribes[sender]) {
@@ -4693,7 +6558,7 @@ window.webrtcManager = {
         this.log('poll', 'Polling loop ended');
     },
 
-    // â”€â”€â”€ Keepalive â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Keepalive ──────────────────────────────────────────────────────────────
 
     startKeepalive() {
         this.keepaliveFailures = 0;
@@ -4733,13 +6598,13 @@ window.webrtcManager = {
         }
     },
 
-    // â”€â”€â”€ Participant discovery (fallback for missing "new publisher" events) â”€â”€â”€â”€
+    // ─── Participant discovery (fallback for missing "new publisher" events) ────
 
     /**
      * Queries Janus for the current room participants via a dedicated server
      * endpoint that uses its own temporary session (no event queue competition).
      * Subscribes to any publishers we haven't seen yet.
-     * This is the primary publisher-discovery mechanism â€” it doesn't rely on
+     * This is the primary publisher-discovery mechanism — it doesn't rely on
      * Janus "event" type notifications which don't arrive reliably via long-poll.
      */
     async checkForNewPublishers() {
@@ -4775,9 +6640,39 @@ window.webrtcManager = {
                     this.log('participants', `  skip self (display match): ${p.id} display=${p.display}`);
                     continue;
                 }
-                // Skip already-subscribed feeds
-                if (this.feeds[p.id]) {
-                    this.log('participants', `  skip already subscribed: ${p.id}`);
+                if (this.isRemoteFeedHidden(p.id)) {
+                    this.rememberHiddenRemoteFeedMeta(p.id, p.display || '', p.streams || []);
+                    this.log('participants', `  skip hidden feed: ${p.id}`);
+                    continue;
+                }
+                // Already subscribed: heal missing tracks if publisher still reports them.
+                const subscribedFeed = this.feeds[p.id];
+                if (subscribedFeed) {
+                    this.updatePublisherStreamHint(p.id, p.streams);
+                    const hint = this.publisherStreamHints[String(p.id)];
+                    const hasAudio = this.hasIncomingAudioTrack(subscribedFeed.pc);
+                    const hasVideo = this.hasIncomingVideoTrack(subscribedFeed.pc);
+                    const preferVideoOnly = subscribedFeed.preferVideoOnly === true;
+                    const needAudioRefresh = !preferVideoOnly && !!hint?.hasAudio && !hasAudio;
+                    const needVideoRefresh = !!hint?.hasVideo && !hasVideo;
+                    if (needAudioRefresh || needVideoRefresh) {
+                        this.log(
+                            'participants',
+                            `  subscribed feed ${p.id} missing track(s) (needAudio=${needAudioRefresh}, needVideo=${needVideoRefresh}); scheduling refresh`
+                        );
+                        this.scheduleExistingSubscriberRefresh(p.id, 100, 'participant-check-stream-mismatch', {
+                            requireAudio: needAudioRefresh,
+                            requireVideo: needVideoRefresh
+                        });
+                    } else if (!preferVideoOnly && !hasAudio && this.getFeedRole(p.id) !== 'stream') {
+                        this.log('participants', `  subscribed feed ${p.id} missing mic audio without hint; scheduling forced audio refresh`);
+                        this.scheduleExistingSubscriberRefresh(p.id, 100, 'participant-check-no-audio', {
+                            requireAudio: true,
+                            force: true
+                        });
+                    } else {
+                        this.log('participants', `  skip already subscribed: ${p.id}`);
+                    }
                     continue;
                 }
                 // Skip feeds we're already subscribing to
@@ -4815,12 +6710,233 @@ window.webrtcManager = {
         }
     },
 
-    // â”€â”€â”€ Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    startRemoteFeedHealthWatchdog() {
+        if (this.remoteFeedHealthTimer) return;
+        this.remoteFeedHealthTimer = setInterval(() => {
+            this.checkRemoteFeedHealth();
+        }, 2000);
+    },
+
+    stopRemoteFeedHealthWatchdog() {
+        if (this.remoteFeedHealthTimer) {
+            clearInterval(this.remoteFeedHealthTimer);
+            this.remoteFeedHealthTimer = null;
+        }
+        this.remoteFeedHealthBusy = false;
+    },
+
+    async getInboundVideoHealthStats(peerConnection) {
+        if (!peerConnection || typeof peerConnection.getStats !== 'function') return null;
+        try {
+            const stats = await peerConnection.getStats();
+            const videoReport = this.extractMediaRtpReport(stats, 'inbound', 'video');
+            if (!videoReport) return null;
+            return {
+                bytesReceived: Number(videoReport.bytesReceived ?? 0),
+                packetsReceived: Number(videoReport.packetsReceived ?? 0),
+                framesDecoded: Number(videoReport.framesDecoded ?? videoReport.framesReceived ?? 0),
+                timestamp: Number(videoReport.timestamp ?? 0)
+            };
+        } catch {
+            return null;
+        }
+    },
+
+    async forceResubscribeFeed(feedId, reason) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+
+        const existing = this.feeds[normalizedFeedId];
+        if (!existing) return;
+
+        const display = existing.display || '';
+        const hint = this.publisherStreamHints[normalizedFeedId];
+        const streamsHint = hint?.raw || hint?.streams || null;
+        const numericFeedId = Number(normalizedFeedId);
+        const subscribeFeedId = Number.isFinite(numericFeedId) ? numericFeedId : normalizedFeedId;
+
+        delete this.pendingSubscribeFeeds[normalizedFeedId];
+        this.log('subscribe', `Feed ${normalizedFeedId} forcing hard re-subscribe (${reason})`);
+        this.removeFeed(normalizedFeedId);
+        await this.initiateSubscribe(subscribeFeedId, display, streamsHint);
+    },
+
+    cancelFeedHardRecovery(feedId) {
+        const key = this.normalizeFeedId(feedId);
+        if (!key) return;
+        const feed = this.feeds[key];
+        if (!feed) return;
+        if (feed.hardRecoveryTimer) {
+            clearTimeout(feed.hardRecoveryTimer);
+            feed.hardRecoveryTimer = null;
+        }
+    },
+
+    scheduleFeedHardRecovery(feedId, reason, delayMs = 0) {
+        const key = this.normalizeFeedId(feedId);
+        if (!key) return;
+        const feed = this.feeds[key];
+        if (!feed?.pc) return;
+
+        const now = Date.now();
+        const nextAllowed = Number(feed.nextHardRecoveryAtMs) || 0;
+        if (nextAllowed > now) return;
+
+        const delay = Math.max(0, parseInt(delayMs, 10) || 0);
+        feed.nextHardRecoveryAtMs = now + Math.max(7000, delay + 3500);
+        this.cancelFeedHardRecovery(key);
+
+        feed.hardRecoveryTimer = setTimeout(async () => {
+            const current = this.feeds[key];
+            if (!current?.pc) return;
+            try {
+                await this.forceResubscribeFeed(key, reason);
+            } catch (err) {
+                this.log('subscribe', `Hard recovery failed for feed ${key} (${reason}): ${err.message}`);
+            }
+        }, delay);
+    },
+
+    async checkRemoteFeedHealth() {
+        if (this.remoteFeedHealthBusy) return;
+        this.remoteFeedHealthBusy = true;
+
+        try {
+        const now = Date.now();
+        for (const [feedId, feed] of Object.entries(this.feeds || {})) {
+            if (!feed?.pc) continue;
+            if (!this.feedHasLiveTrack(feed, 'video')) continue;
+
+            const cell = document.getElementById('remote-' + feedId);
+            const video = cell?.querySelector?.('video');
+            if (!video) continue;
+            if (video.paused) {
+                this.tryResumeRemoteVideo(video, feedId, 'health-paused');
+            }
+
+            const currentTime = Number(video.currentTime) || 0;
+            const inboundStats = await this.getInboundVideoHealthStats(feed.pc);
+            const inboundBytes = Number(inboundStats?.bytesReceived ?? 0);
+            const inboundFrames = Number(inboundStats?.framesDecoded ?? 0);
+            const inboundPackets = Number(inboundStats?.packetsReceived ?? 0);
+
+            const hasDecodedFrameNow = video.readyState >= 2 && (currentTime > 0.01 || inboundFrames > 0);
+            if (!feed.firstVideoFrameSeenAtMs && hasDecodedFrameNow) {
+                feed.firstVideoFrameSeenAtMs = now;
+            }
+
+            const firstTrackAtMs = Number(feed.lastVideoTrackAt || feed.lastTrackAt || 0);
+            if (!feed.firstVideoFrameSeenAtMs && firstTrackAtMs > 0) {
+                const sinceTrackMs = now - firstTrackAtMs;
+                if (sinceTrackMs >= 6000) {
+                    const nextRecoveryAtMs = Number(feed.nextVideoRecoveryAtMs) || 0;
+                    if (nextRecoveryAtMs <= now) {
+                        const recoveryCount = (parseInt(feed.videoStallRecoveryCount, 10) || 0) + 1;
+                        feed.videoStallRecoveryCount = recoveryCount;
+                        const useHardRecovery = recoveryCount >= 2;
+                        this.log(
+                            'subscribe',
+                            `Feed ${feedId} has no first decoded frame after ${Math.round(sinceTrackMs)}ms; recovery=${useHardRecovery ? 'hard-resubscribe' : 'refresh'} attempt=${recoveryCount}, frames=${inboundFrames}, bytes=${inboundBytes}, packets=${inboundPackets}`
+                        );
+                        this.tryResumeRemoteVideo(video, feedId, 'no-first-frame');
+                        if (useHardRecovery) {
+                            feed.videoStallRecoveryCount = 0;
+                            feed.nextVideoRecoveryAtMs = now + 10000;
+                            await this.forceResubscribeFeed(feedId, 'no-first-frame-watchdog');
+                            continue;
+                        }
+                        feed.nextVideoRecoveryAtMs = now + 6000;
+                        this.scheduleExistingSubscriberRefresh(feedId, 150, 'no-first-frame-watchdog', {
+                            requireVideo: true,
+                            force: true
+                        });
+                    }
+                }
+                continue;
+            }
+
+            if (video.readyState < 2) continue;
+            if (!Number.isFinite(feed.lastRenderVideoAtMs)) {
+                feed.lastRenderVideoAtMs = now;
+                feed.lastRenderVideoTime = currentTime;
+                feed.lastInboundVideoBytes = inboundBytes;
+                feed.lastInboundVideoFrames = inboundFrames;
+                feed.lastInboundVideoPackets = inboundPackets;
+                continue;
+            }
+
+            const lastVideoTime = Number(feed.lastRenderVideoTime) || 0;
+            const lastInboundBytes = Number(feed.lastInboundVideoBytes) || 0;
+            const lastInboundFrames = Number(feed.lastInboundVideoFrames) || 0;
+            const lastInboundPackets = Number(feed.lastInboundVideoPackets) || 0;
+
+            const renderProgressed = currentTime > (lastVideoTime + 0.03);
+            const framesProgressed = inboundFrames > lastInboundFrames;
+            const bytesProgressed = inboundBytes > (lastInboundBytes + 8192);
+            const packetsProgressed = inboundPackets > (lastInboundPackets + 3);
+            const hadDecodedFrame = (Number(feed.maxInboundDecodedFrames) || 0) > 0 || inboundFrames > 0;
+            if (inboundFrames > (Number(feed.maxInboundDecodedFrames) || 0)) {
+                feed.maxInboundDecodedFrames = inboundFrames;
+            }
+
+            // Decode/render progress is the primary health signal.
+            // Bytes/packets alone can keep increasing while video is frozen.
+            const mediaProgressed = renderProgressed || framesProgressed;
+            const bootstrapTrafficProgressed = !hadDecodedFrame && (bytesProgressed || packetsProgressed);
+
+            feed.lastInboundVideoBytes = inboundBytes;
+            feed.lastInboundVideoFrames = inboundFrames;
+            feed.lastInboundVideoPackets = inboundPackets;
+
+            if (mediaProgressed || bootstrapTrafficProgressed) {
+                feed.lastRenderVideoAtMs = now;
+                feed.lastRenderVideoTime = currentTime;
+                feed.videoStallRecoveryCount = 0;
+                continue;
+            }
+
+            const decodeStuckWithTraffic = hadDecodedFrame && !framesProgressed && !renderProgressed && (bytesProgressed || packetsProgressed);
+
+            const stalledMs = now - (Number(feed.lastRenderVideoAtMs) || now);
+            if (stalledMs < 5000) continue;
+
+            const nextRecoveryAtMs = Number(feed.nextVideoRecoveryAtMs) || 0;
+            if (nextRecoveryAtMs > now) continue;
+
+            const recoveryCount = (parseInt(feed.videoStallRecoveryCount, 10) || 0) + 1;
+            feed.videoStallRecoveryCount = recoveryCount;
+            const useHardRecovery = decodeStuckWithTraffic ? (recoveryCount >= 2) : (recoveryCount >= 3);
+
+            this.log(
+                'subscribe',
+                `Feed ${feedId} video appears stalled for ${Math.round(stalledMs)}ms; recovery=${useHardRecovery ? 'hard-resubscribe' : 'refresh'} attempt=${recoveryCount}, decodeStuckWithTraffic=${decodeStuckWithTraffic}, frameDelta=${inboundFrames - lastInboundFrames}, byteDelta=${inboundBytes - lastInboundBytes}, packetDelta=${inboundPackets - lastInboundPackets}`
+            );
+            this.tryResumeRemoteVideo(video, feedId, 'stalled-watchdog');
+
+            if (useHardRecovery) {
+                feed.videoStallRecoveryCount = 0;
+                feed.nextVideoRecoveryAtMs = now + 10000;
+                await this.forceResubscribeFeed(feedId, 'video-stalled-watchdog');
+                continue;
+            }
+
+            feed.nextVideoRecoveryAtMs = now + 6000;
+            this.scheduleExistingSubscriberRefresh(feedId, 150, 'video-stalled-watchdog', {
+                requireVideo: true,
+                force: true
+            });
+        }
+        } finally {
+            this.remoteFeedHealthBusy = false;
+        }
+    },
+
+    // ─── Controls ───────────────────────────────────────────────────────────────
 
     toggleMute() {
         // In PTT mode, mute button forces mute but keeps PTT enabled.
         if (this.pttEnabled) {
-            this.log('ptt', 'Mute button pressed during PTT â€” forcing mute, PTT stays enabled');
+            this.log('ptt', 'Mute button pressed during PTT — forcing mute, PTT stays enabled');
             this.pttKeyDown = false;
             this.isMuted = true;
             if (this.localStream) {
@@ -4837,11 +6953,66 @@ window.webrtcManager = {
         this.notifyDotNet('OnMuteChanged', this.isMuted);
     },
 
-    toggleCamera() {
-        this.isCameraOff = !this.isCameraOff;
-        if (this.localStream) {
-            this.localStream.getVideoTracks().forEach(t => t.enabled = !this.isCameraOff);
+    async toggleCamera() {
+        const nextCameraOff = !this.isCameraOff;
+        let shouldRenegotiate = false;
+
+        try {
+            if (nextCameraOff) {
+                this.stopLocalCameraTracks('toggle-camera-off');
+
+                if (this.publisherPc && !this.isScreenSharing) {
+                    const videoSender = this.findSenderByKind(this.publisherPc, 'video');
+                    if (videoSender) {
+                        await videoSender.replaceTrack(null);
+                        const transceiver = this.publisherPc.getTransceivers().find(t => t.sender === videoSender)
+                            || this.publisherPc.getTransceivers().find(t =>
+                                t.receiver?.track?.kind === 'video' || t.mid === '1');
+                        if (transceiver && (transceiver.direction === 'sendrecv' || transceiver.direction === 'sendonly')) {
+                            transceiver.direction = 'recvonly';
+                            shouldRenegotiate = true;
+                        }
+                    }
+                }
+
+                this.isCameraOff = true;
+            } else {
+                const videoTrack = await this.ensureLocalCameraTrack('toggle-camera-on');
+                videoTrack.enabled = true;
+
+                if (this.publisherPc && !this.isScreenSharing) {
+                    let videoSender = this.findSenderByKind(this.publisherPc, 'video');
+                    if (!videoSender) {
+                        videoSender = this.publisherPc.addTrack(videoTrack, this.localStream);
+                        shouldRenegotiate = true;
+                    } else {
+                        await videoSender.replaceTrack(videoTrack);
+                    }
+
+                    const transceiver = this.publisherPc.getTransceivers().find(t => t.sender === videoSender)
+                        || this.publisherPc.getTransceivers().find(t =>
+                            t.receiver?.track?.kind === 'video' || t.mid === '1');
+                    if (transceiver && transceiver.direction !== 'sendrecv') {
+                        transceiver.direction = 'sendrecv';
+                        shouldRenegotiate = true;
+                    }
+                }
+
+                this.isCameraOff = false;
+            }
+
+            if (shouldRenegotiate) {
+                await this.renegotiatePublisher(nextCameraOff ? 'camera-off' : 'camera-on');
+            }
+        } catch (err) {
+            this.logError('camera', `Camera toggle failed: ${err.message}`);
+            this.notifyDotNet('OnError', `Camera toggle failed: ${err.message}`);
+            if (!nextCameraOff) {
+                this.isCameraOff = true;
+                this.stopLocalCameraTracks('camera-toggle-revert');
+            }
         }
+
         this.notifyDotNet('OnCameraChanged', this.isCameraOff);
     },
 
@@ -4953,7 +7124,7 @@ window.webrtcManager = {
                 sharedVideoTrack,
                 fps,
                 'screenshare-capture',
-                { enforceResolutionCap: !isSystemShare }
+                { enforceResolutionCap: true }
             );
 
             // Some Windows builds attach display-audio slightly after getDisplayMedia resolves.
@@ -5043,27 +7214,63 @@ window.webrtcManager = {
                     }
 
                     const preferredTrack = this.selectPreferredScreenShareAudioTrack(stream);
-                    const audioSender = this.findSenderByKind(this.publisherPc, 'audio');
-                    if (!audioSender) return;
-
-                    const mixedOrPreferredTrack = await this.buildScreenShareOutgoingAudioTrack(
-                        preferredTrack,
-                        this.localStream?.getAudioTracks?.()[0] || null
-                    );
-                    await audioSender.replaceTrack(mixedOrPreferredTrack);
+                    if (this.currentConstraints.screenShareAudioEnabled !== false) {
+                        const separateAudioReady = await this.ensureScreenAudioPublisher(preferredTrack);
+                        if (this.publisherPc) {
+                            const audioSender = this.findSenderByKind(this.publisherPc, 'audio');
+                            const currentMicTrack = this.localStream?.getAudioTracks?.()[0] || null;
+                            if (audioSender) {
+                                if (separateAudioReady) {
+                                    await audioSender.replaceTrack(currentMicTrack);
+                                    await this.enforceSinglePublisherAudioSender(currentMicTrack);
+                                    this.log('screenshare', 'Updated main publisher audio sender with microphone (screen audio on separate feed)');
+                                } else {
+                                    const fallbackTrack = await this.buildScreenShareOutgoingAudioTrack(preferredTrack, currentMicTrack);
+                                    await audioSender.replaceTrack(fallbackTrack);
+                                    await this.enforceSinglePublisherAudioSender(fallbackTrack);
+                                    const fallbackIsMixed = !!(fallbackTrack && currentMicTrack && fallbackTrack.id !== currentMicTrack.id);
+                                    this.log(
+                                        'screenshare',
+                                        fallbackIsMixed
+                                            ? 'Screen-audio publisher unavailable; updated main publisher audio sender with mixed fallback track'
+                                            : 'Screen-audio publisher unavailable; updated main publisher audio sender with microphone fallback'
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        await this.stopScreenAudioPublisher('screenshare-audio-disabled');
+                    }
                 } catch (err) {
                     this.log('screenshare', `onaddtrack audio reconcile failed: ${err.message}`);
                 }
             };
 
             const outgoingScreenVideoTrack = this.screenStream.getVideoTracks()[0] || null;
-            const outgoingScreenAudioTrack = await this.buildScreenShareOutgoingAudioTrack(
-                this.selectPreferredScreenShareAudioTrack(this.screenStream),
-                this.localStream?.getAudioTracks?.()[0] || null
-            );
+            const outgoingScreenAudioTrack = this.selectPreferredScreenShareAudioTrack(this.screenStream);
+            const outgoingMainMicTrack = this.localStream?.getAudioTracks?.()[0] || null;
+            let outgoingMainAudioTrack = outgoingMainMicTrack;
+            let usingSeparateScreenAudioPublisher = false;
+            if (this.currentConstraints.screenShareAudioEnabled !== false) {
+                usingSeparateScreenAudioPublisher = await this.ensureScreenAudioPublisher(outgoingScreenAudioTrack);
+                if (!usingSeparateScreenAudioPublisher) {
+                    outgoingMainAudioTrack = await this.buildScreenShareOutgoingAudioTrack(outgoingScreenAudioTrack, outgoingMainMicTrack);
+                    const fallbackIsMixed = !!(outgoingMainAudioTrack && outgoingMainMicTrack && outgoingMainAudioTrack.id !== outgoingMainMicTrack.id);
+                    if (fallbackIsMixed) {
+                        this.log('screenshare', 'Separate screen-audio publisher unavailable; using mixed audio fallback on main publisher');
+                    } else if (outgoingMainAudioTrack) {
+                        this.log('screenshare', 'Separate screen-audio publisher unavailable; using microphone-only fallback on main publisher');
+                    } else {
+                        this.log('screenshare', 'Separate screen-audio publisher unavailable and no fallback audio track is available');
+                    }
+                }
+            } else {
+                await this.stopScreenAudioPublisher('screenshare-audio-disabled');
+            }
 
             const localVideo = document.getElementById('localVideo');
             if (localVideo) localVideo.srcObject = this.screenStream;
+            this.updateLocalFeedAvatarFallback();
 
             this.screenStream.getVideoTracks()[0].onended = () => {
                 const finalizeStop = () => {
@@ -5112,18 +7319,23 @@ window.webrtcManager = {
 
                 const audioSender = this.findSenderByKind(this.publisherPc, 'audio');
                 if (audioSender) {
-                    await audioSender.replaceTrack(outgoingScreenAudioTrack);
-                    if (outgoingScreenAudioTrack) {
-                        const usingMixedTrack = this.screenShareAudioMixTrack && outgoingScreenAudioTrack.id === this.screenShareAudioMixTrack.id;
-                        this.log('screenshare', usingMixedTrack
-                            ? 'Replaced audio sender track with mixed mic+screen track'
-                            : 'Replaced audio sender track for screen share');
+                    await audioSender.replaceTrack(outgoingMainAudioTrack);
+                    if (usingSeparateScreenAudioPublisher) {
+                        if (outgoingMainAudioTrack) {
+                            this.log('screenshare', 'Replaced main audio sender track with microphone (screen audio on separate feed)');
+                        } else {
+                            this.log('screenshare', 'No outgoing microphone track available for main publisher');
+                        }
+                    } else if (outgoingMainAudioTrack && outgoingMainMicTrack && outgoingMainAudioTrack.id !== outgoingMainMicTrack.id) {
+                        this.log('screenshare', 'Replaced main audio sender track with mixed mic+screen fallback');
+                    } else if (outgoingMainAudioTrack) {
+                        this.log('screenshare', 'Replaced main audio sender track with microphone fallback');
                     } else {
-                        this.log('screenshare', 'No outgoing screen-share audio track available (audio sender cleared)');
+                        this.log('screenshare', 'No outgoing audio track available for main publisher');
                     }
 
                     const t = this.publisherPc.getTransceivers().find(t => t.sender === audioSender);
-                    if (t && t.direction === 'recvonly' && outgoingScreenAudioTrack) {
+                    if (t && t.direction === 'recvonly' && outgoingMainAudioTrack) {
                         t.direction = 'sendrecv';
                         needsRenegotiation = true;
                         this.log('screenshare', 'Changed audio transceiver direction to sendrecv');
@@ -5132,7 +7344,7 @@ window.webrtcManager = {
                     this.log('screenshare', 'No sender found for audio track');
                 }
 
-                const audioChanged = await this.enforceSinglePublisherAudioSender(outgoingScreenAudioTrack);
+                const audioChanged = await this.enforceSinglePublisherAudioSender(outgoingMainAudioTrack);
                 needsRenegotiation = needsRenegotiation || audioChanged;
 
                 // Janus needs a new SDP offer when transceiver direction changes
@@ -5151,6 +7363,7 @@ window.webrtcManager = {
             this.stopPublisherVideoPerformanceGuard();
             this.clearScreenShareBitrateWarmupTimers();
             await this.cleanupScreenShareAudioMixTrack();
+            await this.stopScreenAudioPublisher('screenshare-start-error');
             await this.stopWindowsScreenAudioFallback(true);
             this.setSystemScreenShareAppPlaybackSuppressed(false);
             this.notifyDotNet('OnError', 'Screen share failed: ' + err.message);
@@ -5166,6 +7379,7 @@ window.webrtcManager = {
         this.clearScreenShareBitrateWarmupTimers();
         await this.stopWindowsScreenAudioFallback(true);
         await this.cleanupScreenShareAudioMixTrack();
+        await this.stopScreenAudioPublisher('screenshare-stop');
         this.setSystemScreenShareAppPlaybackSuppressed(false);
 
         if (this.screenStream) {
@@ -5179,6 +7393,7 @@ window.webrtcManager = {
         if (localVideo && this.localStream) {
             localVideo.srcObject = this.localStream;
         }
+        this.updateLocalFeedAvatarFallback();
 
         // Restore local tracks in publisher PC
         let needsRenegotiation = false;
@@ -5210,7 +7425,7 @@ window.webrtcManager = {
                     await vt.sender.replaceTrack(null);
                     vt.direction = 'recvonly';
                     needsRenegotiation = true;
-                    this.log('screenshare', 'No local camera â€” switched video transceiver back to recvonly');
+                    this.log('screenshare', 'No local camera — switched video transceiver back to recvonly');
                 }
             }
             // Same for audio if no local audio
@@ -5222,7 +7437,7 @@ window.webrtcManager = {
                     await at.sender.replaceTrack(null);
                     at.direction = 'recvonly';
                     needsRenegotiation = true;
-                    this.log('screenshare', 'No local audio â€” switched audio transceiver back to recvonly');
+                    this.log('screenshare', 'No local audio — switched audio transceiver back to recvonly');
                 }
             }
 
@@ -5238,7 +7453,7 @@ window.webrtcManager = {
         this.notifyDotNet('OnScreenShareChanged', false);
     },
 
-    // â”€â”€â”€ Push-to-talk â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Push-to-talk ─────────────────────────────────────────────────────────
 
     /**
      * Enable or disable push-to-talk mode.
@@ -5277,14 +7492,14 @@ window.webrtcManager = {
             window.addEventListener('blur', this._pttBlurHandler);
             document.addEventListener('visibilitychange', this._pttVisibilityHandler);
 
-            this.log('ptt', `PTT active â€” hold "${this.pttKey}" to talk`);
+            this.log('ptt', `PTT active — hold "${this.pttKey}" to talk`);
         } else {
-            // Exiting PTT mode â€” keep current manual mute state.
+            // Exiting PTT mode — keep current manual mute state.
             if (this.localStream) {
                 this.localStream.getAudioTracks().forEach(t => t.enabled = !this.isMuted);
             }
             this.notifyDotNet('OnMuteChanged', this.isMuted);
-            this.log('ptt', 'PTT disabled â€” manual mute state retained');
+            this.log('ptt', 'PTT disabled — manual mute state retained');
         }
     },
 
@@ -5501,7 +7716,7 @@ window.webrtcManager = {
         }
     },
 
-    // â”€â”€â”€ Stop everything â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Stop everything ────────────────────────────────────────────────────────
 
     stop(reason) {
         const stopReason = typeof reason === 'string' && reason.trim() ? reason.trim() : 'unspecified';
@@ -5513,11 +7728,13 @@ window.webrtcManager = {
         }
         this.stopKeepalive();
         this.stopParticipantCheck();
+        this.stopRemoteFeedHealthWatchdog();
         this.resetStreamInfoState();
         this.stopPublisherVideoPerformanceGuard();
         this.stopPublisherHealthWatchdog();
         this.clearScreenShareBitrateWarmupTimers();
         this.selectedSpotlightStreamKey = null;
+        this.controlOverlayHideTimers = new WeakMap();
         const videoGrid = document.getElementById('videoGrid');
         if (videoGrid) videoGrid.classList.remove('spotlight-mode');
         this.removePttListeners();
@@ -5528,6 +7745,7 @@ window.webrtcManager = {
         this.notifyHostPttConfig();
         this.stopWindowsScreenAudioFallback(true).catch(() => { });
         this.cleanupScreenShareAudioMixTrack().catch(() => { });
+        this.stopScreenAudioPublisher('manager-stop').catch(() => { });
         this.cleanupMusicBotGraph().catch(() => { });
         this.musicBotActive = false;
         this.musicBotTitle = '';
@@ -5566,17 +7784,34 @@ window.webrtcManager = {
             this.publisherPc.close();
             this.publisherPc = null;
         }
+        if (this.screenAudioPublisherPc) {
+            try { this.screenAudioPublisherPc.close(); } catch { }
+            this.screenAudioPublisherPc = null;
+        }
+        this.screenAudioPublisherHandleId = 0;
+        this.screenAudioPublisherConfigured = false;
+        this.screenAudioPublisherPendingCandidates = [];
         this.publisherConfigured = false;
         this.pendingJanusBitrateBps = 0;
+
+        Object.keys(this.nativeScreenReceivers || {}).forEach(userId => {
+            this.cleanupNativeScreenReceiver(userId, true);
+        });
+        this.nativeScreenReceivers = {};
+        this.nativeScreenPendingCandidates = {};
 
         Object.values(this.feeds).forEach(f => f.pc.close());
         this.feeds = {};
         this.remoteFeedVolumes = {};
         this.remoteIdentityVolumes = {};
+        this.hiddenRemoteFeeds = {};
+        this.hiddenRemoteFeedMeta = {};
         this.pendingSubscribes = {};
+        this.pendingSubscribeFeeds = {};
 
         const localVideo = document.getElementById('localVideo');
         if (localVideo) localVideo.srcObject = null;
+        this.updateLocalFeedAvatarFallback();
         const localCell = document.querySelector('#videoGrid .local-cell');
         if (localCell) {
             const localPanel = localCell.querySelector('.video-info-panel');
@@ -5593,14 +7828,16 @@ window.webrtcManager = {
         this.dotNetRef = null;
     },
 
-    // â”€â”€â”€ Signal delivery (from C# CallStore â†’ JS) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Signal delivery (from C# CallStore → JS) ──────────────────────────────
 
-    deliverSignal(fromUserId, signalType, payload) {
-        // For Janus SFU, signals are handled through the polling loop,
-        // not direct peer-to-peer. This is a no-op for the Janus flow.
+    async deliverSignal(fromUserId, signalType, payload) {
+        void fromUserId;
+        void signalType;
+        void payload;
+        // For Janus SFU, direct peer signals are not used. Polling loop handles Janus events.
     },
 
-    // â”€â”€â”€ Device enumeration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Device enumeration ─────────────────────────────────────────────────────
 
     async enumerateDevices() {
         try {
@@ -5614,12 +7851,14 @@ window.webrtcManager = {
                 }));
             this.log('devices', `Found ${filtered.length} devices`);
             this.notifyDotNet('OnDevicesEnumerated', JSON.stringify(filtered));
+            return filtered;
         } catch (err) {
             this.logError('devices', 'enumerateDevices failed: ' + err.message);
+            return [];
         }
     },
 
-    // â”€â”€â”€ Volume control â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Volume control ─────────────────────────────────────────────────────────
 
     setVolume(level) {
         this.ensureAudioContextActive();
@@ -5636,7 +7875,7 @@ window.webrtcManager = {
         this.refreshRemoteAudioRouting();
     },
 
-    // â”€â”€â”€ Settings update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Settings update ────────────────────────────────────────────────────────
 
     async updateSettings(settings) {
         this.log('settings', 'Applying settings:', settings);
@@ -5656,6 +7895,11 @@ window.webrtcManager = {
             settings.screenShareAudioEnabled !== undefined
                 ? settings.screenShareAudioEnabled !== false
                 : this.currentConstraints.screenShareAudioEnabled !== false;
+        const requestedScreenShareAutoGainEnabled =
+            settings.screenShareAutoGainEnabled !== undefined
+                ? settings.screenShareAutoGainEnabled !== false
+                : this.currentConstraints.screenShareAutoGainEnabled !== false;
+        let needsPublisherStateRenegotiation = false;
 
         // Re-acquire local stream with new device constraints
         await this.startLocalStream({
@@ -5665,8 +7909,13 @@ window.webrtcManager = {
             fps: settings.fps || 30,
             bitrateKbps,
             preferredVideoCodec: requestedVideoCodec,
-            screenShareAudioEnabled: requestedScreenShareAudioEnabled
+            screenShareAudioEnabled: requestedScreenShareAudioEnabled,
+            screenShareAutoGainEnabled: requestedScreenShareAutoGainEnabled
         });
+
+        if (this.screenAudioFallbackActive) {
+            this.applyWindowsScreenAudioFallbackGainMode('settings');
+        }
 
         // Replace tracks in publisher PeerConnection
         if (this.publisherPc && this.localStream) {
@@ -5680,28 +7929,66 @@ window.webrtcManager = {
             if (this.isScreenSharing) {
                 const activeFps = parseInt(settings.fps ?? this.currentConstraints.fps, 10) || 30;
                 const audioSender = this.findSenderByKind(this.publisherPc, 'audio');
+                const micTrack = this.localStream.getAudioTracks()[0] || null;
+                const screenAudioTrack = this.selectPreferredScreenShareAudioTrack(this.screenStream);
+                let nextMainAudioTrack = micTrack;
+                let separateScreenAudioReady = false;
+
+                if (this.currentConstraints.screenShareAudioEnabled !== false) {
+                    separateScreenAudioReady = await this.ensureScreenAudioPublisher(screenAudioTrack);
+                    if (!separateScreenAudioReady) {
+                        nextMainAudioTrack = await this.buildScreenShareOutgoingAudioTrack(screenAudioTrack, micTrack);
+                    }
+                } else {
+                    await this.stopScreenAudioPublisher('settings-disable-screenshare-audio');
+                }
+
                 if (audioSender) {
-                    const mixedOrPreferredTrack = await this.buildScreenShareOutgoingAudioTrack(
-                        this.screenStream?.getAudioTracks?.()[0] || null,
-                        this.localStream.getAudioTracks()[0] || null
-                    );
-                    await audioSender.replaceTrack(mixedOrPreferredTrack);
-                    await this.enforceSinglePublisherAudioSender(mixedOrPreferredTrack);
+                    await audioSender.replaceTrack(nextMainAudioTrack);
+                    await this.enforceSinglePublisherAudioSender(nextMainAudioTrack);
+                    if (!separateScreenAudioReady && this.currentConstraints.screenShareAudioEnabled !== false) {
+                        const fallbackIsMixed = !!(nextMainAudioTrack && micTrack && nextMainAudioTrack.id !== micTrack.id);
+                        this.log(
+                            'screenshare',
+                            fallbackIsMixed
+                                ? 'Settings update kept mixed mic+screen fallback on main publisher'
+                                : 'Settings update kept microphone fallback on main publisher'
+                        );
+                    }
                 }
 
                 const screenTrack = this.screenStream?.getVideoTracks?.()[0] || null;
-                const settingsSnapshot = screenTrack?.getSettings?.() || {};
-                const displaySurface = (settingsSnapshot.displaySurface || '').toString();
-                const shareTarget = this.classifyScreenShareTarget(displaySurface, (screenTrack?.label || '').toString());
                 await this.tuneScreenShareVideoTrackForPerformance(
                     screenTrack,
                     activeFps,
                     'screenshare-settings',
-                    { enforceResolutionCap: shareTarget !== 'system' }
+                    { enforceResolutionCap: true }
                 );
 
                 const videoSender = this.findSenderByKind(this.publisherPc, 'video');
                 await this.tuneScreenShareVideoSenderForPerformance(videoSender, activeFps, 'screenshare-settings');
+            } else {
+                const localVideoTrack = this.localStream.getVideoTracks()[0] || null;
+                const videoSender = this.findSenderByKind(this.publisherPc, 'video');
+                const videoTransceiver = this.publisherPc.getTransceivers().find(t => t.sender === videoSender)
+                    || this.publisherPc.getTransceivers().find(t =>
+                        t.receiver?.track?.kind === 'video' || t.mid === '1');
+
+                if (this.isCameraOff || !localVideoTrack) {
+                    if (videoSender) {
+                        await videoSender.replaceTrack(null);
+                    }
+                    if (videoTransceiver && (videoTransceiver.direction === 'sendrecv' || videoTransceiver.direction === 'sendonly')) {
+                        videoTransceiver.direction = 'recvonly';
+                        needsPublisherStateRenegotiation = true;
+                    }
+                } else if (videoSender) {
+                    await videoSender.replaceTrack(localVideoTrack);
+                    if (videoTransceiver && videoTransceiver.direction !== 'sendrecv') {
+                        videoTransceiver.direction = 'sendrecv';
+                        needsPublisherStateRenegotiation = true;
+                    }
+                }
             }
         }
 
@@ -5712,10 +7999,15 @@ window.webrtcManager = {
             this.scheduleScreenShareBitrateWarmup();
         }
 
-        // Codec preference changes need a renegotiation to take effect.
-        if (this.publisherPc && previousVideoCodec !== requestedVideoCodec) {
-            this.log('settings', `Preferred video codec changed ${previousVideoCodec} -> ${requestedVideoCodec}`);
-            await this.renegotiatePublisher('settings-codec');
+        // Codec and transceiver-direction changes need renegotiation to take effect.
+        if (this.publisherPc && (needsPublisherStateRenegotiation || previousVideoCodec !== requestedVideoCodec)) {
+            if (previousVideoCodec !== requestedVideoCodec) {
+                this.log('settings', `Preferred video codec changed ${previousVideoCodec} -> ${requestedVideoCodec}`);
+            }
+            const renegotiateTag = needsPublisherStateRenegotiation && previousVideoCodec !== requestedVideoCodec
+                ? 'settings-camera-codec'
+                : (needsPublisherStateRenegotiation ? 'settings-camera-state' : 'settings-codec');
+            await this.renegotiatePublisher(renegotiateTag);
         }
 
         // Re-enumerate to refresh labels (some browsers only show labels after permission)
@@ -5731,6 +8023,7 @@ window.webrtcManager = {
                 localVideo.srcObject = this.localStream;
             }
         }
+        this.updateLocalFeedAvatarFallback();
         this.ensureLocalFeedCellControls();
 
         for (const [feedId, feed] of Object.entries(this.feeds)) {
@@ -5766,7 +8059,7 @@ window.webrtcManager = {
         this.applySpotlightLayout();
     },
 
-    // â”€â”€â”€ Floating video helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── Floating video helpers ─────────────────────────────────────────────────
 
     /**
      * Clone the local video stream into a floating overlay container.
@@ -5780,15 +8073,21 @@ window.webrtcManager = {
 
         const primaryRemote = this.getPrimaryRemoteFeedForFloat();
         if (primaryRemote?.stream) {
-            const normalized = this.normalizeRemotePlaybackStream(primaryRemote.stream, primaryRemote.feedId);
+            const normalized = primaryRemote.isLocal
+                ? primaryRemote.stream
+                : this.normalizeRemotePlaybackStream(primaryRemote.stream, primaryRemote.feedId);
             floatVideo.srcObject = normalized;
-            floatVideo.dataset.feedId = String(primaryRemote.feedId);
+            if (primaryRemote.isLocal) {
+                delete floatVideo.dataset.feedId;
+            } else {
+                floatVideo.dataset.feedId = String(primaryRemote.feedId);
+            }
             this.detachRemoteFeedElementGain(floatVideo);
             // Keep float preview silent to avoid duplicate playback sinks.
             floatVideo.muted = true;
             floatVideo.volume = 0;
             floatVideo.play?.().catch(() => { });
-            this.log('float', `Bound remote feed ${primaryRemote.feedId} to #${containerId}`);
+            this.log('float', `Bound ${primaryRemote.isLocal ? 'local spotlight' : `remote feed ${primaryRemote.feedId}`} to #${containerId}`);
             return;
         }
 

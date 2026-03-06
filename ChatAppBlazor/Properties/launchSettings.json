@@ -2,8 +2,7 @@
   "profiles": {
     "Windows Machine": {
       "commandName": "Project",
-      "nativeDebugging": false,
-      "jsWebView2Debugging": true
+      "nativeDebugging": false
     }
   }
 }

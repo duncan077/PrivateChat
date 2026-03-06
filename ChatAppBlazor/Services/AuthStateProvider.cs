@@ -100,6 +100,18 @@ public class AuthStateProvider
         OnAuthStateChanged?.Invoke();
     }
 
+    public void UpdateCurrentUserProfile(string displayName, string? avatarUrl)
+    {
+        if (CurrentUser == null)
+        {
+            return;
+        }
+
+        CurrentUser.DisplayName = displayName;
+        CurrentUser.AvatarUrl = avatarUrl;
+        OnAuthStateChanged?.Invoke();
+    }
+
     private static void ClearPersistedSession()
     {
         Preferences.Default.Remove(PrefRememberMe);
