@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>24</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>ChatApp.Droid</RootNamespace>
+    <!--
+      Distinct from the MAUI client's com.duncancc.ChatFlow so both can be installed
+      side by side while this rewrite reaches parity. Flip to com.duncancc.ChatFlow
+      at cutover so existing installs upgrade in place.
+    -->
+    <ApplicationId>com.duncancc.ChatFlow.next</ApplicationId>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.8.0</ApplicationDisplayVersion>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
+    <RuntimeIdentifiers>android-arm64;android-arm;android-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AndroidResource Include="Icon.png">
+      <Link>Resources\drawable\Icon.png</Link>
+    </AndroidResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Android" Version="12.1.1" />
+    <PackageReference Include="Xamarin.AndroidX.Core.SplashScreen" Version="1.0.1.15" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ChatApp.Ui\ChatApp.Ui.csproj" />
+    <!--
+      Compiles fine, but calls into libdatachannel/FFmpeg will fail at runtime until
+      android-arm64/arm/x64 natives are cross-compiled (see the native build scripts).
+    -->
+    <ProjectReference Include="..\ChatApp.Media\ChatApp.Media.csproj" />
+  </ItemGroup>
+</Project>

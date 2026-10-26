@@ -1,12 +1,12 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
 
     <PropertyGroup>
-		<TargetFrameworks>net10.0-android</TargetFrameworks>
-		<TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('linux'))">$(TargetFrameworks);net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
-		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+		<TargetFrameworks>net11.0-android</TargetFrameworks>
+		<TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('linux'))">$(TargetFrameworks);net11.0-ios;net11.0-maccatalyst</TargetFrameworks>
+		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net11.0-windows10.0.19041.0</TargetFrameworks>
 
 		<!-- Uncomment to also build the tizen app. You will need to install tizen by following this: https://github.com/Samsung/Tizen.NET -->
-        <!-- <TargetFrameworks>$(TargetFrameworks);net10.0-tizen</TargetFrameworks> -->
+        <!-- <TargetFrameworks>$(TargetFrameworks);net11.0-tizen</TargetFrameworks> -->
 
         <!-- Note for MacCatalyst:
             The default runtime is maccatalyst-x64, except in Release config, in which case the default is maccatalyst-x64;maccatalyst-arm64.
@@ -24,47 +24,87 @@
         <Nullable>enable</Nullable>
 
         <!-- Display name -->
-        <ApplicationTitle>ChatAppBlazor</ApplicationTitle>
+        <ApplicationTitle>ChatFlow</ApplicationTitle>
 
         <!-- App Identifier -->
-        <ApplicationId>com.companyname.chatappblazor</ApplicationId>
+        <ApplicationId>com.duncancc.ChatFlow</ApplicationId>
 
         <!-- Versions -->
-        <ApplicationDisplayVersion>1.7.3</ApplicationDisplayVersion>
-        <ApplicationVersion>1</ApplicationVersion>
+        <ApplicationDisplayVersion>1.9.19</ApplicationDisplayVersion>
+        <ApplicationVersion>28</ApplicationVersion>
 
         <!-- To develop, package, and publish an app to the Microsoft Store, see: https://aka.ms/MauiTemplateUnpackaged -->
         <WindowsPackageType>None</WindowsPackageType>
 
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">15.0</SupportedOSPlatformVersion>
-		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">24.0</SupportedOSPlatformVersion>
+		<!-- Android 9 (API 28) minimum. -->
+		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">28.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</SupportedOSPlatformVersion>
 		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
 		<PublishAot>False</PublishAot>
     </PropertyGroup>
 
-    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Release|net10.0-android|AnyCPU'">
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Release|net11.0-android|AnyCPU'">
       <AndroidPackageFormat>apk</AndroidPackageFormat>
-      <RunAOTCompilation>False</RunAOTCompilation>
+      <!-- .NET 11 removed the Mono runtime for Android (NETSDK1242): CoreCLR is
+           the only runtime, and every Mono-era AOT knob below died with it —
+           profiled AOT, LLVM AOT, IL stripping, marshal methods. They are guarded
+           rather than deleted so they revive automatically if this head ever
+           targets a Mono-capable framework (net10.0-android) again. -->
+      <RunAOTCompilation Condition="'$(UseMonoRuntime)' == 'true'">True</RunAOTCompilation>
+      <AndroidEnableProfiledAot Condition="'$(UseMonoRuntime)' == 'true'">True</AndroidEnableProfiledAot>
+      <AndroidStripILAfterAOT Condition="'$(UseMonoRuntime)' == 'true'">true</AndroidStripILAfterAOT>
+      <AndroidEnableMarshalMethods Condition="'$(UseMonoRuntime)' == 'true'">true</AndroidEnableMarshalMethods>
+      <EnableLLVM Condition="'$(UseMonoRuntime)' == 'true'">true</EnableLLVM>
+      <ApplicationTitle>ChatFlow</ApplicationTitle>
     </PropertyGroup>
 
-    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net10.0-android|AnyCPU'">
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net11.0-android|AnyCPU'">
       <RunAOTCompilation>False</RunAOTCompilation>
+      <ApplicationTitle>ChatFlow</ApplicationTitle>
     </PropertyGroup>
 
-    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)'=='Release|net10.0-windows10.0.19041.0'">
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)'=='Release|net11.0-windows10.0.19041.0'">
       <PublishSingleFile>False</PublishSingleFile>
       <SelfContained>False</SelfContained>
       <DebugSymbols>False</DebugSymbols>
       <DebugType>None</DebugType>
       <CopyOutputSymbolsToPublishDirectory>False</CopyOutputSymbolsToPublishDirectory>
       <GenerateWindowsPublishZip>true</GenerateWindowsPublishZip>
+      <!-- Precompile to native on publish so the Blazor + MudBlazor + MagicOnion/MessagePack
+           graph is not JIT-compiled at every cold start. Android Release already enables
+           profiled AOT above; Windows had no equivalent. Affects cold start only. -->
+      <PublishReadyToRun>true</PublishReadyToRun>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net11.0-ios|AnyCPU'">
+      <ApplicationTitle>ChatFlow</ApplicationTitle>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net11.0-maccatalyst|AnyCPU'">
+      <ApplicationTitle>ChatFlow</ApplicationTitle>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net11.0-windows10.0.19041.0|AnyCPU'">
+      <ApplicationTitle>ChatFlow</ApplicationTitle>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Release|net11.0-ios|AnyCPU'">
+      <ApplicationTitle>ChatFlow</ApplicationTitle>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Release|net11.0-maccatalyst|AnyCPU'">
+      <ApplicationTitle>ChatFlow</ApplicationTitle>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Release|net11.0-windows10.0.19041.0|AnyCPU'">
+      <ApplicationTitle>ChatFlow</ApplicationTitle>
     </PropertyGroup>
 
     <ItemGroup>
         <!-- App Icon -->
-        <MauiIcon Include="Resources\AppIcon\appicon.svg" ForegroundFile="Resources\AppIcon\appiconfg.svg" Color="#1e1e2e" />
+        <MauiIcon Include="Resources\AppIcon\appicon.png" />
 
         <!-- Splash Screen -->
         <MauiSplashScreen Include="Resources\Splash\splash.svg" Color="#1e1e2e" BaseSize="128,128" />
@@ -80,19 +120,21 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="MagicOnion.Client" Version="7.10.0" />
-        <PackageReference Include="Microsoft.Maui.Controls" Version="10.0.41" />
-        <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="10.0.41" />
-        <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="10.0.3" />
-			<PackageReference Include="Grpc.Net.Client" Version="2.76.0" />
-			<PackageReference Include="MessagePack" Version="3.1.4" />
-			<PackageReference Include="MudBlazor" Version="9.1.0" />
+        <PackageReference Include="MagicOnion.Client" Version="7.10.2" />
+        <PackageReference Include="Microsoft.Maui.Controls" Version="11.0.0-preview.7.26406.9" />
+        <PackageReference Include="Microsoft.AspNetCore.Components.WebView.Maui" Version="11.0.0-preview.7.26406.9" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="11.0.0-preview.7.26381.103" />
+			<PackageReference Include="Grpc.Net.Client" Version="2.83.0" />
+			<PackageReference Include="MessagePack" Version="3.1.8" />
+			<PackageReference Include="MudBlazor" Version="9.7.0" />
+			<PackageReference Include="Markdig" Version="0.41.3" />
 		
     </ItemGroup>
 
     <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
         <PackageReference Include="DataChannelDotnet" Version="1.3.1" />
-        <PackageReference Include="NAudio" Version="2.2.1" />
+        <PackageReference Include="NAudio" Version="2.3.0" />
+        <PackageReference Include="System.Management" Version="11.0.0-preview.7.26381.103" />
         <None Update="Platforms\Windows\ApplicationLoopback.dll" Condition="Exists('Platforms\\Windows\\ApplicationLoopback.dll')">
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
             <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
@@ -109,9 +151,7 @@
       </None>
     </ItemGroup>
 
-    <Target Name="ZipWindowsPublishOutput"
-            AfterTargets="Publish"
-            Condition="'$(GenerateWindowsPublishZip)' == 'true' and '$(TargetPlatformIdentifier)' == 'windows' and '$(PublishDir)' != ''">
+    <Target Name="ZipWindowsPublishOutput" AfterTargets="Publish" Condition="'$(GenerateWindowsPublishZip)' == 'true' and '$(TargetPlatformIdentifier)' == 'windows' and '$(PublishDir)' != ''">
         <PropertyGroup>
             <_ZipRidSuffix Condition="'$(RuntimeIdentifier)' != ''">-$(RuntimeIdentifier)</_ZipRidSuffix>
             <WindowsPublishZipPath>$(PublishDir)..\$(AssemblyName)-$(ApplicationDisplayVersion)-$(Configuration)$(_ZipRidSuffix).zip</WindowsPublishZipPath>

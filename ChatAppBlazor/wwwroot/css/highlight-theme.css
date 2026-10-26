@@ -1,0 +1,82 @@
+/* Code block theme for highlight.js output. The block carries its own dark
+   background (set on .chat-msg-body pre in app.css), so these colors hold
+   regardless of the surrounding chat theme. Palette follows github-dark. */
+
+.chat-msg-body .hljs {
+    color: #e6edf3;
+    background: transparent;
+}
+
+.hljs-comment,
+.hljs-quote {
+    color: #8b949e;
+    font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-meta .hljs-keyword,
+.hljs-template-tag,
+.hljs-type {
+    color: #ff7b72;
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-meta .hljs-string {
+    color: #a5d6ff;
+}
+
+.hljs-number,
+.hljs-literal,
+.hljs-symbol,
+.hljs-bullet {
+    color: #79c0ff;
+}
+
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.function_,
+.hljs-section {
+    color: #d2a8ff;
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id,
+.hljs-selector-pseudo {
+    color: #79c0ff;
+}
+
+.hljs-built_in,
+.hljs-name,
+.hljs-tag {
+    color: #7ee787;
+}
+
+.hljs-meta,
+.hljs-doctag {
+    color: #8b949e;
+}
+
+.hljs-addition {
+    color: #aff5b4;
+    background-color: rgba(46, 160, 67, 0.15);
+}
+
+.hljs-deletion {
+    color: #ffdcd7;
+    background-color: rgba(248, 81, 73, 0.15);
+}
+
+.hljs-emphasis {
+    font-style: italic;
+}
+
+.hljs-strong {
+    font-weight: 600;
+}

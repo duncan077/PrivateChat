@@ -1,0 +1,74 @@
+@using Shared.Models
+@implements IDisposable
+@inject ServerAssetStore Assets
+@inject IDialogService Dialogs
+
+@* Shared sticker library. Picking one closes the dialog and returns the sticker, which
+   the caller sends as an ordinary image attachment. *@
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">Stickers</MudText>
+    </TitleContent>
+    <DialogContent>
+        <MudTextField @bind-Value="_filter" Immediate="true" Margin="Margin.Dense" Variant="Variant.Outlined"
+                      Placeholder="Filter by name"
+                      Adornment="Adornment.Start" AdornmentIcon="@Icons.Material.Filled.Search" />
+
+        @if (Filtered.Count == 0)
+        {
+            <MudText Typo="Typo.body2" Color="Color.Secondary" Class="mt-3">
+                @(Assets.Stickers.Count == 0 ? "No stickers yet — add one below." : "No stickers match that name.")
+            </MudText>
+        }
+        else
+        {
+            <div class="chat-asset-grid mt-2">
+                @foreach (var sticker in Filtered)
+                {
+                    <button type="button" class="chat-asset-tile" @key="sticker.Id"
+                            title="@sticker.Name" @onclick="() => Pick(sticker)">
+                        <img src="@sticker.Url" alt="@sticker.Name" loading="lazy" />
+                        <span class="chat-asset-tile-name">@sticker.Name</span>
+                    </button>
+                }
+            </div>
+        }
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="OpenManage">Manage</MudButton>
+        <MudButton OnClick="Close">Close</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter] private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    private string _filter = string.Empty;
+
+    private List<CustomAssetInfo> Filtered => string.IsNullOrWhiteSpace(_filter)
+        ? Assets.Stickers
+        : Assets.Stickers.Where(s => s.Name.Contains(_filter.Trim(), StringComparison.OrdinalIgnoreCase)).ToList();
+
+    protected override async Task OnInitializedAsync()
+    {
+        Assets.OnChange += HandleChange;
+        // Pull-based propagation: opening the picker is when we re-check the server.
+        await Assets.RefreshAsync();
+    }
+
+    private void HandleChange() => InvokeAsync(StateHasChanged);
+
+    private void Pick(CustomAssetInfo sticker) => MudDialog.Close(DialogResult.Ok(sticker));
+
+    private async Task OpenManage()
+    {
+        var parameters = new DialogParameters { { nameof(ManageAssetsDialog.Kind), CustomAssetKind.Sticker } };
+        await Dialogs.ShowAsync<ManageAssetsDialog>("Stickers", parameters,
+            new DialogOptions { MaxWidth = MaxWidth.Small, FullWidth = true });
+    }
+
+    private void Close() => MudDialog.Close();
+
+    public void Dispose() => Assets.OnChange -= HandleChange;
+}

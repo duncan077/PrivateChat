@@ -52,9 +52,20 @@ namespace ChatAppBlazor
             builder.Services.AddSingleton<GrpcChannelProvider>();
             builder.Services.AddSingleton<ChatClientService>();
             builder.Services.AddSingleton<ApiClientService>();
+            builder.Services.AddSingleton<MarkdownRenderService>();
             builder.Services.AddSingleton<ISystemNotificationService, SystemNotificationService>();
 
+            // Screen-share annotation overlay. Windows draws remote participants'
+            // strokes on the real desktop; other platforms fall back to in-app
+            // rendering over the video.
+#if WINDOWS
+            builder.Services.AddSingleton<IScreenAnnotationOverlay, Platforms.Windows.WindowsScreenAnnotationOverlay>();
+#else
+            builder.Services.AddSingleton<IScreenAnnotationOverlay, NullScreenAnnotationOverlay>();
+#endif
+
             // State stores (singletons — Blazor components subscribe to their events)
+            builder.Services.AddSingleton<ServerAssetStore>();
             builder.Services.AddSingleton<ChatRoomStore>();
             builder.Services.AddSingleton<DirectMessageStore>();
             builder.Services.AddSingleton<CallStore>();

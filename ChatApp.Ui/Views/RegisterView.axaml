@@ -1,0 +1,64 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:ChatApp.Ui.ViewModels"
+             mc:Ignorable="d" d:DesignWidth="900" d:DesignHeight="600"
+             x:Class="ChatApp.Ui.Views.RegisterView"
+             x:DataType="vm:RegisterViewModel">
+
+  <Border Padding="24" HorizontalAlignment="Center" VerticalAlignment="Center">
+    <StackPanel Width="340" Spacing="12">
+
+      <TextBlock Text="ChatFlow"
+                 FontSize="28"
+                 FontWeight="SemiBold"
+                 HorizontalAlignment="Center" />
+
+      <TextBlock Text="Create your account"
+                 Opacity="0.7"
+                 Margin="0,0,0,12"
+                 HorizontalAlignment="Center" />
+
+      <TextBox Watermark="Username"
+               Text="{Binding UserName}"
+               IsEnabled="{Binding !IsBusy}" />
+
+      <TextBox Watermark="Display name (optional)"
+               Text="{Binding DisplayName}"
+               IsEnabled="{Binding !IsBusy}" />
+
+      <TextBox Watermark="Password"
+               PasswordChar="•"
+               Text="{Binding Password}"
+               IsEnabled="{Binding !IsBusy}" />
+
+      <TextBox Watermark="Confirm password"
+               PasswordChar="•"
+               Text="{Binding ConfirmPassword}"
+               IsEnabled="{Binding !IsBusy}" />
+
+      <TextBlock Text="{Binding ErrorMessage}"
+                 Foreground="{DynamicResource SystemFillColorCriticalBrush}"
+                 TextWrapping="Wrap"
+                 IsVisible="{Binding ErrorMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+
+      <Button Content="Create account"
+              Command="{Binding RegisterCommand}"
+              IsEnabled="{Binding !IsBusy}"
+              HorizontalAlignment="Stretch"
+              HorizontalContentAlignment="Center"
+              Classes="accent" />
+
+      <Button Content="Back to sign in"
+              Command="{Binding GoBackCommand}"
+              IsEnabled="{Binding !IsBusy}"
+              HorizontalAlignment="Center"
+              Background="Transparent" />
+
+      <ProgressBar IsIndeterminate="True"
+                   IsVisible="{Binding IsBusy}"
+                   Height="3" />
+    </StackPanel>
+  </Border>
+</UserControl>

@@ -1,3 +1,4 @@
+using ChatAppBlazor.Serialization;
 using MagicOnion.Client;
 using Shared.Models;
 using Shared.Requests;
@@ -96,11 +97,25 @@ public class ApiClientService
         return await client.DeleteRoomAsync(roomId);
     }
 
+    public async Task<ChatRoomInfo> RenameRoomAsync(Guid roomId, string name)
+    {
+        var client = MagicOnionClient.Create<IChatRoomService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.RenameRoomAsync(new RenameRoomRequest { RoomId = roomId, Name = name });
+    }
+
     public async Task<ServerMemberInfo[]> GetServerMembersAsync()
     {
         var client = MagicOnionClient.Create<IChatRoomService>(
             _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
         return await client.GetServerMembersAsync();
+    }
+
+    public async Task<RoomCallParticipantsInfo[]> GetRoomCallParticipantsAsync()
+    {
+        var client = MagicOnionClient.Create<IChatRoomService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.GetRoomCallParticipantsAsync();
     }
 
     public async Task<ChatMemberInfo[]> GetRoomMembersAsync(Guid roomId)
@@ -115,6 +130,87 @@ public class ApiClientService
         var client = MagicOnionClient.Create<IChatRoomService>(
             _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
         return await client.GetRoomMessagesAsync(roomId, count, before);
+    }
+
+    public async Task<ChatMessage[]> GetRoomMessagePageAsync(Guid roomId, int count = 50, MessageCursor? before = null, MessageCursor? after = null)
+    {
+        var client = MagicOnionClient.Create<IChatRoomService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.GetRoomMessagePageAsync(roomId, count, before, after);
+    }
+
+    public async Task<PrivateMessage[]> GetPrivateMessagePageAsync(Guid otherUserId, int count = 50, MessageCursor? before = null, MessageCursor? after = null)
+    {
+        var client = MagicOnionClient.Create<IPrivateMessageService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.GetMessagePageAsync(otherUserId, count, before, after);
+    }
+
+    public async Task<ChatMessage[]> GetRoomMessagesAroundAsync(Guid roomId, Guid messageId, int contextCount = 15)
+    {
+        var client = MagicOnionClient.Create<IChatRoomService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.GetRoomMessagesAroundAsync(roomId, messageId, contextCount);
+    }
+
+    public async Task<CustomAssetInfo[]> GetCustomAssetsAsync()
+    {
+        var client = MagicOnionClient.Create<IServerAssetService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.GetAssetsAsync();
+    }
+
+    public async Task<CustomAssetInfo> CreateCustomAssetAsync(CustomAssetKind kind, string name, string url)
+    {
+        var client = MagicOnionClient.Create<IServerAssetService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.CreateAssetAsync(new CreateCustomAssetRequest
+        {
+            Kind = kind,
+            Name = name,
+            Url = url
+        });
+    }
+
+    public async Task<bool> DeleteCustomAssetAsync(Guid assetId)
+    {
+        var client = MagicOnionClient.Create<IServerAssetService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.DeleteAssetAsync(assetId);
+    }
+
+    public async Task<SearchResultInfo[]> SearchRoomMessagesAsync(string query, Guid? roomId = null, DateTime? before = null, int count = 30)
+    {
+        var client = MagicOnionClient.Create<IChatRoomService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.SearchMessagesAsync(new SearchMessagesRequest
+        {
+            Query = query,
+            RoomId = roomId,
+            Before = before,
+            Count = count
+        });
+    }
+
+    public async Task<PrivateMessage[]> SearchPrivateMessagesAsync(string query, DateTime? before = null, int count = 30)
+    {
+        var client = MagicOnionClient.Create<IPrivateMessageService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.SearchMessagesAsync(query, count, before);
+    }
+
+    public async Task<RoomUnreadState[]> GetRoomUnreadStatesAsync()
+    {
+        var client = MagicOnionClient.Create<IChatRoomService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.GetRoomUnreadStatesAsync();
+    }
+
+    public async Task<PrivateUnreadInfo[]> GetPrivateUnreadCountsAsync()
+    {
+        var client = MagicOnionClient.Create<IPrivateMessageService>(
+            _channelProvider.GetChannel(), _channelProvider.GetAuthFilters());
+        return await client.GetUnreadCountsAsync();
     }
 
     public async Task<UserInfo[]> GetContactsAsync()
@@ -150,7 +246,7 @@ public class ApiClientService
         using var response = await client.PostAsync("api/upload", multipart, cancellationToken);
         response.EnsureSuccessStatusCode();
 
-        var upload = await response.Content.ReadFromJsonAsync<UploadResponse>(cancellationToken: cancellationToken);
+        var upload = await response.Content.ReadFromJsonAsync(AppJsonContext.Default.UploadResponse, cancellationToken);
         if (upload == null)
         {
             throw new InvalidOperationException("Upload failed: empty response.");
@@ -182,6 +278,12 @@ public class ApiClientService
             && !string.Equals(sourceUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
         {
             return null;
+        }
+
+        if (IsYouTubeUrl(sourceUri))
+        {
+            var ytPreview = await GetYouTubePreviewAsync(sourceUri, cancellationToken);
+            if (ytPreview != null) return ytPreview;
         }
 
         try
@@ -279,7 +381,7 @@ public class ApiClientService
         return client;
     }
 
-    private sealed class UploadResponse
+    internal sealed class UploadResponse
     {
         [JsonPropertyName("id")]
         public Guid Id { get; set; }
@@ -416,6 +518,85 @@ public class ApiClientService
             Title = host,
             SiteName = host
         };
+    }
+
+    private static bool IsYouTubeUrl(Uri uri)
+    {
+        var host = uri.Host.ToLowerInvariant();
+        return host is "youtube.com" or "www.youtube.com" or "m.youtube.com" or "youtu.be";
+    }
+
+    private static string? ExtractYouTubeVideoId(Uri uri)
+    {
+        var host = uri.Host.ToLowerInvariant();
+        if (host == "youtu.be")
+            return uri.AbsolutePath.TrimStart('/').Split('/')[0];
+
+        var segments = uri.AbsolutePath.TrimStart('/').Split('/');
+        if (segments.Length >= 2 && segments[0] is "shorts" or "live" or "embed")
+            return segments[1];
+
+        return GetUriQueryParam(uri, "v");
+    }
+
+    private static string? GetUriQueryParam(Uri uri, string param)
+    {
+        var query = uri.Query.TrimStart('?');
+        foreach (var part in query.Split('&'))
+        {
+            var kv = part.Split('=', 2);
+            if (kv.Length == 2 && kv[0] == param)
+                return Uri.UnescapeDataString(kv[1]);
+        }
+        return null;
+    }
+
+    private async Task<LinkPreviewInfo?> GetYouTubePreviewAsync(Uri videoUri, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var oEmbedUrl = $"https://www.youtube.com/oembed?url={Uri.EscapeDataString(videoUri.ToString())}&format=json";
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+            using var request = new HttpRequestMessage(HttpMethod.Get, oEmbedUrl);
+            request.Headers.UserAgent.ParseAdd(PreviewUserAgent);
+            using var response = await client.SendAsync(request, cancellationToken);
+            if (!response.IsSuccessStatusCode) return null;
+
+            var oembed = await response.Content.ReadFromJsonAsync(AppJsonContext.Default.YouTubeOEmbedResponse, cancellationToken);
+            if (oembed == null) return null;
+
+            var videoId = ExtractYouTubeVideoId(videoUri);
+            var thumbnail = !string.IsNullOrWhiteSpace(oembed.ThumbnailUrl)
+                ? oembed.ThumbnailUrl
+                : videoId != null ? $"https://img.youtube.com/vi/{videoId}/hqdefault.jpg" : null;
+
+            return new LinkPreviewInfo
+            {
+                Url = videoUri.ToString(),
+                CanonicalUrl = videoUri.ToString(),
+                Title = NormalizeText(oembed.Title) ?? "YouTube Video",
+                Description = NormalizeText(oembed.AuthorName != null ? $"by {oembed.AuthorName}" : null),
+                SiteName = "YouTube",
+                ImageUrl = thumbnail ?? string.Empty,
+                IconUrl = "https://www.youtube.com/favicon.ico"
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    internal sealed class YouTubeOEmbedResponse
+    {
+        [JsonPropertyName("title")]
+        public string? Title { get; set; }
+
+        [JsonPropertyName("author_name")]
+        public string? AuthorName { get; set; }
+
+        [JsonPropertyName("thumbnail_url")]
+        public string? ThumbnailUrl { get; set; }
     }
 
     private static string? FindTitle(string html)

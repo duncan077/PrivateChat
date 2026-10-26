@@ -239,7 +239,12 @@ public sealed class ChatHubClient : IChatHubReceiver, IAsyncDisposable
     void IChatHubReceiver.OnUserLeftVoiceVideo(Guid roomId, Guid userId) => UserLeftVoiceVideo?.Invoke(roomId, userId);
 
     void IChatHubReceiver.OnMessageDeleted(Guid roomId, Guid messageId) { }
+    void IChatHubReceiver.OnMessageEdited(Guid roomId, Guid messageId, string content, Guid[] mentionedUserIds, DateTime editedAt) { }
+    void IChatHubReceiver.OnMessageReactionChanged(Guid roomId, Guid messageId, Guid userId, string emoji, bool added) { }
+    void IChatHubReceiver.OnTyping(Guid roomId, Guid userId, string userName) { }
+    void IChatHubReceiver.OnRoomRead(Guid roomId, DateTime lastReadAt) { }
     void IChatHubReceiver.OnRoomDeleted(Guid roomId) { }
+    void IChatHubReceiver.OnRoomRenamed(Guid roomId, string newName) { }
     void IChatHubReceiver.OnUserJoinedRoom(Guid roomId, ChatMemberInfo member) { }
     void IChatHubReceiver.OnUserLeftRoom(Guid roomId, Guid userId) { }
     void IChatHubReceiver.OnUserKicked(Guid roomId, Guid userId, string reason) { }
@@ -249,9 +254,16 @@ public sealed class ChatHubClient : IChatHubReceiver, IAsyncDisposable
     void IChatHubReceiver.OnUserProfileUpdated(UserProfileUpdateInfo profile) { }
     void IChatHubReceiver.OnPrivateMessageReceived(PrivateMessage message) { }
     void IChatHubReceiver.OnPrivateMessagesRead(Guid userId) { }
+    void IChatHubReceiver.OnPrivateMessageDeleted(Guid senderId, Guid recipientId, Guid messageId) { }
+    void IChatHubReceiver.OnPrivateMessageEdited(Guid senderId, Guid recipientId, Guid messageId, string content, DateTime editedAt) { }
+    void IChatHubReceiver.OnPrivateMessageReactionChanged(Guid senderId, Guid recipientId, Guid messageId, Guid userId, string emoji, bool added) { }
+    void IChatHubReceiver.OnPrivateTyping(Guid userId, string userName) { }
+    void IChatHubReceiver.OnPrivateConversationRead(Guid readerUserId, Guid peerUserId) { }
     void IChatHubReceiver.OnUserOnlineStatusChanged(Guid userId, bool isOnline) { }
     void IChatHubReceiver.OnWebRtcSignalReceived(Guid roomId, Guid fromUserId, string signalType, string payload) { }
     void IChatHubReceiver.OnPrivateCallIncoming(Guid callerUserId) { }
+    void IChatHubReceiver.OnScreenAnnotationStateChanged(Guid contextId, ScreenAnnotationState state) { }
+    void IChatHubReceiver.OnScreenAnnotationReceived(Guid contextId, Guid fromUserId, ScreenAnnotationEvent annotationEvent) { }
 
     public async ValueTask DisposeAsync()
     {

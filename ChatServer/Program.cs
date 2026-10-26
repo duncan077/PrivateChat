@@ -1,7 +1,6 @@
-using System.Text;
+﻿using System.Text;
 using ChatServer.Auth;
 using ChatServer.Data;
-using System.Data;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
@@ -20,8 +19,42 @@ builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(optio
     options.MultipartBodyLengthLimit = 50 * 1024 * 1024;
 });
 
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
+var dbConnectionString = builder.Configuration.GetConnectionString("DefaultConnection")
+    ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection is not configured.");
+
+// Pinned, not AutoDetect. AddDbContext registers the options as Scoped, so this
+// lambda runs once per DI scope - i.e. once per unary RPC - and AutoDetect opens a
+// real MySqlConnection with Pooling=false and calls Open() synchronously. That put a
+// blocking TCP connect + auth + teardown in front of every request, on a thread-pool
+// thread, and it ran outside the execution strategy so EnableRetryOnFailure below
+// never covered it.
+//
+// The version only selects which SQL dialect EF emits, and the migrations in
+// Data/Migrations were authored against this same version (see AppDbContextFactory).
+// Pinning keeps runtime and design time in agreement and makes startup independent
+// of database reachability. Raise it when the server is upgraded and newer syntax is
+// actually wanted.
+var serverVersion = new MariaDbServerVersion(new Version(11, 4));
+
+void ConfigureDb(DbContextOptionsBuilder options) =>
+    options.UseMySql(dbConnectionString, serverVersion, mysql =>
+        // A transient database blip on restart should recover, not crash-loop.
+        mysql.EnableRetryOnFailure(maxRetryCount: 5, maxRetryDelay: TimeSpan.FromSeconds(10), errorNumbersToAdd: null));
+
+// The factory is the primary registration: it is a singleton, so the options graph
+// is built exactly once for the process rather than once per scope.
+//
+// ChatHubImpl needs it because a StreamingHub is one long-lived DI scope - a scoped
+// DbContext there would live for the whole connection, accumulating every entity it
+// ever tracked. It creates a short-lived context per hub method instead.
+builder.Services.AddDbContextFactory<AppDbContext>(ConfigureDb);
+
+// The unary services are genuinely request-scoped, so they keep taking AppDbContext
+// directly. Resolving it through the factory (rather than a second AddDbContext call)
+// keeps one options instance in play and avoids two registrations racing to own
+// DbContextOptions<AppDbContext>. The scope disposes what this lambda returns.
+builder.Services.AddScoped(sp =>
+    sp.GetRequiredService<IDbContextFactory<AppDbContext>>().CreateDbContext());
 
 var redisConn = builder.Configuration.GetConnectionString("Redis");
 if (!string.IsNullOrEmpty(redisConn))
@@ -59,6 +92,8 @@ builder.Services.AddAuthorization();
 builder.Services.AddControllers();
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<ChatServer.Services.JanusService>();
+// Runs the videoroom codec sweep after the socket is bound rather than in front of it.
+builder.Services.AddHostedService<ChatServer.Services.JanusRoomSyncService>();
 builder.Services.AddMagicOnion();
 
 // CORS for Blazor WebView (MAUI BlazorWebView runs from https://0.0.0.0)
@@ -86,15 +121,46 @@ builder.Services.Configure<ForwardedHeadersOptions>(options =>
 
 var app = builder.Build();
 
-using (var scope = app.Services.CreateScope())
+// Migrate, not EnsureCreated: this applies schema changes to an existing database
+// rather than only creating a missing one, which is what the old hand-written
+// GlobalRole column patch was compensating for.
+//
+// Set Database:MigrateOnStartup to false to apply migrations out of band instead
+// (dotnet ef migrations script > init.sql, then run it). That is the escape hatch
+// when the provider's own migration machinery misbehaves against a given server -
+// MySQL vs MariaDB differ here - and it avoids several instances racing to migrate.
+if (builder.Configuration.GetValue("Database:MigrateOnStartup", true))
 {
+    using var scope = app.Services.CreateScope();
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    await db.Database.EnsureCreatedAsync();
-    await EnsureGlobalRoleColumnAsync(db);
+    var migrationLogger = scope.ServiceProvider
+        .GetRequiredService<ILoggerFactory>()
+        .CreateLogger("DatabaseMigration");
+
+    try
+    {
+        await db.Database.MigrateAsync();
+        migrationLogger.LogInformation("Database schema is up to date.");
+    }
+    catch (Exception ex)
+    {
+        // Crash-looping under systemd buries the real error in restart spam.
+        // Fail once, loudly, with the actionable next step.
+        migrationLogger.LogCritical(
+            ex,
+            "Database migration failed. Apply the schema manually and set "
+            + "Database:MigrateOnStartup=false in appsettings.json, or check that the "
+            + "connection string points at a supported server.");
+        throw;
+    }
 }
 
-app.UseCors();
+// First in the pipeline, before anything reads the scheme, host or client IP.
+// Kestrel is reached over plain HTTP from the reverse proxy, so until these are
+// applied every downstream component sees http:// and the proxy's own address.
 app.UseForwardedHeaders();
+
+app.UseCors();
 
 // Enable HTTPS redirection outside Development.
 if (!app.Environment.IsDevelopment())
@@ -110,64 +176,15 @@ Directory.CreateDirectory(uploadsDir);
 app.UseStaticFiles(new StaticFileOptions
 {
     FileProvider = new PhysicalFileProvider(uploadsDir),
-    RequestPath = "/uploads"
+    RequestPath = "/uploads",
+    // Stored names are GUIDs (see UploadController), so a given URL's bytes never
+    // change. Without an explicit max-age clients fall back to heuristic freshness
+    // and revalidate recently uploaded files - exactly the ones being scrolled past.
+    OnPrepareResponse = ctx =>
+        ctx.Context.Response.Headers.CacheControl = "public,max-age=31536000,immutable"
 });
 
 app.MapControllers();
 app.MapMagicOnionService();
 
 app.Run();
-
-static async Task EnsureGlobalRoleColumnAsync(AppDbContext db)
-{
-    await using var connection = db.Database.GetDbConnection();
-    if (connection.State != ConnectionState.Open)
-    {
-        await connection.OpenAsync();
-    }
-
-    var hasGlobalRole = false;
-    await using (var pragma = connection.CreateCommand())
-    {
-        pragma.CommandText = "PRAGMA table_info('AspNetUsers');";
-        await using var reader = await pragma.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-        {
-            var name = reader["name"]?.ToString();
-            if (string.Equals(name, "GlobalRole", StringComparison.OrdinalIgnoreCase))
-            {
-                hasGlobalRole = true;
-                break;
-            }
-        }
-    }
-
-    if (hasGlobalRole)
-    {
-        return;
-    }
-
-    await using var tx = await connection.BeginTransactionAsync();
-
-    await using (var alter = connection.CreateCommand())
-    {
-        alter.Transaction = tx;
-        alter.CommandText = "ALTER TABLE AspNetUsers ADD COLUMN GlobalRole INTEGER NOT NULL DEFAULT 0;";
-        await alter.ExecuteNonQueryAsync();
-    }
-
-    await using (var backfill = connection.CreateCommand())
-    {
-        backfill.Transaction = tx;
-        backfill.CommandText = """
-            UPDATE AspNetUsers
-            SET GlobalRole = COALESCE(
-                (SELECT MAX(Role) FROM ChatRoomMembers m WHERE m.UserId = AspNetUsers.Id),
-                0
-            );
-            """;
-        await backfill.ExecuteNonQueryAsync();
-    }
-
-    await tx.CommitAsync();
-}

@@ -32,6 +32,12 @@
     --pc-border-strong: rgba(155, 178, 215, 0.30);
     --pc-border-accent: rgba(22, 165, 154, 0.45);
 
+    /* Scrollbars: the stock Windows bars read as a foreign object on this theme.
+       These are the standard properties (Chromium 121+; WebView2 tracks current
+       Chromium), so both the message list and code blocks pick them up. */
+    scrollbar-width: thin;
+    scrollbar-color: var(--pc-border-strong) transparent;
+
     /* Shadows */
     --pc-shadow-sm: 0 4px 12px rgba(2, 6, 13, 0.32);
     --pc-shadow-md: 0 8px 24px rgba(2, 7, 16, 0.42);
@@ -52,7 +58,9 @@
     --pc-sidebar-width: 272px;
     --pc-members-width: 300px;
     --pc-toolbar-height: 52px;
-    --pc-mobile-nav-height: 68px;
+    /* The mobile bottom nav was removed; offsets that referenced it now
+       collapse to the OS safe-area inset alone. */
+    --pc-mobile-nav-height: 0px;
 }
 
 /* ─── Reset ──────────────────────────────────────────────────────────────── */
@@ -184,7 +192,7 @@ h1:focus {
 }
 
 .main-content-area {
-    height: calc(100dvh - 48px);
+    height: 100dvh;
     overflow: hidden;
 }
 
@@ -200,43 +208,12 @@ h1:focus {
     background: linear-gradient(90deg, rgba(11, 38, 56, 0.98), rgba(9, 28, 44, 0.98));
     border-top: 1px solid var(--pc-border-accent);
     color: var(--pc-text);
-.app-shell-nav {
-    padding-top: 0.4rem;
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
-    overflow-y: auto;
-}
-
-.chat-type-title {
-    display: block;
-    padding: 0.2rem 0.9rem 0.55rem;
-    letter-spacing: 0.08em;
-    color: var(--pc-text-muted);
-}
-
-.chat-type-group-content {
-    padding: 0.2rem 0.35rem 0.55rem 0.45rem;
-}
-
-.chat-type-nav-footer {
-    margin-top: auto;
-    padding: 0 0.55rem 0.8rem;
-}
-
-.chat-type-nav-footer .mud-button {
-    width: 100%;
-    justify-content: center;
-}
-
-.chat-type-actions {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 10px 20px;
+    padding: 0.55rem 1.1rem;
     font-size: 0.88rem;
-    gap: 12px;
+    gap: 0.75rem;
     box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.5);
     backdrop-filter: blur(12px);
 }
@@ -308,16 +285,14 @@ h1:focus {
     border-radius: var(--pc-radius-pill);
     overflow: hidden;
     flex-shrink: 0;
+}
+
 .avatar-image-fill {
     width: 100%;
     height: 100%;
     display: block;
     object-fit: cover;
     border-radius: inherit;
-}
-
-.chat-type-entry.active {
-    background: color-mix(in srgb, var(--mud-palette-primary) 14%, transparent);
 }
 
 .update-banner-progress-fill {
@@ -380,12 +355,62 @@ h1:focus {
 .mud-icon-root.material-symbols-sharp    { font-family: "Material Symbols Sharp" !important; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   App Shell Bar & Brand
+   ═══════════════════════════════════════════════════════════════════════════ */
+.app-shell-bar {
+    border-bottom: 1px solid var(--pc-border) !important;
+    background: rgba(11, 18, 32, 0.92) !important;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+.app-brand {
+    font-family: "Sora", "Manrope", "Segoe UI", sans-serif;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+}
+
+.app-shell-subtitle {
+    margin-left: 0.35rem;
+    color: var(--pc-text-dim);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    align-self: center;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    Navigation Sidebar (Drawer)
    ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Force MudBlazor drawer content area to be a full-height flex column
+   so our drawer-content-wrapper can use flex to pin the footer */
+.app-shell-drawer .mud-drawer-content {
+    height: 100% !important;
+    display: flex !important;
+    flex-direction: column !important;
+    overflow: hidden !important;
+}
+
+.drawer-content-wrapper {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.drawer-content-wrapper .app-shell-nav {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+}
+
 .app-shell-nav {
     padding-top: 0.5rem;
 }
 
+/* "Chat" section title — hidden in mini-collapsed mode */
 .chat-type-title {
     display: block;
     padding: 0.2rem 1rem 0.5rem;
@@ -396,18 +421,113 @@ h1:focus {
     color: var(--pc-text-dim);
 }
 
-.chat-type-group-content {
-    padding: 0.15rem 0.3rem 0.5rem 0.4rem;
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .chat-type-title {
+    display: none;
 }
 
+/* Add-room / add-chat action row.
+   Stays visible when the drawer is collapsed: this is the only entry point to
+   room creation, so hiding it made the feature unreachable rather than merely
+   tidier. Label left, compact button right — the button matches the nav-icon
+   footprint in both states instead of floating as a full-size outlined circle. */
 .chat-type-actions {
     display: flex;
-    padding: 0.1rem 0.3rem 0.4rem;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.4rem;
+    padding: 0 0.55rem 0.35rem 0.75rem;
 }
 
-.chat-type-actions .mud-button {
-    width: 100%;
+/* The row owns the indent; the label's own block padding would double it. */
+.chat-type-actions .chat-type-title {
+    padding: 0;
+}
+
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .chat-type-actions {
     justify-content: center;
+    padding: 0 0 0.3rem;
+}
+
+.app-shell-drawer .chat-type-actions .mud-icon-button {
+    width: 26px;
+    height: 26px;
+    min-width: 26px;
+    padding: 0;
+    border: 1px solid var(--pc-border);
+    color: var(--pc-text-dim);
+    background: transparent;
+    transition: color var(--pc-transition), border-color var(--pc-transition), background var(--pc-transition);
+}
+
+.app-shell-drawer .chat-type-actions .mud-icon-button:hover {
+    color: var(--pc-accent);
+    border-color: var(--pc-border-accent);
+    background: var(--pc-surface-active);
+}
+
+.app-shell-drawer .chat-type-actions .mud-icon-button .mud-icon-root {
+    font-size: 1rem;
+    width: 1rem;
+    height: 1rem;
+}
+
+/* NavGroup header: hide title text & expand chevron in mini-collapsed mode */
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .mud-nav-group .mud-nav-link-text,
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .mud-nav-group .mud-nav-link-expand-icon {
+    display: none;
+}
+
+/* MudBlazor's collapsed class is `mud-drawer--closed` (double dash). The old
+   `mud-drawer-close` spellings matched nothing, so call-participant rows kept
+   rendering into the 56px rail as clipped slivers. */
+.app-shell-drawer.mud-drawer--closed .chat-type-room-call-list,
+.app-shell-drawer.mud-drawer--closed .chat-type-room-call-context-hint {
+    display: none !important;
+}
+
+.chat-type-group-content {
+    padding: 0.1rem 0.4rem 0.5rem 0.75rem;
+}
+
+/* ─── Collapsed rail: everything centres on one axis ──────────────────────
+   Hidden labels used to leave their flex gap and the nav icons kept the
+   margin that made room for text, so every row type sat at a different
+   x-offset. Strip those and centre each row instead. */
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .chat-type-group-content {
+    padding: 0.1rem 0 0.4rem;
+}
+
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .mud-nav-link {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
+}
+
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .mud-nav-link .mud-nav-link-icon {
+    margin: 0;
+}
+
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .chat-type-list .mud-list-item {
+    padding: 0.3rem 0;
+}
+
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .chat-type-row {
+    justify-content: center;
+    gap: 0;
+}
+
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .chat-type-label,
+.app-shell-drawer.mud-drawer-mini.mud-drawer--closed .chat-unread-badge {
+    display: none;
+}
+
+/* Settings footer — always pinned at bottom of drawer */
+.chat-type-nav-footer {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    padding: 0.2rem 0.4rem 0.4rem;
+    border-top: 1px solid var(--mud-palette-divider, rgba(255,255,255,0.12));
 }
 
 .chat-type-loading {
@@ -449,10 +569,329 @@ h1:focus {
     width: 20px !important;
     height: 20px !important;
     font-size: 0.65rem !important;
+    transition: box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+/* The glow has to stay on the avatar's own box-shadow: .mud-avatar sets overflow:hidden, so a
+   pseudo-element's outer shadow (the compositor-friendly opacity-animated version) is clipped
+   away entirely. An element's own box-shadow is not clipped by its own overflow. The saturate()
+   filter is gone though — it added a filter pass to every repaint of this animation. */
+.chat-type-avatar-speaking {
+    outline: 1px solid rgba(75, 232, 151, 0.75);
+    outline-offset: 0;
+    box-shadow: 0 0 0 2px rgba(75, 232, 151, 0.22), 0 0 12px rgba(75, 232, 151, 0.42);
+    animation: room-user-speaking-pulse 1.05s ease-in-out infinite;
+}
+
+@keyframes room-user-speaking-pulse {
+    0% {
+        box-shadow: 0 0 0 1px rgba(75, 232, 151, 0.15), 0 0 8px rgba(75, 232, 151, 0.28);
+    }
+    50% {
+        box-shadow: 0 0 0 2px rgba(75, 232, 151, 0.26), 0 0 14px rgba(75, 232, 151, 0.48);
+    }
+    100% {
+        box-shadow: 0 0 0 1px rgba(75, 232, 151, 0.15), 0 0 8px rgba(75, 232, 151, 0.28);
+    }
 }
 
 .chat-type-entry.active {
     background: var(--pc-surface-active) !important;
+}
+
+.chat-type-room-entry {
+    width: 100%;
+    border: 1px dashed transparent;
+    border-radius: 9px;
+    transition: border-color var(--pc-transition), background-color var(--pc-transition);
+}
+
+.chat-type-room-header {
+    cursor: pointer;
+}
+
+.chat-type-room-drop-enabled {
+    border-color: rgba(87, 182, 255, 0.22);
+}
+
+.chat-type-room-drop-hover {
+    border-color: rgba(87, 182, 255, 0.75);
+    background: rgba(87, 182, 255, 0.12);
+}
+
+/* View filter: participants without video drop out of the grid entirely while
+   their audio keeps playing (the media elements stay live, just not rendered). */
+.call-video-grid.hide-no-video-cells .video-cell.video-cell-no-video {
+    display: none !important;
+}
+
+/* Paused share: the source (usually a minimized captured window) has a live
+   track but delivers no frames. The last frame stays dimmed underneath so the
+   tile keeps its identity; the overlay clears on the next delivered frame. */
+.video-cell .video-paused-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.3rem;
+    background: rgba(7, 13, 23, 0.72);
+    color: var(--pc-text-muted);
+    font-size: 0.8rem;
+    pointer-events: none;
+    text-align: center;
+}
+
+.video-cell.video-cell-paused .video-paused-overlay {
+    display: flex;
+}
+
+.video-cell .video-paused-overlay .material-icons {
+    font-size: 2rem;
+    opacity: 0.85;
+}
+
+.chat-type-room-call-list {
+    margin-top: 0.28rem;
+    margin-left: 1.45rem;
+    display: grid;
+    gap: 0.16rem;
+}
+
+.chat-type-room-call-user {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.32rem;
+    padding: 0.16rem 0.24rem;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.chat-type-room-call-user.context-enabled {
+    cursor: context-menu;
+}
+
+.chat-type-room-call-user-main.draggable {
+    cursor: grab;
+}
+
+.chat-type-room-call-user-main.draggable:active {
+    cursor: grabbing;
+}
+
+.chat-type-room-call-user-main {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.chat-type-room-call-menu {
+    flex: 0 0 auto;
+}
+
+.chat-type-room-call-context-hint {
+    opacity: 0.58;
+    flex: 0 0 auto;
+}
+
+.chat-type-room-call-user-name {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 0.74rem;
+    color: var(--pc-text-muted);
+}
+
+.chat-type-room-call-menu-button {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+}
+
+/* Participant context menu. A dropdown, not a modal: the backdrop is an
+   invisible click-away layer, and the panel is a compact menu at the cursor. */
+.participant-actions-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 2150;
+    background: transparent;
+}
+
+.participant-actions-sheet {
+    position: fixed;
+    z-index: 2151;
+    width: 248px;
+    max-height: 70vh;
+    overflow: auto;
+    padding: 0.45rem;
+    border-radius: var(--pc-radius-md);
+    border: 1px solid var(--pc-border-strong);
+    background: var(--pc-surface);
+    box-shadow: var(--pc-shadow-md);
+}
+
+.participant-actions-title {
+    display: block;
+    color: var(--pc-text);
+    padding: 0.1rem 0.45rem 0.3rem;
+    border-bottom: 1px solid var(--pc-border);
+    margin-bottom: 0.3rem;
+}
+
+.participant-actions-section-title {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--pc-text-dim);
+    margin: 0.5rem 0.45rem 0.15rem;
+}
+
+.participant-actions-btn {
+    display: block;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--pc-text);
+    border-radius: var(--pc-radius-sm);
+    padding: 0.4rem 0.45rem;
+    text-align: left;
+    font: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background var(--pc-transition);
+}
+
+.participant-actions-btn:hover {
+    background: var(--pc-surface-hover);
+}
+
+.participant-actions-btn:focus-visible {
+    outline: 2px solid var(--pc-accent);
+    outline-offset: -2px;
+}
+
+.participant-actions-btn.danger {
+    color: var(--pc-danger);
+}
+
+.participant-actions-btn.danger:hover {
+    background: rgba(255, 94, 110, 0.12);
+}
+
+/* Volume row: local-only mic level for that user, 0-200%. */
+.participant-actions-volume {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.35rem 0.45rem 0.45rem;
+    color: var(--pc-text-muted);
+}
+
+.participant-actions-volume input[type="range"] {
+    flex: 1;
+    min-width: 0;
+    accent-color: var(--pc-accent);
+    cursor: pointer;
+}
+
+.participant-actions-volume-value {
+    min-width: 2.6rem;
+    text-align: right;
+    font-size: 0.74rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--pc-text-muted);
+}
+
+/* Speaker glyph in front of a volume slider, doubling as the mute toggle.
+   Deliberately borrows the slider row's colour when live and turns red when muted,
+   so "is this muted" is answerable without reading the slider position. */
+.volume-mute-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    padding: 0.1rem;
+    border: none;
+    border-radius: var(--pc-radius-sm, 6px);
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    line-height: 0;
+    transition: color 120ms ease, background-color 120ms ease;
+}
+
+.volume-mute-btn:hover {
+    background: rgba(255, 255, 255, 0.09);
+}
+
+.volume-mute-btn.muted {
+    color: var(--pc-danger, #ff5468);
+}
+
+body.room-participant-manual-dragging,
+body.room-participant-manual-dragging * {
+    user-select: none !important;
+    cursor: grabbing !important;
+}
+
+.room-participant-manual-drag-source {
+    opacity: 0.72;
+    transform: scale(0.98) translateX(2px);
+    transition: transform 120ms ease, opacity 120ms ease, box-shadow 120ms ease;
+    box-shadow: 0 6px 14px rgba(0, 0, 0, 0.28);
+}
+
+.room-participant-manual-drag-armed {
+    opacity: 0.9;
+    transform: scale(0.992);
+    transition: transform 80ms ease, opacity 80ms ease;
+}
+
+.room-participant-drag-ghost {
+    position: fixed;
+    z-index: 2300;
+    pointer-events: none;
+    margin: 0;
+    opacity: 0.96;
+    border-radius: 8px;
+    border: 1px solid var(--pc-border);
+    background: rgba(20, 31, 50, 0.94);
+    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.38);
+    will-change: transform;
+    animation: room-participant-ghost-float 0.55s ease-in-out infinite alternate;
+}
+
+@keyframes room-participant-ghost-float {
+    from {
+        filter: saturate(0.98);
+    }
+    to {
+        filter: saturate(1.08);
+    }
+}
+
+[data-room-drop-target='1'] {
+    transition: border-color 120ms ease, background-color 120ms ease, transform 120ms ease;
+}
+
+.room-participant-manual-drop-hover {
+    border-color: rgba(87, 182, 255, 0.9) !important;
+    background: rgba(87, 182, 255, 0.16) !important;
+    transform: translateY(-1px);
+    animation: room-participant-drop-pulse 0.75s ease-in-out infinite alternate;
+}
+
+@keyframes room-participant-drop-pulse {
+    from {
+        box-shadow: 0 0 0 rgba(87, 182, 255, 0.0);
+    }
+    to {
+        box-shadow: 0 0 0.65rem rgba(87, 182, 255, 0.33);
+    }
 }
 
 /* Suppress MudList's own selected indicator inside the drawer */
@@ -825,6 +1264,16 @@ h1:focus {
     scroll-behavior: smooth;
 }
 
+/* Push messages to the bottom when the list is short.
+   The pseudo-element acts as a spacer that fills available space above the
+   messages. When messages fill the container it collapses to 0 and scroll
+   works normally — avoids the justify-content: flex-end overflow bug. */
+.chat-messages-area::before {
+    content: '';
+    flex: 1 1 auto;
+    display: block;
+}
+
 .chat-messages-area.call-active {
     flex: 0 0 130px;
 }
@@ -1022,19 +1471,531 @@ h1:focus {
     margin-bottom: 0.2rem;
 }
 
+.chat-msg-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.1rem;
+    margin-left: auto;
+    opacity: 0;
+    transition: opacity var(--pc-transition);
+}
+
+.chat-msg:hover .chat-msg-actions,
+.chat-msg:focus-within .chat-msg-actions {
+    opacity: 1;
+}
+
+/* Touch devices never fire hover, so the actions would be unreachable on Android. */
+@media (hover: none) {
+    .chat-msg-actions {
+        opacity: 1;
+    }
+}
+
+.chat-msg-edit {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin-top: 0.2rem;
+}
+
+.chat-context-window {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    max-height: 60vh;
+    overflow-y: auto;
+    min-width: min(34rem, 80vw);
+}
+
+.chat-msg-context-target {
+    outline: 2px solid var(--pc-border-accent);
+    border-radius: var(--pc-radius-sm);
+}
+
+.chat-msg-quote {
+    display: flex;
+    flex-direction: column;
+    gap: 0.05rem;
+    margin-bottom: 0.25rem;
+    padding: 0.15rem 0.5rem;
+    border-left: 3px solid var(--pc-border-accent);
+    background: var(--pc-surface-hover);
+    border-radius: 0 var(--pc-radius-sm) var(--pc-radius-sm) 0;
+    cursor: pointer;
+    text-align: left;
+    border-top: none;
+    border-right: none;
+    border-bottom: none;
+    color: inherit;
+    font: inherit;
+    width: 100%;
+    transition: background var(--pc-transition);
+}
+
+.chat-msg-quote:hover {
+    background: var(--pc-surface-active);
+}
+
+.chat-msg-quote:focus-visible {
+    outline: 2px solid var(--pc-accent);
+    outline-offset: 1px;
+}
+
+.chat-msg-quote-author {
+    font-size: 0.74rem;
+    font-weight: 600;
+    color: var(--pc-accent-strong);
+}
+
+.chat-msg-quote-text {
+    font-size: 0.78rem;
+    color: var(--pc-text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chat-msg-quote.unavailable {
+    border-left-color: var(--pc-border);
+    cursor: default;
+    font-style: italic;
+}
+
+@keyframes chat-msg-flash-fade {
+    0%   { background-color: var(--pc-accent-glow); }
+    100% { background-color: transparent; }
+}
+
+.chat-msg-flash {
+    animation: chat-msg-flash-fade 1.6s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chat-msg-flash {
+        animation: none;
+        background-color: var(--pc-accent-glow);
+    }
+}
+
+.chat-reply-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.5rem;
+    margin-bottom: 0.3rem;
+    border-left: 3px solid var(--pc-border-accent);
+    background: var(--pc-surface-hover);
+    border-radius: 0 var(--pc-radius-sm) var(--pc-radius-sm) 0;
+}
+
+.chat-reply-banner-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.78rem;
+}
+
+.chat-custom-emoji {
+    height: 1.375em;
+    width: auto;
+    vertical-align: -0.28em;
+    object-fit: contain;
+}
+
+/* A message made only of custom emoji reads as a reaction, not as text. */
+.chat-custom-emoji-jumbo {
+    height: 3rem;
+    vertical-align: middle;
+}
+
+.chat-asset-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(3.25rem, 1fr));
+    gap: 0.35rem;
+    max-height: 40vh;
+    overflow-y: auto;
+    padding: 0.25rem;
+}
+
+.chat-asset-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.15rem;
+    padding: 0.3rem;
+    border: 1px solid var(--pc-border);
+    border-radius: var(--pc-radius-sm);
+    background: var(--pc-surface-hover);
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    transition: background var(--pc-transition), border-color var(--pc-transition);
+}
+
+.chat-asset-tile:hover {
+    background: var(--pc-surface-active);
+    border-color: var(--pc-border-strong);
+}
+
+.chat-asset-tile:focus-visible {
+    outline: 2px solid var(--pc-accent);
+    outline-offset: 1px;
+}
+
+.chat-asset-tile img {
+    height: 2.5rem;
+    width: 2.5rem;
+    object-fit: contain;
+}
+
+.chat-asset-tile-name {
+    font-size: 0.62rem;
+    opacity: 0.75;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chat-asset-file-label {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.25rem 0.6rem;
+    border: 1px dashed var(--pc-border-strong);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: background var(--pc-transition);
+}
+
+.chat-asset-file-label:hover {
+    background: var(--pc-surface-hover);
+}
+
+.chat-asset-file-label:focus-within {
+    outline: 2px solid var(--pc-accent);
+    outline-offset: 1px;
+}
+
+/* The real input stays reachable for assistive tech but out of the layout. */
+.chat-asset-file-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.chat-asset-manage-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0;
+}
+
+.chat-asset-manage-row img {
+    height: 1.75rem;
+    width: 1.75rem;
+    object-fit: contain;
+}
+
+.chat-search-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    min-width: min(34rem, 80vw);
+}
+
+.chat-search-scope {
+    display: flex;
+    flex-wrap: wrap;
+}
+
+.chat-search-results {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin-top: 0.6rem;
+    max-height: 55vh;
+    overflow-y: auto;
+}
+
+.chat-search-result {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    width: 100%;
+    padding: 0.4rem 0.55rem;
+    border: 1px solid var(--pc-border);
+    border-radius: var(--pc-radius-sm);
+    background: var(--pc-surface-hover);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background var(--pc-transition), border-color var(--pc-transition);
+}
+
+.chat-search-result:hover {
+    background: var(--pc-surface-active);
+    border-color: var(--pc-border-strong);
+}
+
+.chat-search-result:focus-visible {
+    outline: 2px solid var(--pc-accent);
+    outline-offset: 1px;
+}
+
+.chat-search-result-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: baseline;
+    font-size: 0.72rem;
+    opacity: 0.85;
+}
+
+.chat-search-result-sender {
+    font-weight: 600;
+    color: var(--mud-palette-primary);
+}
+
+.chat-search-result-room {
+    padding: 0 0.35rem;
+    border-radius: 4px;
+    background: rgba(155, 178, 215, 0.14);
+}
+
+/* Results are previews — clamp long bodies instead of letting one hit fill the list. */
+.chat-search-result-body {
+    max-height: 4.5rem;
+    overflow: hidden;
+}
+
+.chat-msg-read-tick {
+    font-size: 0.9rem !important;
+    color: var(--pc-accent);
+}
+
+.chat-unread-badge {
+    margin-left: auto;
+    min-width: 1.25rem;
+    padding: 0 0.35rem;
+    border-radius: var(--pc-radius-pill);
+    background: var(--pc-accent);
+    color: var(--pc-bg-0);
+    font-size: 0.68rem;
+    font-weight: 700;
+    line-height: 1.25rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+
+/* A mention is worth more than a count — make it read differently at a glance. */
+.chat-unread-badge.mention {
+    background: var(--pc-danger);
+    color: var(--pc-bg-0);
+}
+
+.chat-typing-indicator {
+    display: block;
+    padding: 0 0.25rem 0.2rem;
+    font-style: italic;
+    opacity: 0.75;
+}
+
+.chat-load-older {
+    display: flex;
+    justify-content: center;
+    padding: 0.35rem 0;
+}
+
+.chat-reactions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.25rem;
+    margin-top: 0.3rem;
+}
+
+.chat-reaction-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: var(--pc-radius-pill);
+    border: 1px solid var(--pc-border);
+    background: var(--pc-surface-hover);
+    color: inherit;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    cursor: pointer;
+    transition: background var(--pc-transition), border-color var(--pc-transition);
+}
+
+.chat-reaction-chip:hover {
+    background: rgba(255, 255, 255, 0.09);
+    border-color: var(--pc-border-strong);
+}
+
+.chat-reaction-chip:focus-visible {
+    outline: 2px solid var(--pc-accent);
+    outline-offset: 1px;
+}
+
+.chat-reaction-chip.mine {
+    background: var(--pc-surface-active);
+    border-color: var(--pc-border-accent);
+}
+
+.chat-reaction-emoji {
+    font-size: 0.95rem;
+}
+
+.chat-reaction-count {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.85;
+}
+
+/* The add button follows the same hover-reveal rule as the message actions,
+   but stays put once the message already has chips. */
+.chat-reaction-add {
+    opacity: 0;
+    transition: opacity var(--pc-transition);
+}
+
+.chat-msg:hover .chat-reaction-add,
+.chat-msg:focus-within .chat-reaction-add {
+    opacity: 1;
+}
+
+@media (hover: none) {
+    .chat-reaction-add {
+        opacity: 1;
+    }
+}
+
+.chat-reaction-palette {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 0.15rem;
+    padding: 0.35rem;
+    max-width: 17rem;
+}
+
+.chat-reaction-palette-item {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 1.15rem;
+    line-height: 1;
+    padding: 0.25rem;
+}
+
+.chat-reaction-palette-item:hover {
+    background: var(--pc-surface-active);
+}
+
+.chat-reaction-palette-item:focus-visible {
+    outline: 2px solid var(--pc-accent);
+    outline-offset: 1px;
+}
+
+.chat-msg-edit-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.3rem;
+}
+
 .chat-msg-body {
     word-wrap: break-word;
     overflow-wrap: anywhere;
-    white-space: pre-wrap;
+    /* Markdown rendering owns line breaks now (soft breaks become <br>);
+       pre-wrap here would double them up with the HTML source newlines. */
+    white-space: normal;
     line-height: 1.45;
     font-size: 0.9rem;
+}
+
+.chat-msg-body p {
+    margin: 0 0 0.35rem;
+}
+
+.chat-msg-body p:last-child {
+    margin-bottom: 0;
+}
+
+.chat-msg-body pre {
+    background: var(--pc-bg-0);
+    border: 1px solid var(--pc-border);
+    border-radius: var(--pc-radius-sm);
+    padding: 0.55rem 0.7rem;
+    margin: 0.3rem 0;
+    overflow-x: auto;
+}
+
+.chat-msg-body pre code {
+    display: block;
+    white-space: pre;
+    background: transparent;
+    padding: 0;
+    font-size: 0.82rem;
+}
+
+.chat-msg-body code {
+    font-family: ui-monospace, 'Cascadia Code', Consolas, 'Courier New', monospace;
+    background: rgba(155, 178, 215, 0.14);
+    border-radius: 4px;
+    padding: 0.08rem 0.35rem;
+    font-size: 0.82rem;
+}
+
+.chat-msg-body blockquote {
+    margin: 0.3rem 0;
+    padding: 0.1rem 0 0.1rem 0.6rem;
+    border-left: 3px solid var(--pc-border-accent);
+    color: var(--pc-text-muted);
+}
+
+.chat-msg-body ul,
+.chat-msg-body ol {
+    margin: 0.25rem 0;
+    padding-left: 1.4rem;
+}
+
+.chat-msg-body a {
+    color: #7fcfff;
+    text-underline-offset: 2px;
+}
+
+.chat-msg-body h1,
+.chat-msg-body h2,
+.chat-msg-body h3,
+.chat-msg-body h4,
+.chat-msg-body h5,
+.chat-msg-body h6 {
+    /* Headings in chat bubbles stay close to body size — emphasis, not posters. */
+    font-size: 1.02rem;
+    line-height: 1.35;
+    margin: 0.4rem 0 0.2rem;
+}
+
+.chat-mention {
+    background: var(--pc-surface-active);
+    color: var(--pc-accent-strong);
+    border-radius: 4px;
+    padding: 0 0.25rem;
+    font-weight: 600;
 }
 
 .chat-msg-attachments {
     margin-top: 6px;
     display: flex;
     flex-direction: column;
-    gap: 3px;
     gap: 2px;
     min-width: 0;
     overflow-wrap: anywhere;
@@ -1048,31 +2009,6 @@ h1:focus {
 
 .chat-msg-attachments a:hover {
     color: #b3e4ff;
-}
-
-.chat-empty-state {
-    color: var(--pc-text-muted);
-    gap: 0.5rem;
-    text-align: center;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   Chat Input Area
-   ═══════════════════════════════════════════════════════════════════════════ */
-.chat-input-area {
-    flex-shrink: 0;
-    border-top: 1px solid var(--pc-border);
-    padding: 0.7rem 1rem 0.85rem;
-    background: rgba(7, 14, 26, 0.50);
-}
-
-.chat-input-area.call-active {
-    padding: 0.4rem 0.8rem 0.5rem;
-}
-
-.chat-input-field {
-    flex: 1;
-    width: auto;
 }
 
 .chat-attachment-link {
@@ -1170,6 +2106,129 @@ h1:focus {
     width: 100%;
 }
 
+/* ─── Composer: one framed writing surface ─────────────────────────────────
+   Toolbar, input (or preview), and the action row live inside a single frame,
+   so switching Write <-> Preview swaps content without the chrome jumping.
+   The frame is the field's border — the MudTextField inside runs borderless. */
+.chat-composer {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--pc-border);
+    border-radius: var(--pc-radius-md);
+    background: var(--pc-surface-soft);
+    transition: border-color var(--pc-transition), box-shadow var(--pc-transition);
+}
+
+.chat-composer:focus-within {
+    border-color: var(--pc-border-accent);
+    box-shadow: 0 0 0 3px var(--pc-accent-glow);
+}
+
+.chat-composer-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0 0.25rem;
+    padding: 0.15rem 0.35rem;
+    border-bottom: 1px solid var(--pc-border);
+}
+
+.chat-composer-toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 0.05rem;
+}
+
+/* Auto-margin instead of space-between: when the bar wraps, rows stay
+   left-aligned instead of scattering across the full width. */
+.chat-composer-toolbar-group:last-child {
+    margin-left: auto;
+}
+
+.chat-composer-toolbar .mud-icon-button {
+    color: var(--pc-text-muted);
+    padding: 5px;
+}
+
+.chat-composer-toolbar .mud-icon-button:hover {
+    color: var(--pc-text);
+}
+
+.chat-composer-toolbar .material-icons {
+    font-size: 18px;
+}
+
+/* Phones: one tidy row — the insert group scrolls sideways instead of the bar
+   stacking, the way mobile editors handle overflowing toolbars. */
+@media (max-width: 640px) {
+    .chat-composer-toolbar {
+        flex-wrap: nowrap;
+    }
+
+    .chat-composer-toolbar-group:first-child {
+        overflow-x: auto;
+        flex-shrink: 1;
+        min-width: 0;
+    }
+
+    .chat-composer-toolbar-group:last-child {
+        flex-shrink: 0;
+    }
+}
+
+.chat-composer-preview-toggle {
+    text-transform: none;
+}
+
+.chat-composer .chat-composer-field {
+    padding: 0.15rem 0.65rem;
+}
+
+/* Preview mirrors the field's metrics so the frame keeps its height rhythm. */
+.chat-composer-preview {
+    min-height: 2.4rem;
+    max-height: 12.5rem;
+    overflow-y: auto;
+    padding: 0.45rem 0.8rem;
+}
+
+.chat-composer-preview.expanded {
+    max-height: 26rem;
+}
+
+.chat-composer-preview-empty {
+    color: var(--pc-text-dim);
+    font-style: italic;
+    font-size: 0.85rem;
+}
+
+.chat-composer-bottom {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.45rem 0.35rem;
+    border-top: 1px solid var(--pc-border);
+}
+
+.chat-composer-hint {
+    flex: 1;
+    min-width: 0;
+    text-align: right;
+    font-size: 0.7rem;
+    color: var(--pc-text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Touch keyboards have their own Enter semantics — the hint only makes sense
+   with a physical keyboard. */
+@media (hover: none), (max-width: 640px) {
+    .chat-composer-hint {
+        visibility: hidden;
+    }
+}
+
 .file-picker-wrapper {
     flex-shrink: 0;
 }
@@ -1216,6 +2275,39 @@ h1:focus {
     border-color: var(--pc-accent);
     box-shadow: 0 0 0 3px var(--pc-accent-glow);
     color: var(--pc-text);
+}
+
+/* ─── Voice Gate Mic Level Meter ─────────────────────────────────────────── */
+.voice-gate-meter {
+    position: relative;
+    height: 8px;
+    border-radius: 4px;
+    background: var(--pc-surface-alt, rgba(255, 255, 255, 0.06));
+    overflow: hidden;
+    margin: 4px 0 2px;
+}
+
+.voice-gate-meter-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, #4caf50, #8bc34a 60%, #ffeb3b 85%, #f44336);
+    transition: width 60ms linear;
+    will-change: width;
+}
+
+.voice-gate-meter-threshold {
+    position: absolute;
+    top: -2px;
+    bottom: -2px;
+    width: 2px;
+    background: var(--pc-accent, #7c4dff);
+    border-radius: 1px;
+    box-shadow: 0 0 4px var(--pc-accent-glow, rgba(124, 77, 255, 0.5));
+    transition: left 200ms ease;
+    z-index: 1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1308,15 +2400,12 @@ h1:focus {
     position: absolute;
     bottom: 0.4rem;
     left: 0.45rem;
-    padding: 0.12rem 0.44rem;
-    border-radius: var(--pc-radius-sm);
-    background: rgba(0, 0, 0, 0.62);
-    color: #e8f0ff;
-    font-size: 0.71rem;
-    backdrop-filter: blur(2px);
     padding: 0.14rem 0.45rem;
     border-radius: 7px;
-    background: rgba(0, 0, 0, 0.58);
+    /* No backdrop-filter: this sits directly over a live <video>, so the compositor would
+       re-evaluate the blur for that region on every decoded frame, per cell. The opaque
+       background makes a 2px blur invisible anyway. */
+    background: rgba(0, 0, 0, 0.68);
     color: #eaf1ff;
     font-size: 0.72rem;
     z-index: 2;
@@ -1324,6 +2413,10 @@ h1:focus {
 
 .video-cell.video-cell-no-video video {
     opacity: 0.24;
+}
+
+.video-cell.local-preview-hidden video {
+    opacity: 0;
 }
 
 .video-avatar-fallback {
@@ -1380,9 +2473,8 @@ h1:focus {
     border: 1px solid rgba(255, 255, 255, 0.14);
     opacity: 0;
     transform: translateY(-4px);
-    transition: opacity var(--pc-transition), transform var(--pc-transition);
-    backdrop-filter: blur(4px);
     transition: opacity 120ms ease, transform 120ms ease;
+    backdrop-filter: blur(4px);
     pointer-events: none;
     z-index: 2;
 }
@@ -1392,6 +2484,125 @@ h1:focus {
     opacity: 1;
     transform: translateY(0);
     pointer-events: auto;
+}
+
+/* ─── Fullscreen: controls become a transient overlay ───────────────────────
+   The generic :focus-within rule above would pin the overlay open forever in
+   fullscreen, because clicking the fullscreen button parks focus inside the
+   cell. So in fullscreen, plain focus-within no longer counts; visibility is
+   driven by the JS controls-visible class (mouse/touch activity, 3s idle hide)
+   and by genuine keyboard focus (:focus-visible), which must keep pinning for
+   accessibility. */
+.video-cell:fullscreen:focus-within .video-controls {
+    opacity: 0;
+    transform: translateY(-4px);
+    pointer-events: none;
+}
+
+.video-cell:fullscreen.controls-visible .video-controls,
+.video-cell:fullscreen:has(:focus-visible) .video-controls {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+
+/* The whole screen is video: give the floating actions room, keep them clear of
+   notches, and make them comfortable to hit by touch. */
+.video-cell:fullscreen .video-controls {
+    top: max(0.8rem, env(safe-area-inset-top));
+    right: max(0.8rem, env(safe-area-inset-right));
+    padding: 0.3rem 0.42rem;
+    gap: 0.4rem;
+}
+
+/* Idle fullscreen hides the pointer along with the controls. */
+.video-cell:fullscreen:not(.controls-visible) {
+    cursor: none;
+}
+
+/* ─── Per-stream video zoom ─────────────────────────────────────────────────
+   The zoom transform is one custom property on the cell, applied to the video
+   AND the annotation canvas so drawn ink stays registered with the frame. The
+   cell's overflow:hidden does the cropping. Origin 0 0 keeps the pan math in
+   plain pixel space. */
+.video-cell video,
+.video-cell .annotation-canvas {
+    transform-origin: 0 0;
+}
+
+.video-cell.video-zoomed video,
+.video-cell.video-zoomed .annotation-canvas {
+    transform: var(--video-zoom, none);
+}
+
+/* Custom pinch handling needs the browser's own touch gestures out of the way.
+   Fullscreen has nothing to scroll, so it is always safe there; outside
+   fullscreen only an already-zoomed cell captures touches (otherwise the grid
+   could no longer be scrolled past). */
+.video-cell:fullscreen,
+.video-cell.video-zoomed {
+    touch-action: none;
+}
+
+/* Zoom level indicator, doubling as the reset button. Stays visible even when
+   the fullscreen controls overlay hides: while zoomed you need to know you are
+   looking at a crop. */
+.video-zoom-badge {
+    position: absolute;
+    top: 0.35rem;
+    left: 0.45rem;
+    z-index: 3;
+    padding: 0.14rem 0.55rem;
+    border-radius: var(--pc-radius-pill, 999px);
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    background: rgba(0, 0, 0, 0.62);
+    color: #eaf1ff;
+    font-size: 0.72rem;
+    font-family: inherit;
+    line-height: 1.4;
+    cursor: pointer;
+    backdrop-filter: blur(3px);
+    transition: border-color var(--pc-transition), color var(--pc-transition);
+}
+
+.video-zoom-badge:hover {
+    border-color: var(--pc-accent, #4c8dff);
+    color: #ffffff;
+}
+
+.video-cell:fullscreen .video-zoom-badge {
+    top: max(0.8rem, env(safe-area-inset-top));
+    left: max(0.8rem, env(safe-area-inset-left));
+}
+
+/* ─── Annotation toolbar while fullscreen ───────────────────────────────────
+   webrtc-manager reparents #annotationToolbarHost into the fullscreen cell
+   (element fullscreen shows nothing outside the cell's subtree). Float it
+   bottom-centre above the annotation canvas and tie its visibility to the same
+   auto-hide cycle as the action bar. */
+.video-cell:fullscreen .annotation-toolbar-host {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: max(0.8rem, env(safe-area-inset-bottom));
+    z-index: 6;
+    width: max-content;
+    max-width: min(94vw, 100%);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease;
+}
+
+.video-cell:fullscreen.controls-visible .annotation-toolbar-host,
+.video-cell:fullscreen:has(:focus-visible) .annotation-toolbar-host {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+/* Solid backdrop reads better over live video than the translucent grid style. */
+.video-cell:fullscreen .annotation-toolbar {
+    background: rgba(10, 16, 28, 0.88);
+    margin: 0;
 }
 
 .video-control-btn {
@@ -1444,6 +2655,113 @@ h1:focus {
 
 .video-cell.remote-audio-only-feed {
     display: none !important;
+}
+
+/* ─── Screen-share annotations ─────────────────────────────────────────────── */
+
+.annotation-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 4;
+    /* touch-action:none keeps a drawing finger from scrolling the page; the
+       selection/callout suppressions stop Android/iOS long-press menus from
+       hijacking a slow stroke. */
+    touch-action: none;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.video-cell.annotation-drawable .annotation-canvas {
+    pointer-events: auto;
+    cursor: crosshair;
+}
+
+.video-cell.annotation-active {
+    border-color: var(--pc-accent, #4c8dff);
+}
+
+.annotation-toolbar {
+    display: flex;
+    justify-content: center;
+    padding: 0.35rem 0.6rem;
+    margin: 0.35rem auto 0;
+    max-width: 100%;
+    border: 1px solid var(--pc-border);
+    border-radius: var(--pc-radius-md);
+    background: rgba(12, 18, 30, 0.62);
+    backdrop-filter: blur(4px);
+}
+
+.annotation-toolbar-divider {
+    margin: 0 0.25rem;
+    opacity: 0.5;
+}
+
+.annotation-tool-group {
+    flex-wrap: wrap;
+}
+
+.annotation-color-row {
+    display: flex;
+    align-items: center;
+    gap: 0.28rem;
+}
+
+.annotation-swatch {
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.28);
+    background: var(--swatch-color);
+    cursor: pointer;
+    transition: transform var(--pc-transition), border-color var(--pc-transition);
+}
+
+.annotation-swatch:hover {
+    transform: scale(1.12);
+}
+
+.annotation-swatch-selected {
+    border-color: #ffffff;
+    box-shadow: 0 0 0 2px rgba(76, 141, 255, 0.85);
+}
+
+.annotation-width-slider {
+    width: 92px;
+    margin: 0 0.35rem;
+}
+
+@media (max-width: 720px) {
+    .annotation-toolbar {
+        padding: 0.3rem 0.4rem;
+    }
+
+    .annotation-width-slider {
+        width: 64px;
+    }
+
+    /* Phone widths: drop button label text and keep the icons, so the presenter
+       row (allow / fade / clean) fits on one line beside the tool group. */
+    .annotation-toolbar .mud-button .mud-button-label {
+        font-size: 0.68rem;
+    }
+
+    .annotation-toolbar .mud-button {
+        min-width: 0;
+        padding: 0.25rem 0.5rem;
+    }
+
+    /* Swatches gain a little size on touch screens - 20px is a hard target. */
+    .annotation-swatch {
+        width: 24px;
+        height: 24px;
+    }
 }
 
 .call-video-grid.spotlight-mode .video-cell.spotlight-main {
@@ -1513,13 +2831,6 @@ h1:focus {
     right: 0.42rem;
     bottom: 0.35rem;
     z-index: 2;
-    display: inline-flex;
-    align-items: center;
-    padding: 0.16rem 0.32rem;
-    border-radius: var(--pc-radius-sm);
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    background: rgba(0, 0, 0, 0.60);
-    backdrop-filter: blur(3px);
     display: flex;
     flex-direction: column;
     align-items: stretch;
@@ -1527,8 +2838,8 @@ h1:focus {
     padding: 0.18rem 0.36rem;
     border-radius: 8px;
     border: 1px solid rgba(255, 255, 255, 0.2);
-    background: rgba(0, 0, 0, 0.56);
-    backdrop-filter: blur(1.5px);
+    /* Also over live video — see .video-label. A 1.5px blur is imperceptible here. */
+    background: rgba(0, 0, 0, 0.66);
     opacity: 0;
     transform: translateY(4px);
     transition: opacity 120ms ease, transform 120ms ease;
@@ -1542,10 +2853,53 @@ h1:focus {
     pointer-events: auto;
 }
 
+/* Fullscreen: the volume panel follows the same transient-overlay rules as the
+   action bar above - JS-driven visibility plus keyboard focus, never residual
+   click focus. */
+.video-cell:fullscreen:focus-within .remote-volume-panel {
+    opacity: 0;
+    transform: translateY(-4px);
+    pointer-events: none;
+}
+
+.video-cell:fullscreen.controls-visible .remote-volume-panel,
+.video-cell:fullscreen:has(:focus-visible) .remote-volume-panel {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+
 .remote-volume-row {
     display: flex;
     align-items: center;
     gap: 0.22rem;
+}
+
+/* Same control as .volume-mute-btn, sized down for the per-tile rows, which are
+   much tighter than the participant sheet. */
+.video-volume-mute-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: #cce0ff;
+    cursor: pointer;
+    line-height: 0;
+    transition: color 120ms ease, background-color 120ms ease;
+}
+
+.video-volume-mute-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.video-volume-mute-btn.muted {
+    color: var(--pc-danger, #ff5468);
 }
 
 .remote-volume-caption {
@@ -1688,32 +3042,28 @@ h1:focus {
     display: grid;
     place-items: center;
     padding: 1rem;
-    background: rgba(2, 7, 14, 0.65);
-    backdrop-filter: blur(5px);
+    background: rgba(2, 8, 16, 0.62);
+    backdrop-filter: blur(4px);
 }
 
 .moderation-popup-overlay {
     z-index: 1250;
 }
 
-.create-room-sheet,
-.moderation-popup-sheet {
-    border-radius: var(--pc-radius-lg);
+.create-room-sheet {
+    width: min(460px, calc(100vw - 1rem));
+    border-radius: 16px;
     border: 1px solid var(--pc-border-strong);
-    background: linear-gradient(168deg,
-        rgba(15, 26, 44, 0.97),
-        rgba(11, 20, 34, 0.95));
-    box-shadow: var(--pc-shadow-lg);
+    background: linear-gradient(170deg, rgba(16, 27, 45, 0.96), rgba(12, 22, 36, 0.92));
     padding: 1rem;
 }
 
-.create-room-sheet {
-    width: min(450px, calc(100vw - 1rem));
-}
-
 .moderation-popup-sheet {
-    width: min(410px, calc(100vw - 1rem));
-    padding: 0.9rem;
+    width: min(420px, calc(100vw - 1rem));
+    border-radius: 16px;
+    border: 1px solid var(--pc-border-strong);
+    background: linear-gradient(170deg, rgba(16, 27, 45, 0.96), rgba(12, 22, 36, 0.92));
+    padding: 0.95rem;
 }
 
 .moderation-popup-header {
@@ -1721,7 +3071,7 @@ h1:focus {
     align-items: flex-start;
     justify-content: space-between;
     gap: 0.5rem;
-    margin-bottom: 0.65rem;
+    margin-bottom: 0.7rem;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1819,17 +3169,29 @@ h1:focus {
 
 /* ─── Mobile portrait ────────────────────────────────────────────────────── */
 @media (max-width: 760px) {
+    .app-shell-subtitle {
+        display: none;
+    }
+
+    .app-shell-bar {
+        min-height: 56px;
+    }
+
+    .app-root-mobile .update-banner {
+        bottom: calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom) + 0.25rem);
+    }
+
     .app-root-mobile .rooms-page,
     .app-root-mobile .dm-page {
-        gap: 0.38rem;
-        padding: 0.32rem 0.32rem 0;
+        gap: 0.42rem;
+        padding: 0.35rem 0.35rem 0;
     }
 
     .chat-toolbar-content {
         flex-direction: column;
         align-items: stretch;
-        gap: 0.38rem;
-        padding: 0.42rem 0.58rem;
+        gap: 0.4rem;
+        padding: 0.44rem 0.58rem;
     }
 
     .chat-toolbar-actions {
@@ -1840,41 +3202,41 @@ h1:focus {
 
     .chat-toolbar-actions .mud-button,
     .chat-toolbar-actions .mud-icon-button {
-        min-height: 34px;
+        min-height: 36px;
     }
 
     .chat-messages-area {
-        padding: 0.75rem 0.65rem;
+        padding: 0.75rem 0.68rem;
     }
 
     .chat-input-area {
-        padding: 0.52rem 0.62rem 0.65rem;
+        padding: 0.58rem 0.65rem 0.68rem;
     }
 
     .app-root-mobile .members-sidebar {
-        inset: 4rem 0.32rem calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom) + 0.32rem) 0.32rem;
+        inset: 4.2rem 0.35rem calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom) + 0.35rem) 0.35rem;
     }
 
     .create-room-overlay,
     .moderation-popup-overlay {
-        padding: 0.6rem;
+        padding: 0.65rem;
     }
 
     .create-room-sheet {
-        width: min(450px, calc(100vw - 1.2rem));
-        border-radius: var(--pc-radius-md);
-        padding: 0.82rem;
+        width: min(460px, calc(100vw - 1.3rem));
+        border-radius: 14px;
+        padding: 0.85rem;
     }
 
     .moderation-popup-sheet {
-        width: min(410px, calc(100vw - 1.2rem));
-        border-radius: var(--pc-radius-md);
-        padding: 0.78rem;
+        width: min(420px, calc(100vw - 1.3rem));
+        border-radius: 14px;
+        padding: 0.82rem;
     }
 
     .call-controls-bar .mud-icon-button {
-        width: 38px;
-        height: 38px;
+        width: 40px;
+        height: 40px;
     }
 }
 
@@ -1987,8 +3349,6 @@ h1:focus {
     .video-controls {
         opacity: 1;
         transform: none;
-        gap: 0.18rem;
-        padding: 0.14rem 0.22rem;
         gap: 0.2rem;
         padding: 0.18rem 0.24rem;
     }
@@ -2017,89 +3377,7 @@ h1:focus {
     }
 }
 
-/* ─── Mobile app shell overrides ─────────────────────────────────────────── */
-.chat-toolbar-content {
-    width: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.7rem;
-    padding: 0.48rem 0.75rem;
-}
-
-.chat-toolbar-title-wrap {
-    min-width: 0;
-}
-
-.chat-toolbar-title-wrap .mud-typography {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.chat-toolbar-actions {
-    margin-left: auto;
-    justify-content: flex-end;
-}
-
-.chat-toolbar-actions .mud-button,
-.chat-toolbar-actions .mud-chip,
-.chat-toolbar-actions .mud-icon-button {
-    flex-shrink: 0;
-}
-
-/* MainLayout shell styles are global so they also apply to Mud-rendered DOM. */
-.app-shell-bar {
-    border-bottom: 1px solid rgba(164, 182, 212, 0.18);
-    backdrop-filter: blur(14px);
-    background: linear-gradient(90deg, rgba(9, 16, 30, 0.92), rgba(12, 21, 38, 0.8)) !important;
-}
-
-.app-brand {
-    font-weight: 700;
-    letter-spacing: 0.02em;
-}
-
-.app-shell-subtitle {
-    margin-left: 0.85rem;
-    color: rgba(209, 222, 242, 0.76);
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    font-size: 0.62rem;
-}
-
-.app-shell-drawer {
-    border-right: 1px solid rgba(164, 182, 212, 0.14);
-}
-
-.app-shell-main {
-    position: relative;
-}
-
-.app-shell-main-mobile {
-    padding-bottom: calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom));
-}
-
-.app-root-mobile .app-shell-drawer {
-    width: min(88vw, 340px) !important;
-    max-width: 340px;
-}
-
-.app-root-mobile .app-shell-drawer.mud-drawer-close,
-.app-root-mobile .app-shell-drawer[class*="mud-drawer-close"] {
-    width: 0 !important;
-    min-width: 0 !important;
-    max-width: 0 !important;
-    border-right: 0 !important;
-    overflow: hidden !important;
-    transform: translateX(-100%) !important;
-}
-
-.app-root-mobile .mud-main-content {
-    margin-left: 0 !important;
-}
-
-/* On narrow viewports, never leave a mini/closed drawer rail visible. */
+/* ─── Narrow viewport: hide drawer mini rail ─────────────────────────────── */
 @media (max-width: 1024px) {
     .app-shell-drawer.mud-drawer-mini,
     .app-shell-drawer.mud-drawer-close,
@@ -2118,52 +3396,27 @@ h1:focus {
     }
 }
 
-.app-root-mobile .app-shell-nav {
-    padding-bottom: max(0.6rem, env(safe-area-inset-bottom));
+/* ═══════════════════════════════════════════════════════════════════════════
+   Mobile App Shell (.app-root-mobile — native iOS/Android)
+   ═══════════════════════════════════════════════════════════════════════════ */
+.app-root-mobile .app-shell-drawer.mud-drawer-close,
+.app-root-mobile .app-shell-drawer[class*="mud-drawer-close"] {
+    width: 0 !important;
+    min-width: 0 !important;
+    max-width: 0 !important;
+    border-right: 0 !important;
+    overflow: hidden !important;
+    transform: translateX(-100%) !important;
 }
 
-.mobile-bottom-nav {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 1500;
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0.55rem;
-    padding: 0.55rem max(0.65rem, env(safe-area-inset-left)) max(0.55rem, env(safe-area-inset-bottom)) max(0.65rem, env(safe-area-inset-right));
-    border-top: 1px solid rgba(164, 182, 212, 0.2);
-    background: linear-gradient(180deg, rgba(7, 14, 26, 0.98), rgba(9, 16, 29, 0.98));
-    backdrop-filter: blur(14px);
-}
-
-.mobile-bottom-nav-btn {
-    border: 1px solid rgba(164, 182, 212, 0.3);
-    border-radius: 13px;
-    background: rgba(255, 255, 255, 0.02);
-    color: var(--pc-text-muted);
-    min-height: 42px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.35rem;
-    font-weight: 700;
-    cursor: pointer;
-    transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
-}
-
-.mobile-bottom-nav-btn.active {
-    background: rgba(22, 165, 154, 0.18);
-    border-color: rgba(22, 165, 154, 0.55);
-    color: var(--pc-text);
-}
-
-.mobile-bottom-nav-btn .mud-icon-root {
-    font-size: 1rem;
+.app-root-mobile .mud-main-content {
+    margin-left: 0 !important;
 }
 
 .app-root-mobile .main-content-area {
-    height: calc(100dvh - 56px);
+    height: 100dvh;
+    /* Clear space for the fixed bottom nav bar */
+    padding-bottom: calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom)) !important;
 }
 
 .app-root-mobile .floating-call-overlay {
@@ -2213,48 +3466,46 @@ h1:focus {
 .app-root-mobile .rooms-main,
 .app-root-mobile .dm-main,
 .app-root-mobile .members-sidebar {
-    border-radius: var(--pc-radius-md);
     border-radius: 15px;
 }
 
-.create-room-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 1700;
-    display: grid;
-    place-items: center;
-    padding: 1rem;
-    background: rgba(2, 8, 16, 0.62);
-    backdrop-filter: blur(4px);
+/* ─── Mobile touch & iOS improvements ───────────────────────────────────── */
+
+/* Prevent iOS auto-zoom when focusing inputs (requires font-size >= 16px) */
+.app-root-mobile .mud-input-root input,
+.app-root-mobile .mud-input-root textarea {
+    font-size: max(16px, 1em) !important;
 }
 
-.create-room-sheet {
-    width: min(460px, calc(100vw - 1rem));
-    border-radius: 16px;
-    border: 1px solid var(--pc-border-strong);
-    background: linear-gradient(170deg, rgba(16, 27, 45, 0.96), rgba(12, 22, 36, 0.92));
-    padding: 1rem;
+/* Ensure tappable elements meet the 44px minimum touch target */
+.app-root-mobile .mud-icon-button {
+    min-width: 44px !important;
+    min-height: 44px !important;
 }
 
-.moderation-popup-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 1250;
-    display: grid;
-    place-items: center;
-    padding: 1rem;
-    background: rgba(2, 8, 16, 0.62);
-    backdrop-filter: blur(4px);
+/* Remove tap flash on interactive elements */
+.app-root-mobile button,
+.app-root-mobile a,
+.app-root-mobile .mud-list-item {
+    -webkit-tap-highlight-color: transparent;
+    tap-highlight-color: transparent;
 }
 
-.moderation-popup-sheet {
-    width: min(420px, calc(100vw - 1rem));
-    border-radius: 16px;
-    border: 1px solid var(--pc-border-strong);
-    background: linear-gradient(170deg, rgba(16, 27, 45, 0.96), rgba(12, 22, 36, 0.92));
-    padding: 0.95rem;
+/* Smooth momentum scrolling on iOS */
+.app-root-mobile .chat-messages-area,
+.app-root-mobile .members-list,
+.app-root-mobile .drawer-content-wrapper .app-shell-nav {
+    -webkit-overflow-scrolling: touch;
 }
 
+/* AppBar safe-area padding for notched devices (iOS/Android) */
+.app-root-mobile .app-shell-bar {
+    padding-top: env(safe-area-inset-top) !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Incoming Call Overlay
+   ═══════════════════════════════════════════════════════════════════════════ */
 .incoming-call-overlay {
     position: fixed;
     inset: 0;
@@ -2295,127 +3546,21 @@ h1:focus {
 }
 
 @keyframes incoming-call-pulse {
-    0% {
-        opacity: 0.58;
-    }
-
-    50% {
-        opacity: 1;
-    }
-
-    100% {
-        opacity: 0.58;
-    }
+    0%   { opacity: 0.58; }
+    50%  { opacity: 1; }
+    100% { opacity: 0.58; }
 }
 
-.moderation-popup-header {
+
+/* Measured chat virtualization: row wrappers include the gap in their height. */
+.chat-messages-area:has(.chat-virtual-list) {
+    scroll-behavior: auto;
+    overflow-anchor: none;
+}
+.chat-virtual-list { flex: 0 0 auto; min-width: 0; }
+.chat-virtual-row {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 0.5rem;
-    margin-bottom: 0.7rem;
-}
-
-@media (max-width: 760px) {
-    .app-shell-subtitle {
-        display: none;
-    }
-
-    .app-shell-bar {
-        min-height: 56px;
-    }
-
-    .app-root-mobile .update-banner {
-        bottom: calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom) + 0.25rem);
-    }
-
-    .app-root-mobile .rooms-page,
-    .app-root-mobile .dm-page {
-        gap: 0.42rem;
-        padding: 0.35rem 0.35rem 0;
-    }
-
-    .chat-toolbar-content {
-        flex-direction: column;
-        align-items: stretch;
-        gap: 0.4rem;
-        padding: 0.44rem 0.58rem;
-    }
-
-    .chat-toolbar-actions {
-        width: 100%;
-        margin-left: 0;
-        justify-content: flex-start;
-    }
-
-    .chat-toolbar-actions .mud-button,
-    .chat-toolbar-actions .mud-icon-button {
-        min-height: 36px;
-    }
-
-    .chat-messages-area {
-        padding: 0.75rem 0.68rem;
-    }
-
-    .chat-input-area {
-        padding: 0.58rem 0.65rem 0.68rem;
-    }
-
-    .app-root-mobile .members-sidebar {
-        inset: 4.2rem 0.35rem calc(var(--pc-mobile-nav-height) + env(safe-area-inset-bottom) + 0.35rem) 0.35rem;
-    }
-
-    .create-room-overlay {
-        padding: 0.65rem;
-    }
-
-    .create-room-sheet {
-        width: min(460px, calc(100vw - 1.3rem));
-        border-radius: 14px;
-        padding: 0.85rem;
-    }
-
-    .moderation-popup-overlay {
-        padding: 0.65rem;
-    }
-
-    .moderation-popup-sheet {
-        width: min(420px, calc(100vw - 1.3rem));
-        border-radius: 14px;
-        padding: 0.82rem;
-    }
-
-    .call-controls-bar .mud-icon-button {
-        width: 40px;
-        height: 40px;
-    }
-}
-
-@media (max-width: 560px) {
-    .chat-composer-row {
-        align-items: stretch !important;
-        gap: 0.42rem;
-    }
-
-    .chat-input-field {
-        min-width: 0;
-    }
-
-    .chat-composer-row .mud-button {
-        min-height: 38px;
-    }
-
-    .file-picker-button {
-        min-height: 38px;
-        padding-left: 0.54rem !important;
-        padding-right: 0.54rem !important;
-    }
-
-    .file-picker-button .ml-1 {
-        display: none;
-    }
-
-    .chat-msg {
-        max-width: 94%;
-    }
+    flex-direction: column;
+    padding-bottom: 0.5rem;
+    min-width: 0;
 }

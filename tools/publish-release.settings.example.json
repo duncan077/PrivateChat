@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to publish-release.settings.json (gitignored). NEVER put an SSH password here - run with -UsePassword and the script prompts for it, keeps it in a locked-down temp file for plink, and deletes it afterwards.",
+
+  "DownloadHost": "deploy@www.duncan.com.ar",
+  "DownloadPath": "/var/www/downloads",
+  "DownloadBaseUrl": "https://www.duncan.com.ar",
+
+  "ServerHost": "deploy@chat.duncan.com.ar",
+  "ServerPath": "/opt/chatflow",
+  "ServiceName": "chatflow",
+
+  "_restart": "Optional. Default is 'sudo -n systemctl restart <ServiceName>', which needs NOPASSWD sudo. CloudPanel and most shared hosting deny the site user sudo entirely - use 'none' to deploy files only and restart yourself, or supply a command that works.",
+  "RestartCommand": "",
+
+  "_auth": "Leave SshKey empty to use password auth (prompted per host, never stored here).",
+  "SshKey": ""
+}

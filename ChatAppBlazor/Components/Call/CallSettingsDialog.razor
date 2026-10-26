@@ -18,6 +18,40 @@
                 }
             </MudSelect>
 
+            @* Output devices are only enumerable on Chromium, and only after a media
+               permission exists. Hide the picker rather than show an empty select. *@
+            @if (Store.Speakers.Count > 0)
+            {
+                <MudSelect T="string" @bind-Value="_selectedSpeakerId" Label="Speaker" Variant="Variant.Outlined" Dense="true">
+                    <MudSelectItem T="string" Value="@("")">Default</MudSelectItem>
+                    @foreach (var speaker in Store.Speakers)
+                    {
+                        <MudSelectItem T="string" Value="@speaker.DeviceId">@speaker.Label</MudSelectItem>
+                    }
+                </MudSelect>
+            }
+
+            <MudPaper Class="pa-2">
+                <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween" Spacing="1">
+                    <MudText Typo="Typo.body2">Mic Test</MudText>
+                    <MudButton Variant="Variant.Outlined"
+                               Color="@(_micTestActive ? Color.Warning : Color.Primary)"
+                               Size="Size.Small"
+                               Disabled="_micTestBusy"
+                               StartIcon="@(_micTestActive ? Icons.Material.Filled.Stop : Icons.Material.Filled.PlayArrow)"
+                               OnClick="ToggleMicTest">
+                        @(_micTestActive ? "Stop Test" : "Start Test")
+                    </MudButton>
+                </MudStack>
+                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                    Hear your selected microphone locally.
+                </MudText>
+                @if (!string.IsNullOrWhiteSpace(_micTestError))
+                {
+                    <MudText Typo="Typo.caption" Color="Color.Error">@_micTestError</MudText>
+                }
+            </MudPaper>
+
             <MudSelect T="string" @bind-Value="_selectedCameraId" Label="Camera" Variant="Variant.Outlined" Dense="true">
                 <MudSelectItem T="string" Value="@("")">Default</MudSelectItem>
                 @foreach (var cam in Store.Cameras)
@@ -40,6 +74,11 @@
                 <MudSelectItem T="int" Value="60">60 fps</MudSelectItem>
             </MudSelect>
 
+            <MudSelect T="string" @bind-Value="_selectedVideoContentHint" Label="Video Content Hint" Variant="Variant.Outlined" Dense="true">
+                <MudSelectItem T="string" Value="@("motion")">Motion (video/action)</MudSelectItem>
+                <MudSelectItem T="string" Value="@("detail")">Detail (text/static)</MudSelectItem>
+            </MudSelect>
+
             <MudSelect T="int" @bind-Value="_selectedBitrate" Label="Bitrate" Variant="Variant.Outlined" Dense="true">
                 <MudSelectItem T="int" Value="2000">2 Mbps (Default)</MudSelectItem>
                 <MudSelectItem T="int" Value="4000">4 Mbps</MudSelectItem>
@@ -60,9 +99,58 @@
                 Showing only video encoders supported by this device.
             </MudText>
 
-            <MudSwitch T="bool" @bind-Value="_screenShareAudioEnabled" Color="Color.Primary">
-                Capture Screen Share Audio
+            <MudSwitch T="bool" @bind-Value="_noiseSuppressionEnabled" Color="Color.Primary">
+                Noise Suppression
             </MudSwitch>
+
+            <MudSwitch T="bool" Value="_voiceGateEnabled" Color="Color.Primary"
+                       Disabled="@_pttEnabled"
+                       ValueChanged="OnVoiceGateToggled">
+                Voice Gate (Mic Sensitivity)
+            </MudSwitch>
+            @if (_pttEnabled)
+            {
+                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                    Disabled while Push to Talk is active.
+                </MudText>
+            }
+            @if (_voiceGateEnabled)
+            {
+                <MudSwitch T="bool" @bind-Value="_voiceGateAuto" Color="Color.Primary" Class="mt-n1">
+                    Auto Threshold
+                </MudSwitch>
+
+                <div class="voice-gate-meter">
+                    <div class="voice-gate-meter-bar" style="width: @(_voiceGateMicLevel)%"></div>
+                    <div class="voice-gate-meter-threshold" style="left: @(_voiceGateAuto ? _voiceGateAutoThreshold : _voiceGateThreshold)%"></div>
+                </div>
+                @if (!_voiceGateAuto)
+                {
+                    <MudSlider T="int" @bind-Value="_voiceGateThreshold" Min="1" Max="100" Step="1" Color="Color.Primary" Class="mt-n2">
+                        Threshold: @_voiceGateThreshold%
+                    </MudSlider>
+                }
+                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                    @if (_voiceGateAuto)
+                    {
+                        @:Automatically adjusts gate threshold based on ambient noise level.
+                    }
+                    else
+                    {
+                        @:Mutes mic when audio level is below the threshold. Higher = more sensitive gate.
+                    }
+                </MudText>
+            }
+
+            <MudSwitch T="bool" @bind-Value="_screenShareAudioEnabled" Color="Color.Primary">
+                Native Audio Capture Fallback
+            </MudSwitch>
+            <MudText Typo="Typo.caption" Color="Color.Secondary" Class="ml-2">
+                Windows-only backup capture used when the share itself provides no audio.
+                Audio granted in the share picker always plays regardless of this switch.
+                App-isolated audio for window shares needs Windows 11; on Windows 10,
+                share the entire screen to include audio.
+            </MudText>
 
             <MudSwitch T="bool" @bind-Value="_screenShareAutoGainEnabled" Color="Color.Primary">
                 Screen Share Audio Auto Gain
@@ -81,9 +169,50 @@
                     Enable GPU Acceleration
                 </MudSwitch>
 
+                <MudSwitch T="bool" @bind-Value="_zeroCopyVideoCaptureEnabled" Color="Color.Primary"
+                           Disabled="@(!_gpuAccelerationEnabled)">
+                    Enable Zero-copy Video Capture
+                </MudSwitch>
+
+                @if (_hasMultipleWindowsGpus)
+                {
+                    <MudSelect T="string" @bind-Value="_windowsGpuPreference" Label="Preferred GPU" Variant="Variant.Outlined" Dense="true">
+                        <MudSelectItem T="string" Value="@("high-performance")">High Performance GPU</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("power-saving")">Power Saving GPU</MudSelectItem>
+                        <MudSelectItem T="string" Value="@("auto")">Auto (OS default)</MudSelectItem>
+                    </MudSelect>
+
+                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                        Detected GPUs: @string.Join(", ", _windowsGpuNames)
+                    </MudText>
+                }
+
                 <MudText Typo="Typo.caption" Color="Color.Secondary">
                     Applies on next app launch (WebView2 startup flag).
                 </MudText>
+            }
+
+            <MudDivider Class="my-1" />
+            <MudButton Variant="Variant.Text" Color="Color.Default" Size="Size.Small"
+                       StartIcon="@(_showDebugCodec ? Icons.Material.Filled.ExpandLess : Icons.Material.Filled.ExpandMore)"
+                       OnClick="() => ToggleDebugCodecSection()">
+                Debug: H.264 Encoder Override
+            </MudButton>
+            @if (_showDebugCodec)
+            {
+                <MudStack Spacing="2" Class="ml-2">
+                    <MudSelect T="string" @bind-Value="_selectedH264Override" Label="H.264 Profile Override"
+                               Variant="Variant.Outlined" Dense="true">
+                        <MudSelectItem T="string" Value="@("")">Auto (Highest Available)</MudSelectItem>
+                        @foreach (var entry in _h264Capabilities)
+                        {
+                            <MudSelectItem T="string" Value="@entry.Value">@entry.Label</MudSelectItem>
+                        }
+                    </MudSelect>
+                    <MudText Typo="Typo.caption" Color="Color.Secondary">
+                        Pin a specific H.264 codec entry. Requires renegotiation on Apply.
+                    </MudText>
+                </MudStack>
             }
 
             <div>
@@ -104,8 +233,15 @@
             <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.SpaceBetween">
                 <MudText Typo="Typo.body2">Push to Talk</MudText>
                 <MudSwitch T="bool" Value="_pttEnabled" Color="Color.Primary"
+                           Disabled="@_voiceGateEnabled"
                            ValueChanged="OnPttToggled" />
             </MudStack>
+            @if (_voiceGateEnabled)
+            {
+                <MudText Typo="Typo.caption" Color="Color.Secondary">
+                    Disabled while Voice Gate is active.
+                </MudText>
+            }
 
             <MudSwitch T="bool" Value="_pttSoundEnabled" Color="Color.Primary"
                        Disabled="@(!_pttEnabled)"
@@ -173,12 +309,30 @@
     private string _selectedMicId = "";
     private string _selectedCameraId = "";
     private string _selectedResolution = "1280x720";
+    private string _selectedSpeakerId= "";
     private int _selectedFps = 30;
     private int _selectedBitrate = 2000;
     private string _selectedVideoCodec = "h264";
+    private string _selectedVideoContentHint = "motion";
+    private bool _noiseSuppressionEnabled = true;
+    private bool _voiceGateEnabled;
+    private bool _voiceGateAuto;
+    private int _voiceGateThreshold = 30;
+    // 8 Hz is well above the meter's perceptual threshold; each tick costs an interop round
+    // trip plus a re-render of a dialog holding ~80 Mud* component instances.
+    private const int VoiceGateLevelPollIntervalMs = 120;
+
+    private int _voiceGateMicLevel;
+    private int _voiceGateAutoThreshold;
+    private int _voiceGateLevelPollBusy;
+    private System.Threading.Timer? _voiceGateLevelTimer;
     private bool _screenShareAudioEnabled = true;
     private bool _screenShareAutoGainEnabled = true;
     private bool _gpuAccelerationEnabled = true;
+    private bool _zeroCopyVideoCaptureEnabled = true;
+    private string _windowsGpuPreference = "high-performance";
+    private bool _hasMultipleWindowsGpus;
+    private List<string> _windowsGpuNames = [];
     private bool _forcePlatformHevcEncoderSupport = true;
     private bool _enableWebRtcH265SendFeature = true;
     private double _micVolume = 1.0;
@@ -187,12 +341,19 @@
     private string _pttKey = "Space";
     private bool _pttSoundEnabled = true;
     private bool _notificationsEnabled = true;
+    private bool _micTestActive;
+    private bool _micTestBusy;
+    private string? _micTestError;
     private bool _capturingPtt;
     private ElementReference _pttCaptureBox;
     private readonly HashSet<string> _captureModifiers = [];
     private List<VideoCodecOption> _videoCodecOptions = [];
     private List<ResolutionOption> _resolutionOptions = [];
-    private static readonly string[] CodecPreferenceOrder = ["h264", "h265", "vp9", "vp8"];
+    private bool _showDebugCodec;
+    private string _selectedH264Override = "";
+    private List<H264OverrideOption> _h264Capabilities = [];
+    private sealed record H264OverrideOption(string Value, string Label);
+    private static readonly string[] CodecPreferenceOrder = ["h264", "h265", "hvc1", "av1", "vp9", "vp8"];
     private sealed record VideoCodecOption(string Value, string Label);
     private sealed record ResolutionOption(string Value, string Label, int Width, int Height);
     private static readonly ResolutionOption[] ResolutionPresets =
@@ -210,15 +371,26 @@
         Store.OnChange += HandleStoreChanged;
 
         _selectedMicId = Store.SelectedMicId ?? "";
+        // Without this the picker opened on "Default" every time and silently reset
+        // the saved output device the moment settings were applied.
+        _selectedSpeakerId = Store.SelectedSpeakerId ?? "";
         _selectedCameraId = Store.SelectedCameraId ?? "";
         _selectedResolution = Store.SelectedResolution;
         _selectedFps = Store.SelectedFps;
         // UI only exposes 2 Mbps+ options, while runtime enforces a 1 Mbps hard floor.
         _selectedBitrate = Math.Max(2000, Store.SelectedBitrate);
         _selectedVideoCodec = Store.SelectedVideoCodec;
+        _selectedVideoContentHint = Store.SelectedVideoContentHint;
+        _noiseSuppressionEnabled = Store.NoiseSuppressionEnabled;
+        _voiceGateEnabled = Store.VoiceGateEnabled;
+        _voiceGateAuto = Store.VoiceGateAuto;
+        _voiceGateThreshold = Store.VoiceGateThreshold;
+        if (_voiceGateEnabled) StartVoiceGateLevelPolling();
         _screenShareAudioEnabled = Store.ScreenShareAudioEnabled;
         _screenShareAutoGainEnabled = Store.ScreenShareAutoGainEnabled;
         _gpuAccelerationEnabled = Store.GpuAccelerationEnabled;
+        _zeroCopyVideoCaptureEnabled = Store.ZeroCopyVideoCaptureEnabled;
+        _windowsGpuPreference = Store.WindowsGpuPreference;
         _forcePlatformHevcEncoderSupport = Store.ForcePlatformHevcEncoderSupport;
         _enableWebRtcH265SendFeature = Store.EnableWebRtcH265SendFeature;
         _micVolume = Store.Volume;
@@ -227,6 +399,17 @@
         _pttKey = string.IsNullOrWhiteSpace(Store.PushToTalkKey) ? "Space" : Store.PushToTalkKey;
         _pttSoundEnabled = Store.PushToTalkSoundEnabled;
         _notificationsEnabled = Store.NotificationsEnabled;
+        _selectedH264Override = Store.H264ProfileOverride ?? "";
+
+        if (OperatingSystem.IsWindows())
+        {
+            _windowsGpuNames = CallStore.GetWindowsHardwareGpuNames().ToList();
+            _hasMultipleWindowsGpus = _windowsGpuNames.Count > 1;
+            if (!_hasMultipleWindowsGpus)
+            {
+                _windowsGpuPreference = "high-performance";
+            }
+        }
 
         BuildResolutionOptionsForCurrentDisplay();
         await RefreshDevices();
@@ -242,24 +425,42 @@
 
         var runtimeFlagsChanged =
             _gpuAccelerationEnabled != Store.GpuAccelerationEnabled ||
+            _windowsGpuPreference != Store.WindowsGpuPreference ||
             _forcePlatformHevcEncoderSupport != Store.ForcePlatformHevcEncoderSupport ||
-            _enableWebRtcH265SendFeature != Store.EnableWebRtcH265SendFeature;
+            _enableWebRtcH265SendFeature != Store.EnableWebRtcH265SendFeature ||
+            _zeroCopyVideoCaptureEnabled != Store.ZeroCopyVideoCaptureEnabled;
 
+        var h264Override = string.IsNullOrWhiteSpace(_selectedH264Override) ? null : _selectedH264Override;
+        var videoContentHint = _selectedVideoContentHint is "detail" ? "detail" : "motion";
         Store.ApplyCallSettings(
             _selectedMicId,
             _selectedCameraId,
+            _selectedSpeakerId,
             _selectedResolution,
             _selectedFps,
             _selectedBitrate,
             _selectedVideoCodec,
+            _noiseSuppressionEnabled,
             _screenShareAudioEnabled,
             _screenShareAutoGainEnabled,
+            Store.HideLocalPreview,
             _gpuAccelerationEnabled,
+            _windowsGpuPreference,
             _forcePlatformHevcEncoderSupport,
-            _enableWebRtcH265SendFeature);
+            _enableWebRtcH265SendFeature,
+            _zeroCopyVideoCaptureEnabled,
+            _voiceGateEnabled,
+            _voiceGateAuto,
+            _voiceGateThreshold,
+            videoContentHint,
+            h264Override);
         Store.SetPushToTalkPreference(_pttEnabled, _pttKey);
         Store.SetPushToTalkSoundPreference(_pttSoundEnabled);
         Store.SetNotificationsEnabled(_notificationsEnabled);
+
+        // Output routing is independent of the call pipeline (it re-points the
+        // playback elements), so it applies whether or not a call is running.
+        await WebRtc.SetAudioOutputDeviceAsync(_selectedSpeakerId);
 
         if (ApplyLiveChanges)
         {
@@ -270,8 +471,15 @@
                 _selectedFps,
                 _selectedBitrate,
                 _selectedVideoCodec,
+                _noiseSuppressionEnabled,
                 _screenShareAudioEnabled,
-                _screenShareAutoGainEnabled
+                _screenShareAutoGainEnabled,
+                Store.HideLocalPreview,
+                videoContentHint,
+                h264Override,
+                _voiceGateEnabled,
+                _voiceGateAuto,
+                _voiceGateThreshold
             );
 
             // Apply push-to-talk setting
@@ -286,16 +494,82 @@
                 Severity.Info);
         }
 
+        await StopMicTestIfRunningAsync();
         MudDialog.Close(DialogResult.Ok(true));
     }
 
-    private void Cancel() => MudDialog.Cancel();
+    private async Task Cancel()
+    {
+        await StopMicTestIfRunningAsync();
+        MudDialog.Cancel();
+    }
 
     private async Task RefreshDevices()
     {
         try { await WebRtc.EnumerateDevicesAsync(); } catch { }
         await LoadSupportedVideoCodecOptionsAsync();
         await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task ToggleDebugCodecSection()
+    {
+        _showDebugCodec = !_showDebugCodec;
+        if (_showDebugCodec && _h264Capabilities.Count == 0)
+        {
+            await LoadH264CapabilitiesAsync();
+        }
+    }
+
+    private async Task LoadH264CapabilitiesAsync()
+    {
+        try
+        {
+            var caps = await WebRtc.GetH264CodecCapabilitiesAsync();
+            _h264Capabilities = caps
+                .Select(c =>
+                {
+                    var profile = string.IsNullOrEmpty(c.ProfileLevelId) ? "unknown" : c.ProfileLevelId;
+                    var profileName = GetH264ProfileName(profile);
+                    var value = $"{profile}:{c.PacketizationMode}";
+                    var label = $"{profileName} ({profile}) pm={c.PacketizationMode}";
+                    return new
+                    {
+                        Option = new H264OverrideOption(value, label),
+                        Score = GetH264PreferenceScore(profile, c.PacketizationMode)
+                    };
+                })
+                .OrderByDescending(x => x.Score)
+                .ThenByDescending(x => x.Option.Value, StringComparer.OrdinalIgnoreCase)
+                .Select(x => x.Option)
+                .ToList();
+
+            if (string.IsNullOrWhiteSpace(_selectedH264Override) && _h264Capabilities.Count > 0)
+            {
+                _selectedH264Override = _h264Capabilities[0].Value;
+            }
+        }
+        catch
+        {
+            _h264Capabilities = [];
+        }
+    }
+
+    private static string GetH264ProfileName(string profileLevelId)
+    {
+        if (string.IsNullOrEmpty(profileLevelId) || profileLevelId.Length < 2)
+            return "Unknown";
+
+        return profileLevelId[..2] switch
+        {
+            "42" => "Constrained Baseline",
+            "4d" => "Main",
+            "58" => "Extended",
+            "64" => "High",
+            "6e" => "High 10",
+            "7a" => "High 4:2:2",
+            "f4" => "High 4:4:4 Predictive",
+            _ => "Other"
+        };
     }
 
     private async Task OnMicVolumeChanged(double vol)
@@ -305,6 +579,62 @@
         if (ApplyLiveChanges)
         {
             await WebRtc.SetVolumeAsync(vol);
+        }
+    }
+
+    private async Task ToggleMicTest()
+    {
+        if (_micTestBusy)
+        {
+            return;
+        }
+
+        _micTestBusy = true;
+        _micTestError = null;
+        try
+        {
+            if (_micTestActive)
+            {
+                await WebRtc.StopMicTestAsync();
+                _micTestActive = false;
+                return;
+            }
+
+            var micDeviceId = string.IsNullOrWhiteSpace(_selectedMicId) ? null : _selectedMicId;
+            await WebRtc.StartMicTestAsync(micDeviceId);
+            _micTestActive = true;
+        }
+        catch (Exception ex)
+        {
+            _micTestActive = false;
+            _micTestError = $"Mic test failed: {ex.Message}";
+        }
+        finally
+        {
+            _micTestBusy = false;
+        }
+    }
+
+    private async Task StopMicTestIfRunningAsync()
+    {
+        if (!_micTestActive && !_micTestBusy)
+        {
+            return;
+        }
+
+        try
+        {
+            await WebRtc.StopMicTestAsync();
+        }
+        catch
+        {
+            // Ignore teardown failures while closing dialog.
+        }
+        finally
+        {
+            _micTestActive = false;
+            _micTestBusy = false;
+            _micTestError = null;
         }
     }
 
@@ -318,10 +648,37 @@
         }
     }
 
+    private async Task OnVoiceGateToggled(bool enabled)
+    {
+        _voiceGateEnabled = enabled;
+        if (enabled)
+        {
+            StartVoiceGateLevelPolling();
+            if (_pttEnabled)
+            {
+                _pttEnabled = false;
+                _capturingPtt = false;
+                Store.SetPushToTalkPreference(false, _pttKey);
+                if (ApplyLiveChanges)
+                {
+                    await WebRtc.SetPushToTalkAsync(false, _pttKey);
+                }
+            }
+        }
+        else
+        {
+            StopVoiceGateLevelPolling();
+        }
+    }
+
     private async Task OnPttToggled(bool enabled)
     {
         _pttEnabled = enabled;
         if (!enabled) _capturingPtt = false;
+        if (enabled && _voiceGateEnabled)
+        {
+            _voiceGateEnabled = false;
+        }
         Store.SetPushToTalkPreference(enabled, _pttKey);
         if (ApplyLiveChanges)
         {
@@ -445,7 +802,7 @@
         var supportedSet = new HashSet<string>(
             supported
                 .Select(static codec => (codec ?? string.Empty).Trim().ToLowerInvariant())
-                .Where(static codec => codec is "h264" or "h265" or "vp8" or "vp9"),
+                .Where(static codec => codec is "h264" or "h265" or "hvc1" or "av1" or "vp8" or "vp9"),
             StringComparer.Ordinal);
 
         if (supportedSet.Count == 0)
@@ -462,6 +819,21 @@
         if (_videoCodecOptions.Count == 0)
         {
             _videoCodecOptions = [new VideoCodecOption("h264", GetCodecLabel("h264"))];
+        }
+
+        // Keep a saved choice the probe did not report, rather than silently rewriting it
+        // to h264. Dropping it was a one-way trapdoor for H265: the probe only sees H265
+        // when Chromium was launched with the HEVC feature flags, and those are only
+        // force-enabled when the *saved* codec is already H265. So one session where it
+        // was not detected rewrote the preference, and from then on the flags were never
+        // set, the codec was never advertised, and the option never came back.
+        //
+        // Selecting an unsupported codec is harmless at runtime - resolveJanusVideoCodec
+        // falls back to what the device really has.
+        var saved = Store.SelectedVideoCodec;
+        if (!string.IsNullOrWhiteSpace(saved) && _videoCodecOptions.All(x => x.Value != saved))
+        {
+            _videoCodecOptions.Add(new VideoCodecOption(saved, $"{GetCodecLabel(saved)} (not detected on this device)"));
         }
 
         if (!_videoCodecOptions.Any(x => x.Value == _selectedVideoCodec))
@@ -517,10 +889,48 @@
     {
         "h264" => "H.264 (Recommended)",
         "h265" => "H.265 (HEVC)",
+        "hvc1" => "HVC1 (HEVC)",
+        "av1" => "AV1",
         "vp9" => "VP9",
         "vp8" => "VP8",
         _ => codec.ToUpperInvariant()
     };
+
+    private static int GetH264PreferenceScore(string profileLevelId, int packetizationMode)
+    {
+        if (string.IsNullOrWhiteSpace(profileLevelId) || profileLevelId.Length < 6)
+        {
+            return packetizationMode == 1 ? 20 : 0;
+        }
+
+        var normalized = profileLevelId[..6].ToLowerInvariant();
+        var profileIdc = ParseHexByte(normalized[..2]);
+        var profileIop = ParseHexByte(normalized.Substring(2, 2));
+        var levelIdc = ParseHexByte(normalized.Substring(4, 2));
+
+        var profileRank = profileIdc switch
+        {
+            0xF4 => 800, // High 4:4:4 Predictive
+            0x7A => 700, // High 4:2:2
+            0x6E => 600, // High 10
+            0x64 => 500, // High
+            0x4D => 400, // Main
+            0x58 => 300, // Extended
+            0x42 when (profileIop & 0x40) != 0 => 200, // Constrained Baseline
+            0x42 => 250, // Baseline
+            _ => 100
+        };
+
+        var packetizationBonus = packetizationMode == 1 ? 20 : 0;
+        return profileRank + levelIdc + packetizationBonus;
+    }
+
+    private static int ParseHexByte(string hex)
+    {
+        return int.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out var value)
+            ? value
+            : 0;
+    }
 
     private static string FormatShortcut(string binding)
     {
@@ -559,8 +969,52 @@
         _ = InvokeAsync(StateHasChanged);
     }
 
+    private void StartVoiceGateLevelPolling()
+    {
+        StopVoiceGateLevelPolling();
+        System.Threading.Interlocked.Exchange(ref _voiceGateLevelPollBusy, 0);
+        _voiceGateLevelTimer = new System.Threading.Timer(async _ =>
+        {
+            // The tick is a marshalled interop round trip; without a guard, round trips slower
+            // than the period stack up on the UI thread.
+            if (System.Threading.Interlocked.Exchange(ref _voiceGateLevelPollBusy, 1) == 1)
+            {
+                return;
+            }
+
+            try
+            {
+                var info = await WebRtc.GetVoiceGateMicLevelAsync();
+                if (info.Level == _voiceGateMicLevel && info.Threshold == _voiceGateAutoThreshold)
+                {
+                    // Nothing moved — re-rendering this dialog is far more expensive than the poll.
+                    return;
+                }
+
+                _voiceGateMicLevel = info.Level;
+                _voiceGateAutoThreshold = info.Threshold;
+                await InvokeAsync(StateHasChanged);
+            }
+            catch { }
+            finally
+            {
+                System.Threading.Interlocked.Exchange(ref _voiceGateLevelPollBusy, 0);
+            }
+        }, null, 0, VoiceGateLevelPollIntervalMs);
+    }
+
+    private void StopVoiceGateLevelPolling()
+    {
+        _voiceGateLevelTimer?.Dispose();
+        _voiceGateLevelTimer = null;
+        _voiceGateMicLevel = 0;
+        _voiceGateAutoThreshold = 0;
+    }
+
     public void Dispose()
     {
+        StopVoiceGateLevelPolling();
+        _ = StopMicTestIfRunningAsync();
         Store.OnChange -= HandleStoreChanged;
     }
 }

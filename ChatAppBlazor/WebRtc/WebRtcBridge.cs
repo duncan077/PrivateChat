@@ -1,8 +1,10 @@
 using System.Text.Json;
 using System.Linq;
 using Microsoft.JSInterop;
+using ChatAppBlazor.Serialization;
 using ChatAppBlazor.Services;
 using ChatAppBlazor.State;
+using Shared.Models;
 
 namespace ChatAppBlazor.WebRtc;
 
@@ -37,6 +39,8 @@ public class WebRtcBridge : IAsyncDisposable
         // Subscribe to Janus reconnection events from CallStore
         _callStore.OnJanusReconnect += HandleJanusReconnect;
         _callStore.OnWebRtcSignal += HandleStoreWebRtcSignal;
+        _callStore.OnAnnotationStateChanged += HandleAnnotationStateChanged;
+        _callStore.OnAnnotationEvent += HandleAnnotationEvent;
     }
 
     /// <summary>
@@ -76,8 +80,34 @@ public class WebRtcBridge : IAsyncDisposable
             participantDirectory = _participantDirectory,
             participantAvatarDirectory = _participantAvatars,
             iceServers,
+            micDeviceId = _callStore.SelectedMicId,
+            cameraDeviceId = _callStore.SelectedCameraId,
+            resolution = _callStore.SelectedResolution,
+            fps = _callStore.SelectedFps,
+            bitrateKbps = _callStore.SelectedBitrate,
+            preferredVideoCodec = _callStore.SelectedVideoCodec,
+            videoContentHint = _callStore.SelectedVideoContentHint,
+            hideLocalPreview = _callStore.HideLocalPreview,
+            screenShareAudioEnabled = _callStore.ScreenShareAudioEnabled,
+            screenShareAutoGainEnabled = _callStore.ScreenShareAutoGainEnabled,
+            h264ProfileOverride = _callStore.H264ProfileOverride,
+            noiseSuppressionEnabled = _callStore.NoiseSuppressionEnabled,
+            voiceGateEnabled = _callStore.VoiceGateEnabled,
+            voiceGateAuto = _callStore.VoiceGateAuto,
+            voiceGateThreshold = _callStore.VoiceGateThreshold,
             dotNetRef = _dotNetRef
         });
+
+        // The annotation layer holds its own copy of the callback reference, so it
+        // has to be re-pointed whenever InitAsync swaps it out (join, reconnect).
+        try
+        {
+            await InitAnnotationsAsync();
+        }
+        catch
+        {
+            // Annotation input is optional; never block joining a call.
+        }
     }
 
     public async Task StopAsync(string reason = "unspecified")
@@ -123,8 +153,15 @@ public class WebRtcBridge : IAsyncDisposable
         int fps = 30,
         int bitrateKbps = 2000,
         string? preferredVideoCodec = "h264",
+        bool noiseSuppressionEnabled = true,
         bool screenShareAudioEnabled = true,
-        bool screenShareAutoGainEnabled = true)
+        bool screenShareAutoGainEnabled = true,
+        bool hideLocalPreview = false,
+        string? videoContentHint = "motion",
+        string? h264ProfileOverride = null,
+        bool voiceGateEnabled = false,
+        bool voiceGateAuto = true,
+        int voiceGateThreshold = 30)
     {
         await _js.InvokeVoidAsync("webrtcManager.updateSettings", new
         {
@@ -134,10 +171,33 @@ public class WebRtcBridge : IAsyncDisposable
             fps,
             bitrateKbps,
             preferredVideoCodec,
+            noiseSuppressionEnabled,
+            hideLocalPreview,
+            videoContentHint,
             screenShareAudioEnabled,
-            screenShareAutoGainEnabled
+            screenShareAutoGainEnabled,
+            h264ProfileOverride,
+            voiceGateEnabled,
+            voiceGateAuto,
+            voiceGateThreshold
         });
     }
+
+    public async Task<VoiceGateLevelInfo> GetVoiceGateMicLevelAsync()
+    {
+        try
+        {
+            return await _js.InvokeAsync<VoiceGateLevelInfo>("webrtcManager.getVoiceGateMicLevel");
+        }
+        catch
+        {
+            return new VoiceGateLevelInfo();
+        }
+    }
+
+    public record struct VoiceGateLevelInfo(
+        [property: System.Text.Json.Serialization.JsonPropertyName("level")] int Level = 0,
+        [property: System.Text.Json.Serialization.JsonPropertyName("threshold")] int Threshold = 0);
 
     /// <summary>
     /// Clone local video to the floating overlay container, or clear it.
@@ -155,6 +215,283 @@ public class WebRtcBridge : IAsyncDisposable
     public async Task RebindVideoElementsAsync()
     {
         await _js.InvokeVoidAsync("webrtcManager.rebindVideoElements");
+    }
+
+    // ─── Screen-share annotations ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Hands the annotation input layer its .NET callback target. Safe to call more
+    /// than once; the JS side just replaces the reference.
+    /// </summary>
+    public async Task InitAnnotationsAsync()
+    {
+        _dotNetRef ??= DotNetObjectReference.Create(this);
+        await _js.InvokeVoidAsync("screenAnnotation.init", _dotNetRef, _userId ?? "");
+        await PushAnnotationStateAsync();
+    }
+
+    public async Task SetAnnotationToolAsync(string tool, string colorHex, double widthScale)
+    {
+        // One hop, not three — this is wired to a slider, so a single drag was 24 serialized
+        // WebView messages.
+        await _js.InvokeVoidAsync("screenAnnotation.setToolConfig", tool, colorHex, widthScale);
+    }
+
+    public async Task AnnotationUndoAsync() => await _js.InvokeVoidAsync("screenAnnotation.undo");
+
+    public async Task AnnotationClearMineAsync() => await _js.InvokeVoidAsync("screenAnnotation.clearMine");
+
+    public async Task AnnotationClearAllAsync() => await _js.InvokeVoidAsync("screenAnnotation.clearAll");
+
+    /// <summary>
+    /// Sends the JS layer the full set of annotatable shares. It keeps one canvas
+    /// per entry, so this is a replace-everything push rather than a delta - a
+    /// sharer that disappears from the list gets their canvas torn down.
+    /// </summary>
+    public async Task PushAnnotationStateAsync()
+    {
+        var inCall = _callStore.IsInCall;
+        var sessions = new List<AnnotationSessionPayload>(_callStore.AnnotationSessions.Count);
+
+        if (inCall)
+        {
+            foreach (var (sharerUserId, state) in _callStore.AnnotationSessions)
+            {
+                if (!state.Enabled || sharerUserId == Guid.Empty)
+                {
+                    continue;
+                }
+
+                sessions.Add(new AnnotationSessionPayload
+                {
+                    SharerUserId = sharerUserId.ToString(),
+                    CaptureKind = state.CaptureKind.ToString(),
+                    NeedsLocalRendering = _callStore.AnnotationsNeedLocalRendering(sharerUserId),
+                    AutoFadeSeconds = state.AutoFadeSeconds
+                });
+            }
+        }
+
+        var payload = new AnnotationStatePayload
+        {
+            // Permission (some sharer allows drawing) AND intent (this user turned
+            // their tools on). Without the second half the canvases would swallow
+            // clicks/zoom for everyone the moment a share becomes annotatable.
+            CanDraw = _callStore.CanAnnotate && _callStore.AnnotationToolsActive,
+            Sessions = sessions
+        };
+
+        await _js.InvokeVoidAsync(
+            "screenAnnotation.setState",
+            JsonSerializer.Serialize(payload, AppJsonContext.Default.AnnotationStatePayload));
+    }
+
+    [JSInvokable]
+    public void OnScreenShareTargetChanged(string payloadJson)
+    {
+        try
+        {
+            var payload = JsonSerializer.Deserialize(payloadJson, AppJsonContext.Default.ScreenShareTargetPayload);
+            if (payload == null)
+            {
+                return;
+            }
+
+            _ = _callStore.SetLocalScreenShareTargetAsync(new ScreenAnnotationCaptureTarget(
+                payload.TargetLabel ?? string.Empty,
+                payload.DisplaySurface ?? string.Empty,
+                payload.FrameWidth,
+                payload.FrameHeight));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WebRtcBridge] Invalid screen-share target payload: {ex.Message}");
+        }
+    }
+
+    [JSInvokable]
+    public void OnAnnotationDrawn(string payloadJson)
+    {
+        try
+        {
+            var payload = JsonSerializer.Deserialize(payloadJson, AppJsonContext.Default.AnnotationPayload);
+            if (payload == null)
+            {
+                return;
+            }
+
+            // JS knows which canvas the stroke landed on; that is the only place the
+            // target can come from, since a client may have several shares on screen.
+            if (!Guid.TryParse(payload.TargetSharerUserId, out var targetSharerUserId))
+            {
+                return;
+            }
+
+            _ = _callStore.SendAnnotationAsync(new ScreenAnnotationEvent
+            {
+                Kind = ParseEventKind(payload.Kind),
+                StrokeId = payload.StrokeId ?? string.Empty,
+                Tool = ParseTool(payload.Tool),
+                Color = payload.Color,
+                Width = payload.Width,
+                Points = payload.Points ?? [],
+                TargetSharerUserId = targetSharerUserId
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WebRtcBridge] Invalid annotation payload: {ex.Message}");
+        }
+    }
+
+    private async void HandleAnnotationStateChanged()
+    {
+        try
+        {
+            await PushAnnotationStateAsync();
+        }
+        catch
+        {
+            // WebView may be navigating.
+        }
+    }
+
+    private async void HandleAnnotationEvent(Guid fromUserId, ScreenAnnotationEvent annotationEvent)
+    {
+        // Apply the same filters screenAnnotation.applyRemote does, before paying for the
+        // Guid.ToString + JSON serialize + interop hop. The hub broadcasts with .All so a
+        // drawer receives its own echo, and drawing flushes roughly every 45ms.
+        if (ShouldDropAnnotationEvent(fromUserId, annotationEvent))
+        {
+            return;
+        }
+
+        try
+        {
+            await _js.InvokeVoidAsync(
+                "screenAnnotation.applyRemote",
+                fromUserId.ToString(),
+                SerializeAnnotationEvent(annotationEvent));
+        }
+        catch
+        {
+            // Ignore transient JS interop errors while navigating.
+        }
+    }
+
+    private bool ShouldDropAnnotationEvent(Guid fromUserId, ScreenAnnotationEvent annotationEvent)
+    {
+        // Ink is scoped to one share, and a share with no live session has no canvas
+        // to receive it.
+        var target = annotationEvent.TargetSharerUserId;
+        if (target == Guid.Empty || _callStore.AnnotationSessions.GetValueOrDefault(target)?.Enabled != true)
+        {
+            return true;
+        }
+
+        // Our own echo; JS discards it on the localUserId check.
+        if (Guid.TryParse(_userId, out var localUserId) && fromUserId == localUserId)
+        {
+            return true;
+        }
+
+        // When that sharer's overlay is rendered into their published video, JS keeps only
+        // a global clear (to drop local echoes) and discards everything else.
+        return !_callStore.AnnotationsNeedLocalRendering(target)
+            && annotationEvent.Kind != ScreenAnnotationEventKind.ClearAll;
+    }
+
+    // Serialized through the camelCase context because the JS side reads
+    // payload.kind / payload.strokeId / payload.points.
+    private static string SerializeAnnotationEvent(ScreenAnnotationEvent annotationEvent)
+        => JsonSerializer.Serialize(
+            new AnnotationPayload
+            {
+                Kind = ToEventKindName(annotationEvent.Kind),
+                StrokeId = annotationEvent.StrokeId,
+                Tool = ToToolName(annotationEvent.Tool),
+                Color = annotationEvent.Color,
+                Width = annotationEvent.Width,
+                Points = annotationEvent.Points,
+                TargetSharerUserId = annotationEvent.TargetSharerUserId.ToString()
+            },
+            AppJsonContext.Default.AnnotationPayload);
+
+    private static ScreenAnnotationEventKind ParseEventKind(string? kind) => kind?.ToLowerInvariant() switch
+    {
+        "begin" => ScreenAnnotationEventKind.Begin,
+        "points" => ScreenAnnotationEventKind.Points,
+        "end" => ScreenAnnotationEventKind.End,
+        "undo" => ScreenAnnotationEventKind.Undo,
+        "clear" => ScreenAnnotationEventKind.Clear,
+        "clearall" => ScreenAnnotationEventKind.ClearAll,
+        _ => ScreenAnnotationEventKind.Points
+    };
+
+    private static string ToEventKindName(ScreenAnnotationEventKind kind) => kind switch
+    {
+        ScreenAnnotationEventKind.Begin => "begin",
+        ScreenAnnotationEventKind.Points => "points",
+        ScreenAnnotationEventKind.End => "end",
+        ScreenAnnotationEventKind.Undo => "undo",
+        ScreenAnnotationEventKind.Clear => "clear",
+        ScreenAnnotationEventKind.ClearAll => "clearAll",
+        _ => "points"
+    };
+
+    private static ScreenAnnotationTool ParseTool(string? tool) => tool?.ToLowerInvariant() switch
+    {
+        "highlighter" => ScreenAnnotationTool.Highlighter,
+        "arrow" => ScreenAnnotationTool.Arrow,
+        "rect" => ScreenAnnotationTool.Rectangle,
+        "ellipse" => ScreenAnnotationTool.Ellipse,
+        _ => ScreenAnnotationTool.Pen
+    };
+
+    private static string ToToolName(ScreenAnnotationTool tool) => tool switch
+    {
+        ScreenAnnotationTool.Highlighter => "highlighter",
+        ScreenAnnotationTool.Arrow => "arrow",
+        ScreenAnnotationTool.Rectangle => "rect",
+        ScreenAnnotationTool.Ellipse => "ellipse",
+        _ => "pen"
+    };
+
+    internal sealed class ScreenShareTargetPayload
+    {
+        public string? TargetLabel { get; set; }
+        public string? DisplaySurface { get; set; }
+        public int FrameWidth { get; set; }
+        public int FrameHeight { get; set; }
+    }
+
+    internal sealed class AnnotationPayload
+    {
+        public string? Kind { get; set; }
+        public string? StrokeId { get; set; }
+        public string? Tool { get; set; }
+        public uint Color { get; set; }
+        public float Width { get; set; }
+        public float[]? Points { get; set; }
+
+        /// <summary>Which share the stroke was drawn on, as a Guid string.</summary>
+        public string? TargetSharerUserId { get; set; }
+    }
+
+    /// <summary>One annotatable share, as the JS canvas layer sees it.</summary>
+    internal sealed class AnnotationSessionPayload
+    {
+        public string SharerUserId { get; set; } = string.Empty;
+        public string? CaptureKind { get; set; }
+        public bool NeedsLocalRendering { get; set; }
+        public int AutoFadeSeconds { get; set; }
+    }
+
+    /// <summary>The complete set of annotatable shares plus this user's pen state.</summary>
+    internal sealed class AnnotationStatePayload
+    {
+        public bool CanDraw { get; set; }
+        public List<AnnotationSessionPayload> Sessions { get; set; } = [];
     }
 
     // ─── JS → C# callbacks ─────────────────────────────────────────────────────
@@ -184,6 +521,12 @@ public class WebRtcBridge : IAsyncDisposable
     }
 
     [JSInvokable]
+    public void OnHideLocalPreviewChanged(bool hideLocalPreview)
+    {
+        _callStore.SetHideLocalPreviewPreference(hideLocalPreview);
+    }
+
+    [JSInvokable]
     public void OnError(string message)
     {
         Console.Error.WriteLine($"[WebRTC Error] {message}");
@@ -195,8 +538,7 @@ public class WebRtcBridge : IAsyncDisposable
     {
         try
         {
-            var devices = JsonSerializer.Deserialize<List<MediaDeviceInfo>>(devicesJson,
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
+            var devices = JsonSerializer.Deserialize(devicesJson, AppJsonContext.Default.ListMediaDeviceInfo) ?? [];
             _callStore.UpdateDevices(devices);
         }
         catch (Exception ex)
@@ -229,6 +571,17 @@ public class WebRtcBridge : IAsyncDisposable
     {
         Console.WriteLine("[WebRtcBridge] Janus session lost, triggering reconnection...");
         _ = _callStore.HandleJanusSessionLostAsync();
+    }
+
+    /// <summary>
+    /// Raised when the publisher PeerConnection becomes usable, or stops being usable.
+    /// IsInCall goes true the moment the hub join returns, which is well before a local
+    /// track can reach anyone - this is what the media controls actually depend on.
+    /// </summary>
+    [JSInvokable]
+    public void OnPublisherReadyChanged(bool isReady)
+    {
+        _callStore.UpdatePublisherReady(isReady);
     }
 
     private async void HandleStoreWebRtcSignal(Guid fromUserId, string signalType, string payload)
@@ -291,14 +644,58 @@ public class WebRtcBridge : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Routes playback to a specific output device. Empty means system default.
+    /// Chromium-only; a no-op elsewhere.
+    /// </summary>
+    public async Task SetAudioOutputDeviceAsync(string? deviceId)
+    {
+        try
+        {
+            await _js.InvokeVoidAsync("webrtcManager.setAudioOutputDevice", deviceId ?? string.Empty);
+        }
+        catch
+        {
+            // setSinkId is unsupported on some platforms; playback stays on default.
+        }
+    }
+
     public async Task SetVolumeAsync(double level)
     {
         await _js.InvokeVoidAsync("webrtcManager.setVolume", level);
     }
 
+    /// <summary>Current mic volume (0-200%) for one user, across all their feeds.</summary>
+    public async Task<double> GetUserMicVolumeAsync(Guid userId)
+    {
+        return await _js.InvokeAsync<double>("webrtcManager.getUserMicVolume", userId.ToString());
+    }
+
+    /// <summary>Sets one user's mic volume (0-200%); applies live to their feeds.</summary>
+    public async Task SetUserMicVolumeAsync(Guid userId, double percent)
+    {
+        await _js.InvokeVoidAsync("webrtcManager.setUserMicVolume", userId.ToString(), percent);
+    }
+
+    /// <summary>Visual filter only — hidden participants keep playing audio.</summary>
+    public async Task SetHideNonVideoTilesAsync(bool enabled)
+    {
+        await _js.InvokeVoidAsync("webrtcManager.setHideNoVideoTiles", enabled);
+    }
+
     public async Task SetStreamVolumeAsync(double level)
     {
         await _js.InvokeVoidAsync("webrtcManager.setStreamVolume", level);
+    }
+
+    public async Task StartMicTestAsync(string? micDeviceId)
+    {
+        await _js.InvokeVoidAsync("webrtcManager.startMicTest", micDeviceId);
+    }
+
+    public async Task StopMicTestAsync()
+    {
+        await _js.InvokeVoidAsync("webrtcManager.stopMicTest");
     }
 
     public async Task SetPushToTalkAsync(bool enabled, string key)
@@ -321,9 +718,22 @@ public class WebRtcBridge : IAsyncDisposable
 
             return codecs
                 .Select(static c => (c ?? string.Empty).Trim().ToLowerInvariant())
-                .Where(static c => c is "h264" or "h265" or "vp8" or "vp9")
+                .Where(static c => c is "h264" or "h265" or "hvc1" or "av1" or "vp8" or "vp9")
                 .Distinct()
                 .ToArray();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    public async Task<H264CodecCapability[]> GetH264CodecCapabilitiesAsync()
+    {
+        try
+        {
+            var caps = await _js.InvokeAsync<H264CodecCapability[]>("webrtcManager.getH264CodecCapabilities");
+            return caps ?? [];
         }
         catch
         {
@@ -352,8 +762,15 @@ public class WebRtcBridge : IAsyncDisposable
             _callStore.SelectedFps,
             _callStore.SelectedBitrate,
             _callStore.SelectedVideoCodec,
+            _callStore.NoiseSuppressionEnabled,
             _callStore.ScreenShareAudioEnabled,
-            _callStore.ScreenShareAutoGainEnabled);
+            _callStore.ScreenShareAutoGainEnabled,
+            _callStore.HideLocalPreview,
+            _callStore.SelectedVideoContentHint,
+            _callStore.H264ProfileOverride,
+            _callStore.VoiceGateEnabled,
+            _callStore.VoiceGateAuto,
+            _callStore.VoiceGateThreshold);
 
         await SetVolumeAsync(_callStore.Volume);
         await SetStreamVolumeAsync(_callStore.StreamVolume);
@@ -365,6 +782,8 @@ public class WebRtcBridge : IAsyncDisposable
     {
         _callStore.OnJanusReconnect -= HandleJanusReconnect;
         _callStore.OnWebRtcSignal -= HandleStoreWebRtcSignal;
+        _callStore.OnAnnotationStateChanged -= HandleAnnotationStateChanged;
+        _callStore.OnAnnotationEvent -= HandleAnnotationEvent;
         // Do NOT stop the call here — the JS layer persists in the WebView
         // and the call should survive page navigation.  Only explicit
         // "Leave Call" (via StopAsync + LeaveCallAsync) tears it down.
@@ -462,3 +881,8 @@ public class WebRtcBridge : IAsyncDisposable
         return $"{baseUrl}{path}";
     }
 }
+
+public record H264CodecCapability(
+    string ProfileLevelId,
+    int PacketizationMode,
+    string SdpFmtpLine);

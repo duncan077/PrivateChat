@@ -6,6 +6,7 @@ using Android.Webkit;
 #if WINDOWS
 using Microsoft.Web.WebView2.Core;
 using Microsoft.UI.Windowing;
+using System.Diagnostics;
 using WinRT.Interop;
 #endif
 namespace ChatAppBlazor
@@ -38,12 +39,72 @@ namespace ChatAppBlazor
         public MainPage()
         {
 #if WINDOWS
+            ConfigureWindowsPerformancePriority();
             ConfigureWindowsWebView2Arguments();
 #endif
             InitializeComponent();
         }
 
 #if WINDOWS
+        private static void ConfigureWindowsPerformancePriority()
+        {
+            try
+            {
+                using var process = Process.GetCurrentProcess();
+                TryElevateProcessPriorityAndAffinity(process);
+            }
+            catch
+            {
+                // Best effort; priority elevation may fail under some policies.
+            }
+        }
+
+        private static void ApplyWindowsProcessPerformanceTuning(int webViewBrowserProcessId = 0)
+        {
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    using var currentProcess = Process.GetCurrentProcess();
+                    TryElevateProcessPriorityAndAffinity(currentProcess);
+                }
+                catch { }
+
+                if (webViewBrowserProcessId <= 0)
+                {
+                    return;
+                }
+
+                try
+                {
+                    using var webViewProcess = Process.GetProcessById(webViewBrowserProcessId);
+                    if (!webViewProcess.HasExited)
+                    {
+                        TryElevateProcessPriorityAndAffinity(webViewProcess);
+                    }
+                }
+                catch { }
+            });
+        }
+
+        private static void TryElevateProcessPriorityAndAffinity(Process process)
+        {
+            try
+            {
+                process.PriorityBoostEnabled = true;
+            }
+            catch { }
+
+            try
+            {
+                if (process.PriorityClass < ProcessPriorityClass.AboveNormal)
+                {
+                    process.PriorityClass = ProcessPriorityClass.AboveNormal;
+                }
+            }
+            catch { }
+        }
+
         private static void ConfigureWindowsWebView2Arguments()
         {
             var arguments = State.CallStore.BuildWindowsWebView2Arguments();
@@ -71,6 +132,13 @@ namespace ChatAppBlazor
 #if WINDOWS
             var webView2 = e.WebView;
             _windowsWebView = webView2;
+            var webViewBrowserProcessId = 0;
+            try
+            {
+                webViewBrowserProcessId = checked((int)webView2.CoreWebView2.BrowserProcessId);
+            }
+            catch { }
+            ApplyWindowsProcessPerformanceTuning(webViewBrowserProcessId);
 
             // Auto-grant camera and microphone permissions so getUserMedia() works
             // without prompting inside the BlazorWebView.
@@ -127,8 +195,95 @@ namespace ChatAppBlazor
         }
 
 #if ANDROID
-        private sealed class AndroidMediaWebChromeClient : WebChromeClient
+        internal sealed class AndroidMediaWebChromeClient : WebChromeClient
         {
+            // Chromium only enables the HTML5 Fullscreen API inside a WebView when
+            // the chrome client implements the custom-view contract below. Without
+            // it, document.fullscreenEnabled is false and every requestFullscreen()
+            // call rejects - which is why the fullscreen button did nothing on
+            // Android. The "custom view" Chromium hands over IS the rendered
+            // fullscreen content; we just have to host it over the activity.
+            private static AndroidMediaWebChromeClient? s_fullscreenOwner;
+
+            private Android.Views.View? _customView;
+            private ICustomViewCallback? _customViewCallback;
+
+            /// <summary>
+            /// Closes the active fullscreen view, if any. Called from the activity's
+            /// back handling so back exits fullscreen instead of leaving the app.
+            /// </summary>
+            internal static bool TryCloseFullscreenView()
+            {
+                var owner = s_fullscreenOwner;
+                if (owner?._customView == null)
+                {
+                    return false;
+                }
+
+                owner.OnHideCustomView();
+                return true;
+            }
+
+            public override void OnShowCustomView(Android.Views.View? view, ICustomViewCallback? callback)
+            {
+                if (view == null || callback == null)
+                {
+                    return;
+                }
+
+                // Chromium contract: a second fullscreen request while one is live
+                // must be refused by hiding the new view immediately.
+                if (_customView != null)
+                {
+                    try { callback.OnCustomViewHidden(); } catch { }
+                    return;
+                }
+
+                var decor = Microsoft.Maui.ApplicationModel.Platform.CurrentActivity?.Window?.DecorView
+                    as Android.Widget.FrameLayout;
+                if (decor == null)
+                {
+                    try { callback.OnCustomViewHidden(); } catch { }
+                    return;
+                }
+
+                _customView = view;
+                _customViewCallback = callback;
+                s_fullscreenOwner = this;
+
+                view.SetBackgroundColor(Android.Graphics.Color.Black);
+                // Watching a call is exactly when the screen must not sleep.
+                view.KeepScreenOn = true;
+
+                decor.AddView(view, new Android.Widget.FrameLayout.LayoutParams(
+                    Android.Views.ViewGroup.LayoutParams.MatchParent,
+                    Android.Views.ViewGroup.LayoutParams.MatchParent));
+            }
+
+            public override void OnHideCustomView()
+            {
+                var view = _customView;
+                if (view == null)
+                {
+                    return;
+                }
+
+                _customView = null;
+                var callback = _customViewCallback;
+                _customViewCallback = null;
+                if (ReferenceEquals(s_fullscreenOwner, this))
+                {
+                    s_fullscreenOwner = null;
+                }
+
+                (view.Parent as Android.Views.ViewGroup)?.RemoveView(view);
+                view.KeepScreenOn = false;
+
+                // Tells Chromium the view is gone so the page's fullscreenchange
+                // event fires and the DOM state stays in sync.
+                try { callback?.OnCustomViewHidden(); } catch { }
+            }
+
             public override void OnPermissionRequest(PermissionRequest? request)
             {
                 if (request == null)
@@ -186,14 +341,22 @@ namespace ChatAppBlazor
             {
                 using var payload = System.Text.Json.JsonDocument.Parse(args.WebMessageAsJson);
                 var root = payload.RootElement;
+                if (root.ValueKind != System.Text.Json.JsonValueKind.Object)
+                {
+                    return;
+                }
                 if (!root.TryGetProperty("type", out var typeEl)) return;
-                var type = typeEl.GetString();
+                var type = TryGetJsonString(typeEl);
+                if (string.IsNullOrWhiteSpace(type))
+                {
+                    return;
+                }
                 if (string.Equals(type, "ptt-config", StringComparison.OrdinalIgnoreCase))
                 {
                     var enabled =
                         root.TryGetProperty("enabled", out var enabledEl) &&
                         enabledEl.ValueKind == System.Text.Json.JsonValueKind.True;
-                    var key = root.TryGetProperty("key", out var keyEl) ? keyEl.GetString() : null;
+                    var key = root.TryGetProperty("key", out var keyEl) ? TryGetJsonString(keyEl) : null;
 
                     _pttHook?.UpdateBinding(enabled, key);
                     return;
@@ -213,9 +376,14 @@ namespace ChatAppBlazor
             catch { }
         }
 
+        private static string? TryGetJsonString(System.Text.Json.JsonElement element)
+            => element.ValueKind == System.Text.Json.JsonValueKind.String
+                ? element.GetString()
+                : null;
+
         private void HandleWindowsDesktopFullscreenMessage(System.Text.Json.JsonElement root)
         {
-            var action = root.TryGetProperty("action", out var actionEl) ? actionEl.GetString() : null;
+            var action = root.TryGetProperty("action", out var actionEl) ? TryGetJsonString(actionEl) : null;
 
             MainThread.BeginInvokeOnMainThread(() =>
             {
@@ -299,7 +467,7 @@ namespace ChatAppBlazor
 
         private void HandleWindowsScreenAudioFallbackMessage(System.Text.Json.JsonElement root)
         {
-            var action = root.TryGetProperty("action", out var actionEl) ? actionEl.GetString() : null;
+            var action = root.TryGetProperty("action", out var actionEl) ? TryGetJsonString(actionEl) : null;
 
             if (string.Equals(action, "start", StringComparison.OrdinalIgnoreCase))
             {
@@ -309,7 +477,7 @@ namespace ChatAppBlazor
                 var targetLabel =
                     root.TryGetProperty("targetLabel", out var labelEl) &&
                     labelEl.ValueKind == System.Text.Json.JsonValueKind.String
-                        ? labelEl.GetString()
+                        ? TryGetJsonString(labelEl)
                         : null;
                 var allowSystemFallback =
                     !root.TryGetProperty("allowSystemFallback", out var allowFallbackEl) ||
@@ -323,23 +491,25 @@ namespace ChatAppBlazor
                             targetLabel,
                             allowSystemFallback));
 
-                    PostWindowsWebMessage(new
-                    {
-                        type = "screen-audio-fallback-state",
-                        state = "started",
-                        mode = startResult?.Mode ?? "system",
-                        processId = startResult?.ProcessId,
-                        windowTitle = startResult?.WindowTitle
-                    });
+                    PostWindowsWebMessage(
+                        new Serialization.ScreenAudioFallbackStateMessage
+                        {
+                            State = "started",
+                            Mode = startResult?.Mode ?? "system",
+                            ProcessId = startResult?.ProcessId,
+                            WindowTitle = startResult?.WindowTitle
+                        },
+                        Serialization.AppJsonContext.Default.ScreenAudioFallbackStateMessage);
                 }
                 catch (Exception ex)
                 {
-                    PostWindowsWebMessage(new
-                    {
-                        type = "screen-audio-fallback-state",
-                        state = "error",
-                        message = BuildErrorMessage(ex)
-                    });
+                    PostWindowsWebMessage(
+                        new Serialization.ScreenAudioFallbackStateMessage
+                        {
+                            State = "error",
+                            Message = BuildErrorMessage(ex)
+                        },
+                        Serialization.AppJsonContext.Default.ScreenAudioFallbackStateMessage);
                 }
                 return;
             }
@@ -347,40 +517,41 @@ namespace ChatAppBlazor
             if (string.Equals(action, "stop", StringComparison.OrdinalIgnoreCase))
             {
                 _screenShareAudioFallback?.Stop();
-                PostWindowsWebMessage(new
-                {
-                    type = "screen-audio-fallback-state",
-                    state = "stopped"
-                });
+                PostWindowsWebMessage(
+                    new Serialization.ScreenAudioFallbackStateMessage { State = "stopped" },
+                    Serialization.AppJsonContext.Default.ScreenAudioFallbackStateMessage);
             }
         }
 
         private void OnWindowsScreenAudioChunkCaptured(
             Platforms.Windows.WindowsScreenShareAudioFallback.AudioChunk chunk)
         {
-            PostWindowsWebMessage(new
-            {
-                type = "screen-audio-fallback-chunk",
-                format = "f32le",
-                sampleRate = chunk.SampleRate,
-                channels = chunk.Channels,
-                data = chunk.Base64Data
-            });
+            PostWindowsWebMessage(
+                new Serialization.ScreenAudioFallbackChunkMessage
+                {
+                    SampleRate = chunk.SampleRate,
+                    Channels = chunk.Channels,
+                    Data = chunk.Base64Data
+                },
+                Serialization.AppJsonContext.Default.ScreenAudioFallbackChunkMessage);
         }
 
         private void OnWindowsScreenAudioCaptureError(string message)
         {
-            PostWindowsWebMessage(new
-            {
-                type = "screen-audio-fallback-state",
-                state = "error",
-                message
-            });
+            PostWindowsWebMessage(
+                new Serialization.ScreenAudioFallbackStateMessage
+                {
+                    State = "error",
+                    Message = message
+                },
+                Serialization.AppJsonContext.Default.ScreenAudioFallbackStateMessage);
         }
 
-        private void PostWindowsWebMessage(object payload)
+        private void PostWindowsWebMessage<T>(
+            T payload,
+            System.Text.Json.Serialization.Metadata.JsonTypeInfo<T> typeInfo)
         {
-            var payloadJson = System.Text.Json.JsonSerializer.Serialize(payload);
+            var payloadJson = System.Text.Json.JsonSerializer.Serialize(payload, typeInfo);
             MainThread.BeginInvokeOnMainThread(() =>
             {
                 try

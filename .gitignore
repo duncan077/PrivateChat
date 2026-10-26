@@ -361,3 +361,30 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+/nul
+
+# Downloaded FFmpeg shared libraries (auto-downloaded during build)
+ChatAppNative/ffmpeg-libs/
+
+# FFmpeg shared libraries staged by tools/fetch-ffmpeg.ps1 (~131 MB, not committed)
+third_party/ffmpeg/
+
+# Local deploy settings for tools/publish-release.ps1 (hosts, key paths)
+tools/publish-release.settings.json
+
+# Scratch build/output dirs (hundreds of MB, not source)
+_tmp_build/
+_tmp_dtln/
+
+# Local server configuration and runtime data. Copy the committed example files.
+ChatServer/appsettings.json
+ChatServer/appsettings.Development.json
+ChatServer/appsettings.Production.json
+ChatServer/appsettings.Local.json
+ChatServer/*.db
+ChatServer/*.db-shm
+ChatServer/*.db-wal
+ChatServer/Uploads/
+.env
+.env.*
+!.env.example

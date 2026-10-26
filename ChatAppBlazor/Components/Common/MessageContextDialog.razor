@@ -1,0 +1,81 @@
+@using Shared.Models
+@inject ApiClientService Api
+@inject MarkdownRenderService Md
+
+@* Read-only window of messages around one target, for when the quoted (or searched)
+   message is not in the loaded page and scrolling to it is impossible. *@
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">Message context</MudText>
+    </TitleContent>
+    <DialogContent>
+        @if (_loading)
+        {
+            <MudProgressCircular Indeterminate="true" Size="Size.Small" />
+        }
+        else if (_error != null)
+        {
+            <MudAlert Severity="Severity.Error" Dense="true">@_error</MudAlert>
+        }
+        else
+        {
+            <div class="chat-context-window">
+                @foreach (var msg in _messages)
+                {
+                    <div class="chat-msg @(msg.Id == MessageId ? "chat-msg-context-target" : string.Empty)" @key="msg.Id">
+                        <div class="chat-msg-header">
+                            <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
+                                @msg.SenderName
+                            </MudText>
+                            <MudText Typo="Typo.caption" Color="Color.Secondary">
+                                @msg.SentAt.ToLocalTime().ToString("g")
+                            </MudText>
+                            @if (msg.EditedAt != null)
+                            {
+                                <MudText Typo="Typo.caption" Color="Color.Secondary">(edited)</MudText>
+                            }
+                        </div>
+                        <div class="chat-msg-body">@Md.Render(msg.Id, msg.Content)</div>
+                    </div>
+                }
+            </div>
+        }
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="Close">Close</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter] private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter] public Guid RoomId { get; set; }
+    [Parameter] public Guid MessageId { get; set; }
+
+    private ChatMessage[] _messages = [];
+    private bool _loading = true;
+    private string? _error;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _messages = await Api.GetRoomMessagesAroundAsync(RoomId, MessageId);
+            foreach (var message in _messages)
+            {
+                Api.NormalizeAttachments(message.Attachments);
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = $"Could not load context: {ex.Message}";
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private void Close() => MudDialog.Close();
+}

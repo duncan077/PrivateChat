@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ChatServer.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -69,6 +70,11 @@ public class JanusController : ControllerBase
         }
         catch (Exception ex)
         {
+            // Logged, not just returned. The reason only travelled in the response body,
+            // and the client cannot read it: a subscriber attach failing is exactly the
+            // point at which a call starts falling apart, and the server log said nothing
+            // at all about it.
+            _logger.LogError(ex, "Failed attaching Janus plugin handle on session {SessionId}.", sessionId);
             return StatusCode(502, new { error = ex.Message });
         }
     }
@@ -94,11 +100,18 @@ public class JanusController : ControllerBase
             var result = await _janus.SendPluginMessageAndWaitAsync(
                 sessionId,
                 handleId,
-                bodyEl,
-                jsepEl.HasValue ? jsepEl.Value : null,
+                ToJsonNode(bodyEl)!,
+                jsepEl.HasValue ? ToJsonNode(jsepEl.Value) : null,
                 requireJsep: requireJsep);
 
             return Content(result.GetRawText(), "application/json");
+        }
+        catch (JanusService.JanusSessionNotFoundException ex)
+        {
+            // Reported promptly now rather than after a 15s wait - the plugin-message
+            // wait loop gives up as soon as it learns the session is gone.
+            _logger.LogWarning("Janus session {Session} not found", ex.SessionId);
+            return NotFound(new { error = $"Janus session {ex.SessionId} not found (458)" });
         }
         catch (TimeoutException ex)
         {
@@ -136,8 +149,8 @@ public class JanusController : ControllerBase
             var ack = await _janus.SendPluginMessageNoWaitAsync(
                 sessionId,
                 handleId,
-                bodyEl,
-                jsepEl.HasValue ? jsepEl.Value : null);
+                ToJsonNode(bodyEl)!,
+                jsepEl.HasValue ? ToJsonNode(jsepEl.Value) : null);
 
             return Content(ack.GetRawText(), "application/json");
         }
@@ -150,7 +163,9 @@ public class JanusController : ControllerBase
     }
 
     /// <summary>
-    /// Forwards a trickle ICE candidate (or end-of-candidates null) to Janus.
+    /// Forwards trickle ICE candidates to Janus. Accepts a single candidate, an array of
+    /// candidates (the client batches a gathering burst into one request), or null for
+    /// end-of-candidates.
     /// </summary>
     [HttpPost("session/{sessionId}/handle/{handleId}/trickle")]
     public async Task<IActionResult> Trickle(
@@ -160,15 +175,49 @@ public class JanusController : ControllerBase
     {
         try
         {
-            if (candidate.ValueKind == JsonValueKind.Null)
-                await _janus.TrickleCompletedAsync(sessionId, handleId);
-            else
-                await _janus.TrickleAsync(sessionId, handleId, candidate);
+            switch (candidate.ValueKind)
+            {
+                case JsonValueKind.Null or JsonValueKind.Undefined:
+                    await _janus.TrickleCompletedAsync(sessionId, handleId);
+                    break;
+
+                case JsonValueKind.Array:
+                    var batch = new JsonArray();
+                    var sawCompleted = false;
+                    foreach (var element in candidate.EnumerateArray())
+                    {
+                        if (element.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                        {
+                            sawCompleted = true;
+                            continue;
+                        }
+
+                        batch.Add(ToJsonNode(element));
+                    }
+
+                    if (batch.Count > 0)
+                    {
+                        await _janus.TrickleManyAsync(sessionId, handleId, batch);
+                    }
+
+                    // A null inside the batch is end-of-candidates; it must follow the
+                    // candidates it was gathered with, never precede them.
+                    if (sawCompleted)
+                    {
+                        await _janus.TrickleCompletedAsync(sessionId, handleId);
+                    }
+                    break;
+
+                default:
+                    await _janus.TrickleAsync(sessionId, handleId, ToJsonNode(candidate)!);
+                    break;
+            }
 
             return Ok();
         }
         catch (Exception ex)
         {
+            _logger.LogError(ex, "Janus trickle error for session {Session}/handle {Handle}", sessionId, handleId);
             return StatusCode(502, new { error = ex.Message });
         }
     }
@@ -191,8 +240,15 @@ public class JanusController : ControllerBase
             // Pass through the raw Janus JSON without re-serialization
             var rawJson = result.Value.GetRawText();
 
-            _logger.LogInformation("Poll session {Session}: {Event}", sessionId,
-                rawJson.Length > 300 ? rawJson[..300] + "..." : rawJson);
+            // Debug, and guarded: this fires on every Janus event for every participant
+            // and the payload is SDP/ICE. Building the truncated string unconditionally
+            // allocated on a per-event path, and at Information it dumped signalling
+            // detail into the production log.
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                _logger.LogDebug("Poll session {Session}: {Event}", sessionId,
+                    rawJson.Length > 300 ? rawJson[..300] + "..." : rawJson);
+            }
 
             return Content(rawJson, "application/json");
         }
@@ -203,6 +259,7 @@ public class JanusController : ControllerBase
         }
         catch (Exception ex)
         {
+            _logger.LogError(ex, "Poll error for session {Session}", sessionId);
             return StatusCode(502, new { error = ex.Message });
         }
     }
@@ -214,8 +271,21 @@ public class JanusController : ControllerBase
     [HttpPost("session/{sessionId}/keepalive")]
     public async Task<IActionResult> Keepalive(long sessionId)
     {
-        await _janus.SendKeepaliveAsync(sessionId);
-        return Ok();
+        try
+        {
+            await _janus.SendKeepaliveAsync(sessionId);
+            return Ok();
+        }
+        catch (JanusService.JanusSessionNotFoundException ex)
+        {
+            _logger.LogWarning("Keepalive session {Session} not found in Janus", ex.SessionId);
+            return NotFound(new { error = $"Janus session {ex.SessionId} not found (458)" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Keepalive error for session {Session}", sessionId);
+            return StatusCode(502, new { error = ex.Message });
+        }
     }
 
     /// <summary>
@@ -243,4 +313,13 @@ public class JanusController : ControllerBase
             return StatusCode(502, new { error = ex.Message });
         }
     }
+
+    /// <summary>
+    /// Re-parses a request fragment as a mutable node. Round-tripping the raw text
+    /// preserves the payload exactly and avoids reflection-based serialization.
+    /// </summary>
+    private static JsonNode? ToJsonNode(JsonElement element)
+        => element.ValueKind == JsonValueKind.Undefined || element.ValueKind == JsonValueKind.Null
+            ? null
+            : JsonNode.Parse(element.GetRawText());
 }

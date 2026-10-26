@@ -14,6 +14,7 @@
 @inject ISnackbar Snackbar
 @inject IDialogService DialogService
 @inject ISystemNotificationService SystemNotifications
+@inject IJSRuntime JS
 <MudThemeProvider Theme="_theme" IsDarkMode="true" />
 <MudPopoverProvider />
 <MudDialogProvider />
@@ -143,17 +144,21 @@
                            Variant="@(_isMobileShell ? DrawerVariant.Temporary : DrawerVariant.Mini)"
                            Breakpoint="@(_isMobileShell ? Breakpoint.Lg : Breakpoint.Md)"
                            OpenMiniOnHover="@(!_isMobileShell)" Class="app-shell-drawer">
+                    <div class="drawer-content-wrapper">
                     <MudNavMenu Class="app-shell-nav">
                         <MudText Typo="Typo.overline" Class="chat-type-title">Chat</MudText>
 
                         <MudNavGroup Title="Rooms" Icon="@Icons.Material.Filled.Forum" Expanded="@_roomsGroupExpanded">
                             <div class="chat-type-group-content">
+                                @if (Rooms.CurrentUserRole >= UserRole.Admin)
+                                {
                                 <div class="chat-type-actions">
-                                    <MudButton Variant="Variant.Outlined" Size="Size.Small" Color="Color.Primary"
-                                               StartIcon="@Icons.Material.Filled.Add"
-                                               OnClick="OpenCreateRoomFromDrawer">
-                                    </MudButton>
+                                    <MudText Typo="Typo.overline" Class="chat-type-title">Create room</MudText>
+                                    <MudIconButton Icon="@Icons.Material.Filled.Add" Size="Size.Small"
+                                                   Variant="Variant.Outlined" Color="Color.Primary"
+                                                   OnClick="OpenCreateRoomFromDrawer" title="New room" />
                                 </div>
+                                }
 
                                 @if (_chatTypeListsLoading && Rooms.Rooms.Length == 0)
                                 {
@@ -171,12 +176,90 @@
                                     <MudList T="Guid" Dense="true" Class="chat-type-list">
                                         @foreach (var room in Rooms.Rooms.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase))
                                         {
-                                            <MudListItem T="Guid" Value="room.Id"
-                                                         OnClick="() => OpenRoomFromDrawer(room.Id)"
+                                            var connectedParticipants = GetRoomCallParticipants(room);
+                                            <MudListItem @key="room.Id" T="Guid" Value="room.Id"
                                                          Class="@($"chat-type-entry {(IsRoomSelected(room.Id) ? "active" : string.Empty)}")">
-                                                <div class="chat-type-row">
-                                                    <MudIcon Icon="@GetRoomIcon(room)" Size="Size.Small" />
-                                                    <MudText Typo="Typo.caption" Class="chat-type-label">@room.Name</MudText>
+                                                <div class="@GetRoomCallDropTargetClass(room)"
+                                                     data-room-drop-target="1"
+                                                     data-room-id="@room.Id"
+                                                     @ondragover:preventDefault="true"
+                                                     @ondragenter:preventDefault="true"
+                                                     @ondrop:preventDefault="true"
+                                                     @ondragover="(DragEventArgs _) => HandleRoomDragOver(room.Id)"
+                                                     @ondragenter="(DragEventArgs _) => HandleRoomDragEnter(room.Id)"
+                                                     @ondragleave="(DragEventArgs _) => HandleRoomDragLeave(room.Id)"
+                                                     @ondrop="(DragEventArgs _) => HandleRoomDropAsync(room.Id)">
+                                                    <div class="chat-type-row chat-type-room-header"
+                                                         @onclick="() => OpenRoomFromDrawer(room.Id)">
+                                                        <MudIcon Icon="@GetRoomIcon(room)" Size="Size.Small" />
+                                                        <MudText Typo="Typo.caption" Class="chat-type-label">@room.Name</MudText>
+                                                        @{
+                                                            var roomUnread = Rooms.GetUnreadCount(room.Id);
+                                                        }
+                                                        @if (roomUnread > 0)
+                                                        {
+                                                            <span class="chat-unread-badge @(Rooms.HasUnreadMention(room.Id) ? "mention" : string.Empty)"
+                                                                  title="@($"{roomUnread} unread")">
+                                                                @(roomUnread >= 99 ? "99+" : roomUnread.ToString())
+                                                            </span>
+                                                        }
+                                                    </div>
+
+                                                    @if (connectedParticipants.Count > 0)
+                                                    {
+                                                        <div class="chat-type-room-call-list">
+                                                            @foreach (var participant in connectedParticipants)
+                                                            {
+                                                                var participantAvatarUrl = GetAvatarUrl(participant.AvatarUrl);
+                                                                var canMoveParticipant = CanMoveRoomParticipant(participant.UserId);
+                                                                var canModerateParticipant = CanModerateRoomParticipant(participant.UserId);
+                                                                var assignableRoles = GetAssignableRoles(participant.UserId);
+                                                                var canOpenActions = CanOpenParticipantActions(room.Id, participant.UserId);
+
+                                                                <div @key="participant.UserId"
+                                                                     class="@($"chat-type-room-call-user {(canOpenActions ? "context-enabled" : string.Empty)}")"
+                                                                     @onclick:stopPropagation="true"
+                                                                     @oncontextmenu:preventDefault="true"
+                                                                     @oncontextmenu="(MouseEventArgs e) => HandleParticipantContextMenu(room.Id, participant, e)"
+                                                                     @ontouchstart="(TouchEventArgs e) => StartParticipantLongPress(room.Id, participant, e)"
+                                                                     @ontouchend="(TouchEventArgs _) => CancelParticipantLongPress()"
+                                                                     @ontouchcancel="(TouchEventArgs _) => CancelParticipantLongPress()"
+                                                                     @ontouchmove="(TouchEventArgs _) => CancelParticipantLongPress()">
+                                                                    <div class="@($"chat-type-room-call-user-main {(canMoveParticipant ? "draggable" : string.Empty)}")"
+                                                                         data-room-drag-user="@participant.UserId"
+                                                                         data-room-source-room="@room.Id"
+                                                                         draggable="@(canMoveParticipant ? "true" : "false")"
+                                                                         @onclick:stopPropagation="true"
+                                                                         @onmousedown:stopPropagation="true"
+                                                                         @onpointerdown:stopPropagation="true"
+                                                                         @ondragstart="(DragEventArgs _) => HandleParticipantDragStart(room.Id, participant.UserId)"
+                                                                         @ondragend="(DragEventArgs _) => HandleParticipantDragEnd()">
+                                                                        <MudAvatar Size="Size.Small"
+                                                                                   Color="Color.Secondary"
+                                                                                   Class="chat-type-avatar">
+                                                                            @if (!string.IsNullOrWhiteSpace(participantAvatarUrl))
+                                                                            {
+                                                                                <img src="@participantAvatarUrl" alt="Profile" class="avatar-image-fill" />
+                                                                            }
+                                                                            else
+                                                                            {
+                                                                                @GetAvatarInitial(participant.DisplayName, participant.UserName)
+                                                                            }
+                                                                        </MudAvatar>
+                                                                        <MudText Typo="Typo.caption" Class="chat-type-room-call-user-name">
+                                                                            @participant.DisplayName
+                                                                        </MudText>
+                                                                    </div>
+                                                                    @if (canOpenActions)
+                                                                    {
+                                                                        <MudIcon Icon="@Icons.Material.Filled.MoreHoriz"
+                                                                                 Size="Size.Small"
+                                                                                 Class="chat-type-room-call-context-hint" />
+                                                                    }
+                                                                </div>
+                                                            }
+                                                        </div>
+                                                    }
                                                 </div>
                                             </MudListItem>
                                         }
@@ -188,10 +271,10 @@
                         <MudNavGroup Title="Private Chats" Icon="@Icons.Material.Filled.Email" Expanded="@_privateChatsGroupExpanded">
                             <div class="chat-type-group-content">
                                 <div class="chat-type-actions">
-                                    <MudButton Variant="Variant.Outlined" Size="Size.Small" Color="Color.Primary"
-                                               StartIcon="@Icons.Material.Filled.PersonSearch"
-                                               OnClick="OpenSelectPrivateUserFromDrawer">
-                                    </MudButton>
+                                    <MudText Typo="Typo.overline" Class="chat-type-title">New private chat</MudText>
+                                    <MudIconButton Icon="@Icons.Material.Filled.PersonSearch" Size="Size.Small"
+                                                   Variant="Variant.Outlined" Color="Color.Primary"
+                                                   OnClick="OpenSelectPrivateUserFromDrawer" title="New private chat" />
                                 </div>
 
                                 @if (_chatTypeListsLoading && DirectMessages.Contacts.Length == 0)
@@ -211,7 +294,7 @@
                                         @foreach (var contact in DirectMessages.Contacts.OrderBy(c => c.DisplayName, StringComparer.OrdinalIgnoreCase))
                                         {
                                             var contactAvatarUrl = GetAvatarUrl(contact.AvatarUrl);
-                                            <MudListItem T="Guid" Value="contact.Id"
+                                            <MudListItem @key="contact.Id" T="Guid" Value="contact.Id"
                                                          OnClick="() => OpenDirectMessageFromDrawer(contact.Id)"
                                                          Class="@($"chat-type-entry {(IsDirectMessageSelected(contact.Id) ? "active" : string.Empty)}")">
                                                 <div class="chat-type-row">
@@ -228,6 +311,15 @@
                                                         }
                                                     </MudAvatar>
                                                     <MudText Typo="Typo.caption" Class="chat-type-label">@contact.DisplayName</MudText>
+                                                    @{
+                                                        var contactUnread = DirectMessages.GetUnreadCount(contact.Id);
+                                                    }
+                                                    @if (contactUnread > 0)
+                                                    {
+                                                        <span class="chat-unread-badge" title="@($"{contactUnread} unread")">
+                                                            @(contactUnread >= 99 ? "99+" : contactUnread.ToString())
+                                                        </span>
+                                                    }
                                                 </div>
                                             </MudListItem>
                                         }
@@ -236,25 +328,15 @@
                             </div>
                         </MudNavGroup>
 
-                        <div class="chat-type-nav-footer">
-                            <MudDivider Class="my-2" />
-                            <MudButton Variant="Variant.Text"
-                                       Size="Size.Small"
-                                       Color="Color.Default"
-                                       StartIcon="@Icons.Material.Filled.AccountCircle"
-                                       OnClick="OpenProfileSettings"
-                                       Class="mb-1">
-                                Profile
-                            </MudButton>
-                            <MudButton Variant="Variant.Outlined"
-                                       Size="Size.Small"
-                                       Color="Color.Primary"
-                                       StartIcon="@Icons.Material.Filled.Settings"
-                                       OnClick="OpenGlobalSettings">
-                                Settings
-                            </MudButton>
-                        </div>
                     </MudNavMenu>
+                    <div class="chat-type-nav-footer">
+                        <MudIconButton Icon="@Icons.Material.Filled.Settings"
+                                       Size="Size.Small"
+                                       Color="Color.Inherit"
+                                       OnClick="OpenGlobalSettings"
+                                       title="Settings" />
+                    </div>
+                    </div>
                 </MudDrawer>
             }
 
@@ -276,19 +358,10 @@
             </MudMainContent>
         </MudLayout>
 
-        @if (_isMobileShell)
-        {
-            <nav class="mobile-bottom-nav">
-                <button type="button" class="mobile-bottom-nav-btn @(_isRoomsRoute ? "active" : string.Empty)" @onclick="NavigateToRooms">
-                    <MudIcon Icon="@Icons.Material.Filled.Forum" Size="Size.Small" />
-                    <span>Rooms</span>
-                </button>
-                <button type="button" class="mobile-bottom-nav-btn @(_isDirectMessagesRoute ? "active" : string.Empty)" @onclick="NavigateToDirectMessages">
-                    <MudIcon Icon="@Icons.Material.Filled.Email" Size="Size.Small" />
-                    <span>Direct</span>
-                </button>
-            </nav>
-        }
+        @* The mobile bottom nav (Rooms / Direct) was removed: the navigation drawer
+           already lists both sections, so it duplicated navigation and covered the
+           bottom of the screen. _isRoomsRoute / _isDirectMessagesRoute are still
+           used for route-dependent behaviour elsewhere in this component. *@
 
         @* Floating call overlay (PiP when navigating away from call room) *@
         <FloatingCallOverlay />
@@ -318,6 +391,74 @@
                 </div>
             </div>
         }
+
+        @if (_participantActionsOpen && _participantActionsContext != null)
+        {
+            <div class="participant-actions-backdrop" @onclick="CloseParticipantActions"></div>
+            <div class="participant-actions-sheet"
+                 role="menu"
+                 style="@GetParticipantActionsStyle()"
+                 @onclick:stopPropagation="true">
+                <MudText Typo="Typo.overline" Class="participant-actions-title">
+                    @(_participantActionsContext.DisplayName)
+                </MudText>
+
+                @if (CanAdjustParticipantVolume(_participantActionsContext.UserId))
+                {
+                    <div class="participant-actions-volume" title="Mic volume (only for you)">
+                        <button type="button"
+                                class="@(_participantActionsVolume <= 0 ? "volume-mute-btn muted" : "volume-mute-btn")"
+                                aria-label="@(_participantActionsVolume <= 0 ? "Unmute" : "Mute")"
+                                aria-pressed="@(_participantActionsVolume <= 0)"
+                                title="@(_participantActionsVolume <= 0 ? "Unmute" : "Mute")"
+                                @onclick="ToggleParticipantMute">
+                            <MudIcon Icon="@(_participantActionsVolume <= 0 ? Icons.Material.Filled.VolumeOff : Icons.Material.Filled.VolumeUp)"
+                                     Size="Size.Small" />
+                        </button>
+                        <input type="range" min="0" max="200" step="5"
+                               value="@_participantActionsVolume"
+                               aria-label="Mic volume"
+                               @oninput="OnParticipantVolumeInput" />
+                        <span class="participant-actions-volume-value">@($"{_participantActionsVolume:0}%")</span>
+                    </div>
+                }
+
+                @if (_participantActionsContext.CanKick)
+                {
+                    <button type="button"
+                            class="participant-actions-btn danger"
+                            @onclick="KickParticipantFromActionsAsync">
+                        Kick from call
+                    </button>
+                }
+
+                @if (_participantActionsContext.CanMove && _participantActionsContext.MoveTargets.Count > 0)
+                {
+                    <div class="participant-actions-section-title">Move to room</div>
+                    @foreach (var targetRoom in _participantActionsContext.MoveTargets)
+                    {
+                        <button type="button"
+                                class="participant-actions-btn"
+                                @onclick="() => MoveParticipantFromActionsAsync(targetRoom.Id)">
+                            @($"#{targetRoom.Name}")
+                        </button>
+                    }
+                }
+
+                @if (_participantActionsContext.AssignableRoles.Count > 0)
+                {
+                    <div class="participant-actions-section-title">Set role</div>
+                    @foreach (var role in _participantActionsContext.AssignableRoles)
+                    {
+                        <button type="button"
+                                class="participant-actions-btn"
+                                @onclick="() => SetParticipantRoleFromActionsAsync(role)">
+                            @role.ToString()
+                        </button>
+                    }
+                }
+            </div>
+        }
     }
 </div>
 
@@ -333,8 +474,47 @@
     private bool _isRoomsRoute = true;
     private bool _isDirectMessagesRoute;
     private bool _keepDrawerOpenOnNextNavigation;
+    private Guid? _drawerPendingSelectedRoomId;
     private Guid? _incomingPrivateCallUserId;
     private string? _incomingPrivateCallDisplayName;
+    private Guid? _draggedParticipantUserId;
+    private Guid? _draggedParticipantSourceRoomId;
+    private Guid? _dragOverRoomId;
+    private DotNetObjectReference<MainLayout>? _roomParticipantDragDotNetRef;
+    private bool _roomParticipantDragBound;
+    private CancellationTokenSource? _participantLongPressCts;
+    private DrawerParticipantActionContext? _participantActionsContext;
+    private double _participantActionsVolume = 100;
+    /// <summary>Level to restore when unmuting; only ever holds a non-zero value.</summary>
+    private double _participantActionsVolumeBeforeMute = 100;
+    private bool _participantActionsOpen;
+    private double? _participantActionsClientX;
+    private double? _participantActionsClientY;
+    private CancellationTokenSource? _roomCallParticipantsSyncCts;
+    private bool _roomCallParticipantsSyncInFlight;
+    // Enum.GetValues allocates a fresh array on every call; this runs once per participant per
+    // drawer render.
+    private static readonly UserRole[] AllUserRoles = Enum.GetValues<UserRole>();
+
+    // The hub pushes OnUserJoinedVoiceVideo/OnUserLeftVoiceVideo, so this poll is only a
+    // reconciliation safety net. At 5s it issued a roster call for the whole authenticated
+    // session — not gated on being in a call, on any call existing, or on visibility.
+    private static readonly TimeSpan RoomCallParticipantsSyncInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ParticipantLongPressDelay = TimeSpan.FromMilliseconds(550);
+    private sealed record DrawerRoomParticipant(
+        Guid UserId,
+        string UserName,
+        string DisplayName,
+        string? AvatarUrl,
+        UserRole Role);
+    private sealed record DrawerParticipantActionContext(
+        Guid RoomId,
+        Guid UserId,
+        string DisplayName,
+        bool CanMove,
+        bool CanKick,
+        IReadOnlyList<ChatRoomInfo> MoveTargets,
+        IReadOnlyList<UserRole> AssignableRoles);
     private MudTheme _theme = new()
     {
         PaletteLight = new PaletteLight
@@ -406,6 +586,7 @@
         Call.OnChange += OnCallChanged;
         Rooms.OnChange += OnRoomsChanged;
         DirectMessages.OnChange += OnDirectMessagesChanged;
+        MembersPanel.OnChange += OnMembersPanelChanged;
         _showRegister = IsRegisterPage();
         UpdateCurrentRoute();
         Updater.OnUpdateAvailable += OnUpdateAvailable;
@@ -427,6 +608,7 @@
         if (Auth.IsAuthenticated)
         {
             await EnsureChatTypeListsLoadedAsync();
+            StartRoomCallParticipantsSyncLoop();
             if (_isMobileShell)
             {
                 _drawerOpen = false;
@@ -467,6 +649,7 @@
         if (Auth.IsAuthenticated)
         {
             _ = EnsureChatTypeListsLoadedAsync();
+            StartRoomCallParticipantsSyncLoop();
             if (_isMobileShell)
             {
                 _drawerOpen = false;
@@ -476,6 +659,8 @@
         {
             _chatTypeListsLoaded = false;
             ClearIncomingPrivateCallPrompt();
+            CloseParticipantActions();
+            StopRoomCallParticipantsSyncLoop();
         }
 
         InvokeAsync(StateHasChanged);
@@ -488,13 +673,34 @@
             _ = EnsureChatTypeListsLoadedAsync();
         }
 
+        if (connected && Auth.IsAuthenticated)
+        {
+            StartRoomCallParticipantsSyncLoop();
+            _ = RefreshRoomCallParticipantsSnapshotAsync();
+        }
+        else if (!connected)
+        {
+            StopRoomCallParticipantsSyncLoop();
+        }
+
         InvokeAsync(StateHasChanged);
     }
 
     private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e)
     {
         _showRegister = IsRegisterPage();
+        CloseParticipantActions();
         UpdateCurrentRoute();
+
+        if (_isRoomsRoute
+            && _drawerPendingSelectedRoomId is Guid pendingRoomId
+            && pendingRoomId != Guid.Empty
+            && TryGetQueryGuid(Nav.ToAbsoluteUri(Nav.Uri).Query, "roomId", out var roomIdFromQuery)
+            && roomIdFromQuery == pendingRoomId)
+        {
+            _drawerPendingSelectedRoomId = null;
+        }
+
         if (_isMobileShell)
         {
             _drawerOpen = _keepDrawerOpenOnNextNavigation;
@@ -513,22 +719,6 @@
         var path = relative.Split('?', '#')[0].Trim('/');
         _isRoomsRoute = string.IsNullOrWhiteSpace(path);
         _isDirectMessagesRoute = path.Equals("dm", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private void NavigateToRooms()
-    {
-        if (_isRoomsRoute)
-            return;
-
-        Nav.NavigateTo("/");
-    }
-
-    private void NavigateToDirectMessages()
-    {
-        if (_isDirectMessagesRoute)
-            return;
-
-        Nav.NavigateTo("/dm");
     }
 
     private void ToggleDrawer() => _drawerOpen = !_drawerOpen;
@@ -872,6 +1062,7 @@
                 Rooms.LoadRoomsAsync(),
                 DirectMessages.LoadContactsAsync());
             _chatTypeListsLoaded = true;
+            await RefreshRoomCallParticipantsSnapshotAsync();
         }
         finally
         {
@@ -880,9 +1071,45 @@
         }
     }
 
-    private void OnRoomsChanged() => InvokeAsync(StateHasChanged);
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        await base.OnAfterRenderAsync(firstRender);
+
+        if (_roomParticipantDragBound)
+        {
+            return;
+        }
+
+        try
+        {
+            _roomParticipantDragDotNetRef ??= DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("roomParticipantDrag.bindBlazor", _roomParticipantDragDotNetRef);
+            _roomParticipantDragBound = true;
+        }
+        catch
+        {
+            // Best effort; HTML5 drag events still remain as fallback.
+        }
+    }
+
+    private void OnRoomsChanged()
+    {
+        if (_drawerPendingSelectedRoomId is Guid pendingRoomId
+            && pendingRoomId != Guid.Empty
+            && Rooms.SelectedRoomId == pendingRoomId)
+        {
+            _drawerPendingSelectedRoomId = null;
+        }
+
+        CloseParticipantActions();
+        // No ad-hoc refresh here: the sync loop already reconciles, and the hub pushes
+        // join/leave events directly into CallStore.
+        InvokeAsync(StateHasChanged);
+    }
 
     private void OnDirectMessagesChanged() => InvokeAsync(StateHasChanged);
+
+    private void OnMembersPanelChanged() => InvokeAsync(StateHasChanged);
 
     private void OpenRoomFromDrawer(Guid roomId)
     {
@@ -938,9 +1165,16 @@
         var isRoomsPage = uri.AbsolutePath.Equals("/", StringComparison.OrdinalIgnoreCase);
         if (!isRoomsPage) return false;
 
-        if (Rooms.SelectedRoomId != null)
+        if (_drawerPendingSelectedRoomId is Guid pendingRoomId && pendingRoomId != Guid.Empty)
         {
-            return Rooms.SelectedRoomId == roomId;
+            return pendingRoomId == roomId;
+        }
+
+        // Store selection is authoritative for live state changes (for example,
+        // moderator drag-move that switches current room without immediate route update).
+        if (Rooms.SelectedRoomId is Guid selectedRoomId && selectedRoomId != Guid.Empty)
+        {
+            return selectedRoomId == roomId;
         }
 
         if (TryGetQueryGuid(uri.Query, "roomId", out var roomIdFromQuery))
@@ -963,6 +1197,764 @@
         }
 
         return DirectMessages.SelectedContactId == userId;
+    }
+
+    private IReadOnlyList<DrawerRoomParticipant> GetRoomCallParticipants(ChatRoomInfo room)
+    {
+        if (room.Id == Guid.Empty)
+        {
+            return [];
+        }
+
+        var participantIds = Call.GetRoomParticipants(room.Id)
+            .Where(id => id != Guid.Empty)
+            .ToArray();
+
+        if (Call.IsInCall
+            && Call.ActiveCallKind == CallContextKind.Room
+            && Call.ActiveRoomId == room.Id)
+        {
+            var activeIds = Call.Participants
+                .Where(id => id != Guid.Empty)
+                .ToList();
+
+            if (Auth.CurrentUser?.Id is Guid selfId && selfId != Guid.Empty)
+            {
+                activeIds.Add(selfId);
+            }
+
+            participantIds = participantIds
+                .Concat(activeIds)
+                .Where(id => id != Guid.Empty)
+                .Distinct()
+                .ToArray();
+        }
+        else
+        {
+            participantIds = participantIds
+                .Where(id => id != Guid.Empty)
+                .Distinct()
+                .ToArray();
+        }
+
+        if (participantIds.Length == 0)
+        {
+            return [];
+        }
+
+        var participants = new List<DrawerRoomParticipant>(participantIds.Length);
+        foreach (var participantId in participantIds)
+        {
+            var serverMember = Rooms.FindServerMember(participantId);
+            if (serverMember != null)
+            {
+                var displayName = string.IsNullOrWhiteSpace(serverMember.DisplayName)
+                    ? serverMember.UserName
+                    : serverMember.DisplayName.Trim();
+
+                participants.Add(new DrawerRoomParticipant(
+                    participantId,
+                    serverMember.UserName,
+                    string.IsNullOrWhiteSpace(displayName) ? $"User {participantId.ToString()[..8]}" : displayName,
+                    serverMember.AvatarUrl,
+                    serverMember.Role));
+                continue;
+            }
+
+            if (Auth.CurrentUser?.Id == participantId)
+            {
+                var selfName = !string.IsNullOrWhiteSpace(Auth.CurrentUser.DisplayName)
+                    ? Auth.CurrentUser.DisplayName.Trim()
+                    : (!string.IsNullOrWhiteSpace(Auth.CurrentUser.UserName)
+                        ? Auth.CurrentUser.UserName.Trim()
+                        : $"User {participantId.ToString()[..8]}");
+
+                participants.Add(new DrawerRoomParticipant(
+                    participantId,
+                    Auth.CurrentUser.UserName ?? string.Empty,
+                    selfName,
+                    Auth.CurrentUser.AvatarUrl,
+                    UserRole.Member));
+                continue;
+            }
+
+            participants.Add(new DrawerRoomParticipant(
+                participantId,
+                $"user_{participantId.ToString()[..8]}",
+                $"User {participantId.ToString()[..8]}",
+                null,
+                UserRole.Member));
+        }
+
+        return participants
+            .OrderBy(participant => participant.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(participant => participant.UserName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private bool CanModerateRoomParticipant(Guid userId)
+    {
+        if (userId == Guid.Empty || userId == Auth.CurrentUser?.Id)
+        {
+            return false;
+        }
+
+        if (Rooms.CurrentUserRole < UserRole.Moderator)
+        {
+            return false;
+        }
+
+        var targetRole = Rooms.FindServerMember(userId)?.Role ?? UserRole.Member;
+        return targetRole < Rooms.CurrentUserRole;
+    }
+
+    private bool CanMoveRoomParticipant(Guid userId)
+    {
+        if (userId == Guid.Empty)
+        {
+            return false;
+        }
+
+        if (Rooms.CurrentUserRole < UserRole.Moderator)
+        {
+            return false;
+        }
+
+        if (Rooms.CurrentUserRole >= UserRole.Admin)
+        {
+            return true;
+        }
+
+        if (userId == Auth.CurrentUser?.Id)
+        {
+            return true;
+        }
+
+        var targetRole = Rooms.FindServerMember(userId)?.Role ?? UserRole.Member;
+        return targetRole < Rooms.CurrentUserRole;
+    }
+
+    private bool CanManageRolesForParticipant(Guid userId)
+        => CanModerateRoomParticipant(userId) && Rooms.CurrentUserRole >= UserRole.Admin;
+
+    private IReadOnlyList<UserRole> GetAssignableRoles(Guid userId)
+    {
+        if (!CanManageRolesForParticipant(userId))
+        {
+            return [];
+        }
+
+        var currentRole = Rooms.FindServerMember(userId)?.Role ?? UserRole.Member;
+        return AllUserRoles
+            .Where(role => role != UserRole.Owner && role < Rooms.CurrentUserRole && role != currentRole)
+            .OrderByDescending(role => role)
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Everyone can adjust another participant's local volume, so the menu opens
+    /// for any call participant who isn't yourself; moderation entries inside it
+    /// stay permission-gated separately.
+    /// </summary>
+    private bool CanAdjustParticipantVolume(Guid userId)
+        => userId != Guid.Empty && userId != Auth.CurrentUser?.Id;
+
+    private bool CanOpenParticipantActions(Guid roomId, Guid userId)
+    {
+        if (roomId == Guid.Empty || userId == Guid.Empty)
+        {
+            return false;
+        }
+
+        return CanAdjustParticipantVolume(userId)
+            || CanMoveRoomParticipant(userId)
+            || CanModerateRoomParticipant(userId)
+            || GetAssignableRoles(userId).Count > 0;
+    }
+
+    private async Task HandleParticipantContextMenu(Guid roomId, DrawerRoomParticipant participant, MouseEventArgs _)
+    {
+        CancelParticipantLongPress();
+        await OpenParticipantActionsAsync(roomId, participant, _.ClientX, _.ClientY);
+    }
+
+    private void StartParticipantLongPress(Guid roomId, DrawerRoomParticipant participant, TouchEventArgs eventArgs)
+    {
+        CancelParticipantLongPress();
+        if (!CanOpenParticipantActions(roomId, participant.UserId))
+        {
+            return;
+        }
+
+        var touchPoint = eventArgs.Touches.FirstOrDefault() ?? eventArgs.ChangedTouches.FirstOrDefault();
+        var touchX = touchPoint?.ClientX;
+        var touchY = touchPoint?.ClientY;
+
+        var cts = new CancellationTokenSource();
+        _participantLongPressCts = cts;
+        _ = RunParticipantLongPressAsync(roomId, participant, touchX, touchY, cts.Token);
+    }
+
+    private async Task RunParticipantLongPressAsync(
+        Guid roomId,
+        DrawerRoomParticipant participant,
+        double? clientX,
+        double? clientY,
+        CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(ParticipantLongPressDelay, token);
+            if (token.IsCancellationRequested)
+            {
+                return;
+            }
+
+            await InvokeAsync(() => OpenParticipantActionsAsync(roomId, participant, clientX, clientY));
+        }
+        catch (OperationCanceledException)
+        {
+            // Ignore canceled long-press gesture.
+        }
+    }
+
+    private void CancelParticipantLongPress()
+    {
+        if (_participantLongPressCts == null)
+        {
+            return;
+        }
+
+        try
+        {
+            _participantLongPressCts.Cancel();
+        }
+        catch
+        {
+            // Ignore cancellation races.
+        }
+        finally
+        {
+            _participantLongPressCts.Dispose();
+            _participantLongPressCts = null;
+        }
+    }
+
+    private async Task OpenParticipantActionsAsync(
+        Guid roomId,
+        DrawerRoomParticipant participant,
+        double? clientX = null,
+        double? clientY = null)
+    {
+        if (!CanOpenParticipantActions(roomId, participant.UserId))
+        {
+            return;
+        }
+
+        var moveTargets = CanMoveRoomParticipant(participant.UserId)
+            ? GetRoomMoveTargets(roomId)
+            : [];
+        var assignableRoles = GetAssignableRoles(participant.UserId);
+
+        _participantActionsContext = new DrawerParticipantActionContext(
+            roomId,
+            participant.UserId,
+            string.IsNullOrWhiteSpace(participant.DisplayName) ? participant.UserName : participant.DisplayName,
+            CanMoveRoomParticipant(participant.UserId),
+            CanModerateRoomParticipant(participant.UserId),
+            moveTargets,
+            assignableRoles);
+        _participantActionsClientX = clientX;
+        _participantActionsClientY = clientY;
+        _participantActionsOpen = true;
+
+        // Open with the stored value rather than waiting on interop, then correct
+        // if the bridge answers with something else.
+        _participantActionsVolume = 100;
+        _participantActionsVolumeBeforeMute = 100;
+        StateHasChanged();
+
+        if (CanAdjustParticipantVolume(participant.UserId))
+        {
+            try
+            {
+                var current = await WebRtc.GetUserMicVolumeAsync(participant.UserId);
+                if (_participantActionsContext?.UserId == participant.UserId)
+                {
+                    _participantActionsVolume = Math.Clamp(current, 0, 200);
+                    if (_participantActionsVolume > 0)
+                    {
+                        // Someone opened at a real level; that is what unmuting returns to.
+                        _participantActionsVolumeBeforeMute = _participantActionsVolume;
+                    }
+                    StateHasChanged();
+                }
+            }
+            catch
+            {
+                // Volume readback is cosmetic; the slider still works from 100%.
+            }
+        }
+    }
+
+    private void OnParticipantVolumeInput(ChangeEventArgs e)
+    {
+        if (_participantActionsContext == null) return;
+        if (!double.TryParse(e.Value?.ToString(), out var volume)) return;
+
+        _participantActionsVolume = Math.Clamp(volume, 0, 200);
+        if (_participantActionsVolume > 0)
+        {
+            // Dragging off zero is an unmute, so the level to come back to is this one.
+            _participantActionsVolumeBeforeMute = _participantActionsVolume;
+        }
+
+        var userId = _participantActionsContext.UserId;
+        // Fire-and-forget so dragging stays smooth; the JS side coalesces bursts.
+        _ = ApplyParticipantVolumeAsync(userId, _participantActionsVolume);
+    }
+
+    /// <summary>
+    /// Mutes this participant for the local user, or restores the level they were at.
+    ///
+    /// Muting deliberately keeps the slider's own value at 0 rather than tracking a
+    /// separate flag: the slider, the icon and what is actually applied then cannot
+    /// disagree, and dragging away from zero is itself an unmute.
+    /// </summary>
+    private void ToggleParticipantMute()
+    {
+        if (_participantActionsContext == null) return;
+
+        if (_participantActionsVolume > 0)
+        {
+            _participantActionsVolumeBeforeMute = _participantActionsVolume;
+            _participantActionsVolume = 0;
+        }
+        else
+        {
+            // Falls back to 100 when they were already silent when the sheet opened,
+            // so unmuting can never be a no-op.
+            _participantActionsVolume = _participantActionsVolumeBeforeMute > 0
+                ? _participantActionsVolumeBeforeMute
+                : 100;
+        }
+
+        _ = ApplyParticipantVolumeAsync(_participantActionsContext.UserId, _participantActionsVolume);
+    }
+
+    private async Task ApplyParticipantVolumeAsync(Guid userId, double volume)
+    {
+        try
+        {
+            await WebRtc.SetUserMicVolumeAsync(userId, volume);
+        }
+        catch
+        {
+            // A dropped slider sample is invisible; the next one lands.
+        }
+    }
+
+    private string GetParticipantActionsStyle()
+    {
+        const double defaultX = 220;
+        const double defaultY = 180;
+        var x = _participantActionsClientX ?? defaultX;
+        var y = _participantActionsClientY ?? defaultY;
+
+        // Keep the menu inside the viewport with a small margin; the width bound
+        // matches .participant-actions-sheet.
+        var clampedX = Math.Max(12, x + 4);
+        var clampedY = Math.Max(12, y + 4);
+
+        return $"left:min(calc(100vw - 268px), max(12px, {clampedX:0.##}px));" +
+               $"top:min(calc(100vh - 320px), max(12px, {clampedY:0.##}px));";
+    }
+
+    private void CloseParticipantActions()
+    {
+        _participantActionsOpen = false;
+        _participantActionsContext = null;
+        _participantActionsClientX = null;
+        _participantActionsClientY = null;
+        CancelParticipantLongPress();
+    }
+
+    private async Task KickParticipantFromActionsAsync()
+    {
+        var context = _participantActionsContext;
+        CloseParticipantActions();
+
+        if (context == null)
+        {
+            return;
+        }
+
+        await KickUserFromRoomCallAsync(context.RoomId, context.UserId);
+    }
+
+    private async Task MoveParticipantFromActionsAsync(Guid targetRoomId)
+    {
+        var context = _participantActionsContext;
+        CloseParticipantActions();
+
+        if (context == null)
+        {
+            return;
+        }
+
+        await MoveUserBetweenRoomsAsync(context.RoomId, targetRoomId, context.UserId);
+    }
+
+    private async Task SetParticipantRoleFromActionsAsync(UserRole role)
+    {
+        var context = _participantActionsContext;
+        CloseParticipantActions();
+
+        if (context == null)
+        {
+            return;
+        }
+
+        await SetUserRoleFromDrawerAsync(context.RoomId, context.UserId, role);
+    }
+
+    private IReadOnlyList<ChatRoomInfo> GetRoomMoveTargets(Guid sourceRoomId)
+    {
+        if (sourceRoomId == Guid.Empty)
+        {
+            return [];
+        }
+
+        return Rooms.Rooms
+            .Where(room => room.Id != sourceRoomId && IsVoiceVideoRoom(room))
+            .OrderBy(room => room.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static bool IsVoiceVideoRoom(ChatRoomInfo room)
+        => room.Id != Guid.Empty && (room.IsVoiceEnabled || room.IsVideoEnabled);
+
+    private string GetRoomCallDropTargetClass(ChatRoomInfo room)
+    {
+        var classes = new List<string> { "chat-type-room-entry" };
+        if (CanDropDraggedParticipantIntoRoom(room.Id))
+        {
+            classes.Add("chat-type-room-drop-enabled");
+        }
+        if (_dragOverRoomId == room.Id && CanDropDraggedParticipantIntoRoom(room.Id))
+        {
+            classes.Add("chat-type-room-drop-hover");
+        }
+        return string.Join(" ", classes);
+    }
+
+    private bool CanDropDraggedParticipantIntoRoom(Guid targetRoomId)
+    {
+        if (_draggedParticipantUserId is not Guid userId
+            || _draggedParticipantSourceRoomId is not Guid sourceRoomId
+            || userId == Guid.Empty
+            || sourceRoomId == Guid.Empty
+            || targetRoomId == Guid.Empty
+            || targetRoomId == sourceRoomId)
+        {
+            return false;
+        }
+
+        var targetRoom = Rooms.Rooms.FirstOrDefault(room => room.Id == targetRoomId);
+        if (targetRoom == null || !IsVoiceVideoRoom(targetRoom))
+        {
+            return false;
+        }
+
+        return CanMoveRoomParticipant(userId);
+    }
+
+    private void HandleParticipantDragStart(Guid sourceRoomId, Guid userId)
+    {
+        CloseParticipantActions();
+        if (!CanMoveRoomParticipant(userId))
+        {
+            return;
+        }
+
+        var sourceRoom = Rooms.Rooms.FirstOrDefault(room => room.Id == sourceRoomId);
+        if (sourceRoom == null || !IsVoiceVideoRoom(sourceRoom))
+        {
+            return;
+        }
+
+        _draggedParticipantSourceRoomId = sourceRoomId;
+        _draggedParticipantUserId = userId;
+        _dragOverRoomId = null;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleParticipantDragEnd()
+    {
+        if (_draggedParticipantUserId == null && _draggedParticipantSourceRoomId == null && _dragOverRoomId == null)
+        {
+            return;
+        }
+
+        _draggedParticipantUserId = null;
+        _draggedParticipantSourceRoomId = null;
+        _dragOverRoomId = null;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public Task OnRoomParticipantDragStart(string sourceRoomId, string userId)
+    {
+        if (Guid.TryParse(sourceRoomId, out var sourceRoomGuid)
+            && Guid.TryParse(userId, out var userGuid))
+        {
+            HandleParticipantDragStart(sourceRoomGuid, userGuid);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public async Task OnRoomParticipantDrop(string targetRoomId)
+    {
+        if (!Guid.TryParse(targetRoomId, out var targetRoomGuid))
+        {
+            HandleParticipantDragEnd();
+            return;
+        }
+
+        await HandleRoomDropAsync(targetRoomGuid);
+    }
+
+    [JSInvokable]
+    public Task OnRoomParticipantDragEnd()
+    {
+        HandleParticipantDragEnd();
+        return Task.CompletedTask;
+    }
+
+    private void HandleRoomDragOver(Guid roomId)
+    {
+        if (!CanDropDraggedParticipantIntoRoom(roomId))
+        {
+            return;
+        }
+
+        if (_dragOverRoomId != roomId)
+        {
+            _dragOverRoomId = roomId;
+            _ = InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void HandleRoomDragEnter(Guid roomId)
+    {
+        if (CanDropDraggedParticipantIntoRoom(roomId) && _dragOverRoomId != roomId)
+        {
+            _dragOverRoomId = roomId;
+            _ = InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void HandleRoomDragLeave(Guid roomId)
+    {
+        if (_dragOverRoomId == roomId)
+        {
+            _dragOverRoomId = null;
+            _ = InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task HandleRoomDropAsync(Guid targetRoomId)
+    {
+        if (!CanDropDraggedParticipantIntoRoom(targetRoomId)
+            || _draggedParticipantSourceRoomId is not Guid sourceRoomId
+            || _draggedParticipantUserId is not Guid userId)
+        {
+            HandleParticipantDragEnd();
+            return;
+        }
+
+        _dragOverRoomId = null;
+        _draggedParticipantSourceRoomId = null;
+        _draggedParticipantUserId = null;
+        await MoveUserBetweenRoomsAsync(sourceRoomId, targetRoomId, userId);
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task KickUserFromRoomCallAsync(Guid roomId, Guid userId)
+    {
+        if (roomId == Guid.Empty || !CanModerateRoomParticipant(userId))
+        {
+            return;
+        }
+
+        try
+        {
+            await Chat.KickUserFromVoiceVideoAsync(roomId, userId, "Kicked from call by moderator");
+            await RefreshRoomCallParticipantsSnapshotAsync();
+            Snackbar.Add("User removed from call.", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Failed to kick user from call: {ex.Message}", Severity.Error);
+        }
+    }
+
+    private async Task MoveUserBetweenRoomsAsync(Guid sourceRoomId, Guid targetRoomId, Guid userId)
+    {
+        if (sourceRoomId == Guid.Empty || targetRoomId == Guid.Empty || sourceRoomId == targetRoomId || !CanMoveRoomParticipant(userId))
+        {
+            return;
+        }
+
+        try
+        {
+            await Chat.MoveUserAsync(sourceRoomId, targetRoomId, userId);
+
+            if (userId == Auth.CurrentUser?.Id)
+            {
+                _drawerPendingSelectedRoomId = targetRoomId;
+                await InvokeAsync(StateHasChanged);
+
+                var keepPreviousRoomSubscription =
+                    Call.IsInCall
+                    && Call.ActiveCallKind == CallContextKind.Room
+                    && Call.ActiveRoomId == sourceRoomId;
+
+                await Rooms.SelectRoomAsync(targetRoomId, keepPreviousRoomSubscription);
+
+                var targetRoute = $"/?roomId={targetRoomId:D}";
+                var uri = Nav.ToAbsoluteUri(Nav.Uri);
+                var currentRoute = uri.PathAndQuery;
+                if (!currentRoute.Equals(targetRoute, StringComparison.OrdinalIgnoreCase))
+                {
+                    Nav.NavigateTo(targetRoute, replace: true);
+                }
+            }
+
+            await Rooms.LoadRoomsAsync();
+            await RefreshRoomCallParticipantsSnapshotAsync();
+            Snackbar.Add("User moved to another room.", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Failed to move user: {ex.Message}", Severity.Error);
+        }
+    }
+
+    private async Task SetUserRoleFromDrawerAsync(Guid roomId, Guid userId, UserRole role)
+    {
+        if (roomId == Guid.Empty || !CanManageRolesForParticipant(userId) || role >= Rooms.CurrentUserRole || role == UserRole.Owner)
+        {
+            return;
+        }
+
+        try
+        {
+            await Chat.SetUserRoleAsync(roomId, userId, role);
+            await Rooms.LoadServerMembersAsync();
+            Snackbar.Add($"Role changed to {role}.", Severity.Success);
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Failed to change role: {ex.Message}", Severity.Error);
+        }
+    }
+
+    private void StartRoomCallParticipantsSyncLoop()
+    {
+        if (_roomCallParticipantsSyncCts != null)
+        {
+            return;
+        }
+
+        if (!Auth.IsAuthenticated || !Chat.IsConnected)
+        {
+            return;
+        }
+
+        var cts = new CancellationTokenSource();
+        _roomCallParticipantsSyncCts = cts;
+        _ = RunRoomCallParticipantsSyncLoopAsync(cts.Token);
+    }
+
+    private void StopRoomCallParticipantsSyncLoop()
+    {
+        if (_roomCallParticipantsSyncCts == null)
+        {
+            return;
+        }
+
+        try
+        {
+            _roomCallParticipantsSyncCts.Cancel();
+        }
+        catch
+        {
+            // Ignore cancellation races during shutdown/reconnect.
+        }
+        finally
+        {
+            _roomCallParticipantsSyncCts.Dispose();
+            _roomCallParticipantsSyncCts = null;
+        }
+    }
+
+    private async Task RunRoomCallParticipantsSyncLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            if (await IsAppVisibleAsync())
+            {
+                await RefreshRoomCallParticipantsSnapshotAsync();
+            }
+
+            try
+            {
+                await Task.Delay(RoomCallParticipantsSyncInterval, token);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+    }
+
+    private async Task<bool> IsAppVisibleAsync()
+    {
+        try
+        {
+            return await JS.InvokeAsync<bool>("webrtcManager.isAppVisible");
+        }
+        catch
+        {
+            // WebView navigating or torn down — assume visible rather than stall the sync.
+            return true;
+        }
+    }
+
+    private async Task RefreshRoomCallParticipantsSnapshotAsync()
+    {
+        if (!Auth.IsAuthenticated || !Chat.IsConnected || _roomCallParticipantsSyncInFlight)
+        {
+            return;
+        }
+
+        _roomCallParticipantsSyncInFlight = true;
+        try
+        {
+            var snapshots = await Api.GetRoomCallParticipantsAsync();
+            Call.ApplyRoomParticipantSnapshot(snapshots);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MainLayout] Room call participant snapshot refresh failed: {ex.Message}");
+        }
+        finally
+        {
+            _roomCallParticipantsSyncInFlight = false;
+        }
     }
 
     private static bool TryGetQueryGuid(string? query, string key, out Guid value)
@@ -1019,6 +2011,19 @@
 
     public void Dispose()
     {
+        CloseParticipantActions();
+        StopRoomCallParticipantsSyncLoop();
+        try
+        {
+            _ = JS.InvokeVoidAsync("roomParticipantDrag.unbindBlazor");
+        }
+        catch
+        {
+            // Ignore interop disposal races during app shutdown.
+        }
+        _roomParticipantDragDotNetRef?.Dispose();
+        _roomParticipantDragDotNetRef = null;
+        _roomParticipantDragBound = false;
         Auth.OnAuthStateChanged -= OnAuthChanged;
         Nav.LocationChanged -= OnLocationChanged;
         Chat.OnConnectionStateChanged -= OnConnectionChanged;
@@ -1028,6 +2033,7 @@
         Call.OnChange -= OnCallChanged;
         Rooms.OnChange -= OnRoomsChanged;
         DirectMessages.OnChange -= OnDirectMessagesChanged;
+        MembersPanel.OnChange -= OnMembersPanelChanged;
         Updater.OnUpdateAvailable -= OnUpdateAvailable;
         Updater.OnStateChanged -= OnUpdaterStateChanged;
         NotificationNavigationBridge.NavigateRequested -= OnNotificationNavigateRequested;

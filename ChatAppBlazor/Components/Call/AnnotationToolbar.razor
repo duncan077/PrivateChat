@@ -1,0 +1,271 @@
+@implements IDisposable
+@inject CallStore Store
+@inject WebRtcBridge WebRtc
+@using Shared.Models
+
+@* ─── Drawing tools for the shared screen ───────────────────────────────────── *@
+@* Shown to the presenter (to allow/stop annotations) and to viewers once the      *@
+@* presenter has enabled them.                                                     *@
+
+@if (ShowPresenterControls || Store.CanAnnotate)
+{
+    <MudPaper Class="annotation-toolbar" Elevation="0">
+        <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Wrap="Wrap.Wrap">
+
+            @if (ShowPresenterControls)
+            {
+                <MudTooltip Text="@PresenterToggleTooltip">
+                    <MudButton Size="Size.Small"
+                               Variant="Variant.Filled"
+                               Color="@(Store.LocalAnnotationsEnabled ? Color.Warning : Color.Default)"
+                               StartIcon="@(Store.LocalAnnotationsEnabled ? Icons.Material.Filled.EditOff : Icons.Material.Filled.Draw)"
+                               OnClick="ToggleAnnotations">
+                        @(Store.LocalAnnotationsEnabled ? "Stop annotations" : "Allow annotations")
+                    </MudButton>
+                </MudTooltip>
+            }
+
+            @if (ShowPresenterControls && Store.LocalAnnotationsEnabled)
+            {
+                <MudTooltip Text="@FadeToggleTooltip">
+                    <MudButton Size="Size.Small"
+                               Variant="Variant.Outlined"
+                               Color="@(Store.AnnotationsArePermanent ? Color.Info : Color.Default)"
+                               StartIcon="@(Store.AnnotationsArePermanent ? Icons.Material.Filled.PushPin : Icons.Material.Filled.Timer)"
+                               OnClick="TogglePermanent">
+                        @(Store.AnnotationsArePermanent ? "Pinned" : $"Fades {Store.AnnotationAutoFadeSeconds}s")
+                    </MudButton>
+                </MudTooltip>
+
+                <MudTooltip Text="Erase everyone's annotations from your shared screen">
+                    <MudButton Size="Size.Small"
+                               Variant="Variant.Outlined"
+                               Color="Color.Error"
+                               StartIcon="@Icons.Material.Filled.CleaningServices"
+                               OnClick="ClearAll">
+                        Clean
+                    </MudButton>
+                </MudTooltip>
+            }
+
+            @if (Store.CanAnnotate)
+            {
+                <MudDivider Vertical FlexItem Class="annotation-toolbar-divider" />
+
+                @* One Draw toggle per client - never per stream. However many
+                   annotation-enabled streams are visible, this single switch and
+                   the single tool set below apply to drawing on all of them.
+                   Separate from the presenter's Allow toggle above: that grants
+                   permission call-wide, this is each user picking up the pen. *@
+                <MudTooltip Text="@DrawToggleTooltip">
+                    <MudButton Size="Size.Small"
+                               Variant="@(Store.AnnotationToolsActive ? Variant.Filled : Variant.Outlined)"
+                               Color="@(Store.AnnotationToolsActive ? Color.Primary : Color.Default)"
+                               StartIcon="@Icons.Material.Filled.Brush"
+                               OnClick="ToggleDrawTools">
+                        Draw
+                    </MudButton>
+                </MudTooltip>
+            }
+
+            @if (Store.CanAnnotate && Store.AnnotationToolsActive)
+            {
+                <MudToggleGroup T="string" Value="_tool" ValueChanged="OnToolChanged"
+                                Size="Size.Small" Color="Color.Primary" CheckMark="false"
+                                SelectionMode="SelectionMode.SingleSelection" Class="annotation-tool-group">
+                    <MudToggleItem T="string" Value="@("pen")" Text="Pen" />
+                    <MudToggleItem T="string" Value="@("highlighter")" Text="Marker" />
+                    <MudToggleItem T="string" Value="@("arrow")" Text="Arrow" />
+                    <MudToggleItem T="string" Value="@("rect")" Text="Box" />
+                    <MudToggleItem T="string" Value="@("ellipse")" Text="Oval" />
+                </MudToggleGroup>
+
+                <div class="annotation-color-row">
+                    @foreach (var swatch in Palette)
+                    {
+                        <button type="button"
+                                class="@GetSwatchClass(swatch)"
+                                style="@($"--swatch-color:{swatch}")"
+                                title="@swatch"
+                                @onclick="() => OnColorChanged(swatch)"></button>
+                    }
+                </div>
+
+                <MudTooltip Text="Stroke size">
+                    <MudSlider T="double" Value="_widthScale" ValueChanged="OnWidthChanged"
+                               Min="0.5" Max="2.5" Step="0.25" Class="annotation-width-slider" />
+                </MudTooltip>
+
+                <MudTooltip Text="Undo my last stroke">
+                    <MudIconButton Icon="@Icons.Material.Filled.Undo" Size="Size.Small" OnClick="Undo" />
+                </MudTooltip>
+
+                <MudTooltip Text="Erase everything I drew">
+                    <MudIconButton Icon="@Icons.Material.Filled.Backspace" Size="Size.Small" OnClick="ClearMine" />
+                </MudTooltip>
+            }
+
+            @if (!string.IsNullOrEmpty(CaptureWarning))
+            {
+                <MudTooltip Text="@CaptureWarning">
+                    <MudIcon Icon="@Icons.Material.Filled.WarningAmber" Color="Color.Warning" Size="Size.Small" />
+                </MudTooltip>
+            }
+        </MudStack>
+    </MudPaper>
+}
+
+@code {
+    private static readonly string[] Palette =
+        ["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#ffffff", "#111111"];
+
+    private string _tool = "pen";
+    private string _color = "#ff3b30";
+    private double _widthScale = 1;
+    private bool _initialized;
+
+    /// <summary>
+    /// The presenter's allow/stop control only makes sense while sharing. It is not
+    /// gated on anyone else's session: every sharer owns annotations on their own
+    /// screen, so someone else presenting with annotations on never locks this out.
+    /// </summary>
+    private bool ShowPresenterControls => Store.IsInCall && Store.IsScreenSharing;
+
+    private string PresenterToggleTooltip => Store.LocalAnnotationsEnabled
+        ? "Stop others from drawing on your shared screen"
+        : "Let call participants draw on your shared screen";
+
+    private string FadeToggleTooltip => Store.AnnotationsArePermanent
+        ? "Annotations stay until cleared. Click to let them fade again."
+        : $"Annotations disappear {Store.AnnotationAutoFadeSeconds}s after they are drawn. Click to keep them.";
+
+    private string DrawToggleTooltip => Store.AnnotationToolsActive
+        ? "Put the pen down - clicks and zoom reach the video again"
+        : "Pick up the pen to draw on any shared screen";
+
+    /// <summary>
+    /// Explains the cases where the local user's own ink cannot reach their published
+    /// video, so people are not left wondering why others can't see their drawing.
+    /// Only about this user's share - other presenters warn on their own toolbars.
+    /// </summary>
+    private string? CaptureWarning
+    {
+        get
+        {
+            if (Store.LocalAnnotationSession is not { Enabled: true } session)
+            {
+                return null;
+            }
+
+            return session.CaptureKind switch
+            {
+                ScreenAnnotationCaptureKind.Window =>
+                    "You are sharing a single window, so annotations cannot be drawn into the captured video. "
+                    + "Everyone still sees them in the app, but they will not appear in a recording. "
+                    + "Share a whole screen for full-fidelity annotations.",
+                ScreenAnnotationCaptureKind.Unsupported =>
+                    "This device cannot draw annotations on its desktop, so annotations are shown in-app only.",
+                ScreenAnnotationCaptureKind.Unknown =>
+                    "The shared surface could not be matched to a monitor, so annotations are shown in-app only.",
+                _ => session.OverlayActive
+                    ? null
+                    : "Your desktop overlay is not running; annotations are shown in-app only."
+            };
+        }
+    }
+
+    protected override void OnInitialized()
+    {
+        Store.OnAnnotationStateChanged += OnStoreChanged;
+        Store.OnChange += OnStoreChanged;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender && _initialized)
+        {
+            return;
+        }
+
+        _initialized = true;
+
+        try
+        {
+            await WebRtc.InitAnnotationsAsync();
+            await WebRtc.SetAnnotationToolAsync(_tool, _color, _widthScale);
+        }
+        catch
+        {
+            // JS layer may not be ready during navigation; state is pushed again on change.
+        }
+    }
+
+    private string GetSwatchClass(string swatch)
+        => swatch.Equals(_color, StringComparison.OrdinalIgnoreCase)
+            ? "annotation-swatch annotation-swatch-selected"
+            : "annotation-swatch";
+
+    private async Task ToggleAnnotations()
+    {
+        await Store.SetAnnotationsEnabledAsync(!Store.LocalAnnotationsEnabled);
+    }
+
+    private async Task OnToolChanged(string tool)
+    {
+        _tool = string.IsNullOrWhiteSpace(tool) ? "pen" : tool;
+        await ApplyToolAsync();
+    }
+
+    private async Task OnColorChanged(string color)
+    {
+        _color = color;
+        await ApplyToolAsync();
+    }
+
+    private async Task OnWidthChanged(double scale)
+    {
+        _widthScale = scale;
+        await ApplyToolAsync();
+    }
+
+    private async Task ApplyToolAsync()
+    {
+        try { await WebRtc.SetAnnotationToolAsync(_tool, _color, _widthScale); } catch { }
+    }
+
+    private async Task Undo()
+    {
+        try { await WebRtc.AnnotationUndoAsync(); } catch { }
+    }
+
+    private async Task ClearMine()
+    {
+        try { await WebRtc.AnnotationClearMineAsync(); } catch { }
+    }
+
+    private async Task TogglePermanent()
+    {
+        await Store.SetAnnotationsPermanentAsync(!Store.AnnotationsArePermanent);
+    }
+
+    private void ToggleDrawTools()
+    {
+        Store.SetAnnotationToolsActive(!Store.AnnotationToolsActive);
+    }
+
+    private async Task ClearAll()
+    {
+        // Clear the local canvas as well as broadcasting, so the presenter's own
+        // echoes go too rather than lingering until they fade.
+        try { await WebRtc.AnnotationClearAllAsync(); } catch { }
+        await Store.ClearAllAnnotationsAsync();
+    }
+
+    private void OnStoreChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        Store.OnAnnotationStateChanged -= OnStoreChanged;
+        Store.OnChange -= OnStoreChanged;
+    }
+}

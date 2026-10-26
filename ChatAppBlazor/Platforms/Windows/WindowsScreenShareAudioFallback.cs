@@ -11,10 +11,22 @@ namespace ChatAppBlazor.Platforms.Windows;
 internal sealed class WindowsScreenShareAudioFallback : IDisposable
 {
     private const int HResultFileNotFound = unchecked((int)0x80070002);
+
+    /// <summary>Minimum audio accumulated before a chunk is handed to the WebView.</summary>
+    private const int ChunkFlushMilliseconds = 50;
+
     private readonly object _sync = new();
+    private readonly object _chunkSync = new();
     private IWaveIn? _capture;
     private bool _disposed;
     private bool _reportedUnsupportedFormat;
+
+    private byte[] _pendingPcm = Array.Empty<byte>();
+    private int _pendingPcmLength;
+    private int _pendingSampleRate;
+    private int _pendingChannels;
+    /// <summary>Capture that owns the pending batch; guarded by <see cref="_chunkSync"/>.</summary>
+    private IWaveIn? _batchOwner;
 
     private string _activeMode = "system";
     private uint? _activeProcessId;
@@ -351,7 +363,28 @@ internal sealed class WindowsScreenShareAudioFallback : IDisposable
         }
 
         var format = source.WaveFormat;
-        if (!TryConvertToFloat32InterleavedBase64(format, e.Buffer, e.BytesRecorded, out var base64Data))
+
+        bool converted;
+        AudioChunk? batched = null;
+        lock (_chunkSync)
+        {
+            // Unsubscribing DataAvailable does not cancel an invocation already dispatched on the
+            // WASAPI thread, so a buffer from a torn-down capture can arrive after teardown has
+            // cleared the batch. Gate on ownership under the same lock that guards the batch,
+            // otherwise that stale audio is prepended to the next capture session.
+            if (!ReferenceEquals(source, _batchOwner))
+            {
+                return;
+            }
+
+            converted = TryAppendFloat32InterleavedUnsafe(format, e.Buffer, e.BytesRecorded);
+            if (converted)
+            {
+                batched = TryTakeBatchedChunkUnsafe();
+            }
+        }
+
+        if (!converted)
         {
             if (_reportedUnsupportedFormat)
             {
@@ -365,10 +398,106 @@ internal sealed class WindowsScreenShareAudioFallback : IDisposable
             return;
         }
 
-        ChunkCaptured?.Invoke(new AudioChunk(
-            format.SampleRate,
-            format.Channels,
-            base64Data));
+        if (batched.HasValue)
+        {
+            ChunkCaptured?.Invoke(batched.Value);
+        }
+    }
+
+    /// <summary>
+    /// Appends one WASAPI capture buffer to the pending batch as interleaved 32-bit float.
+    /// Returns false when the source format is not one we can convert.
+    /// </summary>
+    private bool TryAppendFloat32InterleavedUnsafe(WaveFormat format, byte[] buffer, int bytesRecorded)
+    {
+        var isFloat32 = format.Encoding == WaveFormatEncoding.IeeeFloat && format.BitsPerSample == 32;
+        var isPcm16 = format.Encoding == WaveFormatEncoding.Pcm && format.BitsPerSample == 16;
+
+        int requiredBytes;
+        if (isFloat32)
+        {
+            requiredBytes = bytesRecorded;
+        }
+        else if (isPcm16)
+        {
+            requiredBytes = bytesRecorded / 2 * sizeof(float);
+        }
+        else
+        {
+            return false;
+        }
+
+        // A format change mid-capture invalidates whatever is already batched.
+        if (_pendingPcmLength > 0 &&
+            (_pendingSampleRate != format.SampleRate || _pendingChannels != format.Channels))
+        {
+            _pendingPcmLength = 0;
+        }
+
+        _pendingSampleRate = format.SampleRate;
+        _pendingChannels = Math.Max(1, format.Channels);
+
+        EnsurePendingCapacityUnsafe(_pendingPcmLength + requiredBytes);
+
+        if (isFloat32)
+        {
+            Buffer.BlockCopy(buffer, 0, _pendingPcm, _pendingPcmLength, bytesRecorded);
+            _pendingPcmLength += bytesRecorded;
+            return true;
+        }
+
+        var destination = _pendingPcm.AsSpan(_pendingPcmLength, requiredBytes);
+        var readOffset = 0;
+        var writeOffset = 0;
+
+        while (readOffset + 1 < bytesRecorded)
+        {
+            var sample = (short)(buffer[readOffset] | (buffer[readOffset + 1] << 8));
+            var normalized = Math.Clamp(sample / 32768f, -1f, 1f);
+            BitConverter.TryWriteBytes(destination[writeOffset..], normalized);
+            readOffset += 2;
+            writeOffset += sizeof(float);
+        }
+
+        _pendingPcmLength += writeOffset;
+        return true;
+    }
+
+    private void EnsurePendingCapacityUnsafe(int requiredBytes)
+    {
+        if (_pendingPcm.Length >= requiredBytes)
+        {
+            return;
+        }
+
+        var capacity = Math.Max(requiredBytes, Math.Max(8192, _pendingPcm.Length * 2));
+        Array.Resize(ref _pendingPcm, capacity);
+    }
+
+    /// <summary>
+    /// Emits a chunk only once at least <see cref="ChunkFlushMilliseconds"/> of audio has
+    /// accumulated. WASAPI hands us a buffer roughly every 10 ms, and each emitted chunk costs a
+    /// base64 encode, a JSON serialize, a UI-thread dispatch and a cross-process WebView post —
+    /// batching cuts all four by ~5x for a proportional increase in playout latency.
+    /// </summary>
+    private AudioChunk? TryTakeBatchedChunkUnsafe()
+    {
+        if (_pendingPcmLength <= 0 || _pendingSampleRate <= 0 || _pendingChannels <= 0)
+        {
+            return null;
+        }
+
+        var bytesPerFrame = _pendingChannels * sizeof(float);
+        var thresholdBytes = (int)((long)_pendingSampleRate * ChunkFlushMilliseconds / 1000) * bytesPerFrame;
+        if (thresholdBytes <= 0 || _pendingPcmLength < thresholdBytes)
+        {
+            return null;
+        }
+
+        var base64Data = Convert.ToBase64String(_pendingPcm.AsSpan(0, _pendingPcmLength));
+        var chunk = new AudioChunk(_pendingSampleRate, _pendingChannels, base64Data);
+        _pendingPcmLength = 0;
+        return chunk;
     }
 
     private void OnRecordingStopped(object? sender, StoppedEventArgs e)
@@ -379,6 +508,12 @@ internal sealed class WindowsScreenShareAudioFallback : IDisposable
             _activeMode = "system";
             _activeProcessId = null;
             _activeWindowTitle = null;
+        }
+
+        lock (_chunkSync)
+        {
+            _batchOwner = null;
+            _pendingPcmLength = 0;
         }
 
         if (sender is IWaveIn source)
@@ -401,6 +536,15 @@ internal sealed class WindowsScreenShareAudioFallback : IDisposable
         _activeMode = "system";
         _activeProcessId = null;
         _activeWindowTitle = null;
+
+        // Disown the batch and drop any sub-threshold tail. Clearing the owner is what actually
+        // stops a late DataAvailable callback from resurrecting the batch.
+        // Nesting is only ever _sync -> _chunkSync, never the reverse.
+        lock (_chunkSync)
+        {
+            _batchOwner = null;
+            _pendingPcmLength = 0;
+        }
 
         if (capture is null)
         {
@@ -429,6 +573,15 @@ internal sealed class WindowsScreenShareAudioFallback : IDisposable
         StopInternalUnsafe();
 
         _capture = capture;
+
+        // Claim the batch for this capture before wiring up events, so the first callback is
+        // never rejected as stale.
+        lock (_chunkSync)
+        {
+            _batchOwner = capture;
+            _pendingPcmLength = 0;
+        }
+
         _capture.DataAvailable += OnDataAvailable;
         _capture.RecordingStopped += OnRecordingStopped;
 
@@ -459,46 +612,6 @@ internal sealed class WindowsScreenShareAudioFallback : IDisposable
         }
 
         return unwrapped.Message;
-    }
-
-    private static bool TryConvertToFloat32InterleavedBase64(
-        WaveFormat format,
-        byte[] buffer,
-        int bytesRecorded,
-        out string base64Data)
-    {
-        base64Data = string.Empty;
-
-        if (format.Encoding == WaveFormatEncoding.IeeeFloat && format.BitsPerSample == 32)
-        {
-            var payload = new byte[bytesRecorded];
-            Buffer.BlockCopy(buffer, 0, payload, 0, bytesRecorded);
-            base64Data = Convert.ToBase64String(payload);
-            return true;
-        }
-
-        if (format.Encoding == WaveFormatEncoding.Pcm && format.BitsPerSample == 16)
-        {
-            var sampleCount = bytesRecorded / 2;
-            var floatPayload = new byte[sampleCount * sizeof(float)];
-            var readOffset = 0;
-            var writeOffset = 0;
-
-            while (readOffset + 1 < bytesRecorded)
-            {
-                var sample = (short)(buffer[readOffset] | (buffer[readOffset + 1] << 8));
-                var normalized = Math.Clamp(sample / 32768f, -1f, 1f);
-                var rawFloat = BitConverter.GetBytes(normalized);
-                Buffer.BlockCopy(rawFloat, 0, floatPayload, writeOffset, sizeof(float));
-                readOffset += 2;
-                writeOffset += sizeof(float);
-            }
-
-            base64Data = Convert.ToBase64String(floatPayload);
-            return true;
-        }
-
-        return false;
     }
 
     private static bool TryResolveWindowProcessId(string? targetLabel, out uint processId, out string? matchedWindowTitle)

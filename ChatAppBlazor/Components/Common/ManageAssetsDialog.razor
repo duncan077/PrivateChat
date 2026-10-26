@@ -1,0 +1,174 @@
+@using Shared.Models
+@implements IDisposable
+@inject ServerAssetStore Assets
+@inject ApiClientService Api
+@inject AuthStateProvider Auth
+@inject ChatRoomStore Rooms
+
+@* Upload and remove server-wide custom emoji and stickers. Any member may add;
+   the uploader or a Moderator+ may remove. *@
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">Custom @(Kind == CustomAssetKind.Emoji ? "emoji" : "stickers")</MudText>
+    </TitleContent>
+    <DialogContent>
+        <div class="chat-asset-manage">
+            <MudTextField @bind-Value="_name" Immediate="true" Margin="Margin.Dense" Variant="Variant.Outlined"
+                          Label="Name" HelperText="2-24 characters: a-z, 0-9, underscore"
+                          MaxLength="24" />
+
+            <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="mt-2">
+                @* A plain label wrapping InputFile: no JS needed to open the picker. *@
+                <label class="chat-asset-file-label">
+                    <MudIcon Icon="@Icons.Material.Filled.Upload" Size="Size.Small" />
+                    <span class="ml-1">@(_uploadedUrl == null ? "Choose image" : "Change image")</span>
+                    <InputFile OnChange="HandleFileSelected" accept="image/*" class="chat-asset-file-input" />
+                </label>
+                @if (_uploadedUrl != null)
+                {
+                    <img src="@_uploadedUrl" alt="Preview" style="height:2.5rem;width:2.5rem;object-fit:contain" />
+                }
+            </MudStack>
+
+            @if (_error != null)
+            {
+                <MudAlert Severity="Severity.Error" Dense="true" Class="mt-2">@_error</MudAlert>
+            }
+
+            <MudButton Variant="Variant.Filled" Color="Color.Primary" Size="Size.Small" Class="mt-2"
+                       Disabled="@(_busy || _uploadedUrl == null || string.IsNullOrWhiteSpace(_name))"
+                       OnClick="Create">
+                @(_busy ? "Saving..." : "Add")
+            </MudButton>
+
+            <MudDivider Class="my-3" />
+
+            @if (Existing.Count == 0)
+            {
+                <MudText Typo="Typo.body2" Color="Color.Secondary">Nothing added yet.</MudText>
+            }
+            else
+            {
+                @foreach (var asset in Existing)
+                {
+                    <div class="chat-asset-manage-row" @key="asset.Id">
+                        <img src="@asset.Url" alt="@asset.Name" />
+                        <MudText Typo="Typo.body2" Class="flex-grow-1">
+                            @(Kind == CustomAssetKind.Emoji ? $":{asset.Name}:" : asset.Name)
+                        </MudText>
+                        @if (CanDelete(asset))
+                        {
+                            <MudIconButton Icon="@Icons.Material.Filled.Delete" Size="Size.Small" Color="Color.Error"
+                                           Disabled="_busy" OnClick="() => Delete(asset.Id)" title="Remove" />
+                        }
+                    </div>
+                }
+            }
+        </div>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="Close">Close</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    [CascadingParameter] private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    [Parameter] public CustomAssetKind Kind { get; set; } = CustomAssetKind.Emoji;
+
+    private string _name = string.Empty;
+    private string? _uploadedUrl;
+    private string? _error;
+    private bool _busy;
+
+    private List<CustomAssetInfo> Existing => Kind == CustomAssetKind.Emoji
+        ? Assets.EmojiByName.Values.OrderBy(a => a.Name, StringComparer.Ordinal).ToList()
+        : Assets.Stickers;
+
+    private long MaxBytes => Kind == CustomAssetKind.Emoji
+        ? Shared.ChatLimits.MaxEmojiUploadBytes
+        : Shared.ChatLimits.MaxStickerUploadBytes;
+
+    protected override void OnInitialized() => Assets.OnChange += HandleChange;
+
+    private void HandleChange() => InvokeAsync(StateHasChanged);
+
+    // The server enforces this too; here it just avoids showing a button that would fail.
+    private bool CanDelete(CustomAssetInfo asset) =>
+        asset.UploaderId == Auth.CurrentUser?.Id || Rooms.CurrentUserRole >= UserRole.Moderator;
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+
+        if (file.Size > MaxBytes)
+        {
+            _error = $"File is too large (limit {MaxBytes / 1024} KB).";
+            return;
+        }
+
+        _busy = true;
+        _error = null;
+
+        try
+        {
+            await using var stream = file.OpenReadStream(MaxBytes);
+            var attachment = await Api.UploadFileAsync(stream, file.Name, file.ContentType, file.Size);
+            _uploadedUrl = attachment.Url;
+
+            // Default the name from the file so the common case needs no typing.
+            if (string.IsNullOrWhiteSpace(_name))
+            {
+                var suggestion = new string(Path.GetFileNameWithoutExtension(file.Name)
+                    .ToLowerInvariant()
+                    .Select(c => char.IsLetterOrDigit(c) ? c : '_')
+                    .ToArray());
+                _name = suggestion.Length > 24 ? suggestion[..24] : suggestion;
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = $"Upload failed: {ex.Message}";
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task Create()
+    {
+        if (_uploadedUrl == null) return;
+
+        _busy = true;
+        _error = null;
+
+        if (await Assets.CreateAsync(Kind, _name.Trim().ToLowerInvariant(), _uploadedUrl))
+        {
+            _name = string.Empty;
+            _uploadedUrl = null;
+        }
+        else
+        {
+            _error = Assets.Error;
+        }
+
+        _busy = false;
+    }
+
+    private async Task Delete(Guid assetId)
+    {
+        _busy = true;
+        if (!await Assets.DeleteAsync(assetId))
+        {
+            _error = Assets.Error;
+        }
+        _busy = false;
+    }
+
+    private void Close() => MudDialog.Close();
+
+    public void Dispose() => Assets.OnChange -= HandleChange;
+}

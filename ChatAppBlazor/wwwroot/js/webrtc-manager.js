@@ -33,6 +33,15 @@ window.webrtcManager = {
     remoteFeedVolumes: {},
     remoteIdentityVolumes: {},
     remoteIdentityVolumeStoragePrefix: 'privatechat:remoteIdentityVolumes:v1:',
+    identityVolumePersistDebounceMs: 300,
+    _identityVolumePersistTimerId: 0,
+    _displayParseCache: null,
+    displayParseCacheLimit: 256,
+    _remoteAudioRoutingRafId: 0,
+    _remoteAudioRoutingTimerId: 0,
+    _screenAudioScratch: null,
+    _screenAudioScheduled: null,
+    screenAudioFallbackMaxLeadSeconds: 0.25,
     hiddenRemoteFeeds: {},
     hiddenRemoteFeedMeta: {},
     streamVolume: 1.0,
@@ -73,7 +82,17 @@ window.webrtcManager = {
     participantCheckTimer: null,
     remoteFeedHealthTimer: null,
     remoteFeedHealthBusy: false,
+    remoteFeedHealthCursor: 0,
     keepaliveFailures: 0,
+    pollFailures: 0,
+    pollGeneration: 0,
+    pollBackoffMaxMs: 30_000,
+    pollFailureLogEscalation: 5,
+    maxAudioRecoveryAttempts: 3,
+    lastParticipantCheckAtMs: 0,
+    lastRemoteFeedHealthRunAtMs: 0,
+    lastStreamInfoRefreshAtMs: 0,
+    verbosePollEventLogging: false,
 
     // C# interop reference
     dotNetRef: null,
@@ -86,12 +105,34 @@ window.webrtcManager = {
         fps: 30,
         bitrateKbps: 2000,
         preferredVideoCodec: 'h264',
+        h264ProfileOverride: '',
+        hideLocalPreview: false,
         screenShareAudioEnabled: true,
-        screenShareAutoGainEnabled: true
+        screenShareAutoGainEnabled: true,
+        noiseSuppressionEnabled: true,
+        voiceGateEnabled: false,
+        voiceGateAuto: true,
+        voiceGateThreshold: 30
     },
     minPublisherBitrateKbps: 1000,
     maxPublisherBitrateKbps: 20000,
-    enforcePublisherCbr: true,
+    /// Initial bandwidth estimate handed to libwebrtc via x-google-start-bitrate, in
+    /// kbps. Deliberately modest and NOT derived from the cap - see
+    /// applyVideoBitrateParametersToSdp for why starting near the cap is self-defeating.
+    publisherStartBitrateKbps: 2500,
+    /// Whether to ask the encoder for constant bitrate via x-google-cbr.
+    ///
+    /// Off, because screen content is bursty in exactly the way CBR is bad at. A share
+    /// is mostly still, then changes a lot for a few frames. CBR asks the encoder to
+    /// spend the same number of bits on every frame regardless: padding out the still
+    /// ones, and - the part that costs frames - refusing to spend extra on the busy ones,
+    /// so a burst is met by degrading the frame instead of borrowing bits from the idle
+    /// seconds either side of it. VBR within the same floor and cap gives the same
+    /// average with the headroom placed where the content actually needs it.
+    ///
+    /// Set back to true to restore the previous behaviour; the SDP log line reports
+    /// cbr=0 or cbr=1 so the active setting is visible per negotiation.
+    enforcePublisherCbr: false,
     // Applied to outgoing SDP when H264 is present/selected.
     h264ProfileLevelId: '64e029',
     h264ProfileLevelIdFallbacks: ['4de01f', '42e01f'],
@@ -100,8 +141,16 @@ window.webrtcManager = {
     receiverAudioPlayoutDelayHintS: 0.12,
     receiverVideoPlayoutDelayHintS: 0.10,
     audioContext: null,
+    voiceGateAnalyser: null,
     remotePlaybackAudioContext: null,
     remotePlaybackAudioNodes: new WeakMap(),
+    remoteSpeakingAnalyzers: {},
+    localSpeakingAnalyzer: null,
+    speakingMonitorTimer: null,
+    speakingMonitorIntervalMs: 250,
+    speakingHoldMs: 700,
+    speakingRmsThreshold: 0.035,
+    activeSpeakingUsers: new Set(),
     gainNode: null,
     musicBotContext: null,
     musicBotDestination: null,
@@ -113,6 +162,9 @@ window.webrtcManager = {
     musicBotTitle: '',
     musicBotStreamUrl: '',
     musicBotVolume: 0.8,
+    micTestStream: null,
+    micTestAudioElement: null,
+    micTestStreamIdentity: '',
 
     // Push-to-talk
     pttEnabled: false,
@@ -189,10 +241,27 @@ window.webrtcManager = {
         } catch { }
     },
 
+    /// Ceiling for a frame-rate limiter that is meant to hit `desiredFps`.
+    ///
+    /// A limiter clamps at "no more than this", and both the capture adapter and
+    /// libwebrtc's frame dropper make that decision against a jittery arrival time.
+    /// Pinned exactly at the target, each one rejects the occasional frame that turns up
+    /// a fraction early - and there are two of them in series, on the track and on the
+    /// encoding, which is how a source delivering a clean 60 came out at 55-57.
+    ///
+    /// A little headroom lets them clamp what they are actually for - a 144Hz display
+    /// feeding a 60fps share - while leaving the target itself alone. The rate is still
+    /// governed by `ideal` on the capture constraint, so this does not invite overshoot.
+    getFrameRateCeiling(desiredFps) {
+        const target = Math.max(1, parseInt(desiredFps, 10) || 30);
+        return Math.max(target + 2, Math.ceil(target * 1.1));
+    },
+
     async tuneScreenShareVideoTrackForPerformance(videoTrack, targetFps, scope = 'screenshare', options = null) {
         if (!videoTrack) return;
 
         const desiredFps = Math.max(1, parseInt(targetFps, 10) || 30);
+        const ceilingFps = this.getFrameRateCeiling(desiredFps);
         const minFps = desiredFps >= 30 ? 30 : Math.max(5, Math.floor(desiredFps * 0.75));
         const targetResolution = this.parseResolutionSetting(this.currentConstraints?.resolution, 1920, 1080);
         const enforceResolutionCap = options?.enforceResolutionCap !== false;
@@ -200,7 +269,7 @@ window.webrtcManager = {
         if (typeof videoTrack.applyConstraints === 'function') {
             try {
                 const constraints = {
-                    frameRate: { min: minFps, ideal: desiredFps, max: desiredFps }
+                    frameRate: { min: minFps, ideal: desiredFps, max: ceilingFps }
                 };
                 if (enforceResolutionCap) {
                     constraints.width = { ideal: targetResolution.width, max: targetResolution.width };
@@ -209,7 +278,7 @@ window.webrtcManager = {
                 await videoTrack.applyConstraints(constraints);
                 this.log(
                     'screenshare',
-                    `${scope}: applied video constraints ${enforceResolutionCap ? `${targetResolution.width}x${targetResolution.height} ` : ''}frameRate=${minFps}/${desiredFps}/${desiredFps}`
+                    `${scope}: applied video constraints ${enforceResolutionCap ? `${targetResolution.width}x${targetResolution.height} ` : ''}frameRate=${minFps}/${desiredFps}/${ceilingFps}`
                 );
             } catch (err) {
                 this.log('screenshare', `${scope}: video constraint tuning failed (${err.message})`);
@@ -248,7 +317,10 @@ window.webrtcManager = {
             }
 
             params.degradationPreference = 'maintain-framerate';
-            params.encodings[0].maxFramerate = desiredFps;
+            // The second of the two limiters - see getFrameRateCeiling. libwebrtc drops
+            // frames to stay at or below this, so exactly the target meant dropping on
+            // jitter alone.
+            params.encodings[0].maxFramerate = this.getFrameRateCeiling(desiredFps);
             params.encodings[0].minBitrate = minBitrateBps;
             params.encodings[0].maxBitrate = maxBitrateBps;
             params.encodings[0].priority = 'high';
@@ -319,6 +391,73 @@ window.webrtcManager = {
         return 'unknown';
     },
 
+    // ─── Screen-share annotation support ──────────────────────────────────────
+
+    /// Tells .NET which desktop surface is being captured so the Windows overlay
+    /// can position itself over exactly that monitor or window.
+    reportScreenShareTarget(targetLabel, displaySurface) {
+        try {
+            const track = this.screenStream?.getVideoTracks?.()[0] || null;
+            const settings = track?.getSettings?.() || {};
+            this.notifyDotNet('OnScreenShareTargetChanged', JSON.stringify({
+                targetLabel: (targetLabel || '').toString(),
+                displaySurface: (displaySurface || settings.displaySurface || '').toString(),
+                frameWidth: parseInt(settings.width, 10) || 0,
+                frameHeight: parseInt(settings.height, 10) || 0
+            }));
+        } catch (err) {
+            this.log('screenshare', `Unable to report annotation capture target: ${err.message}`);
+        }
+    },
+
+    /// Locates the video cell showing a given user's shared screen, which is the
+    /// surface annotations are drawn on.
+    findAnnotationTargetCell(sharerUserId) {
+        const normalized = this.normalizeUserId(sharerUserId);
+        if (!normalized) return null;
+
+        const selfId = this.normalizeUserId(this.userId || '');
+        if (selfId && normalized === selfId) {
+            return this.isScreenSharing ? document.querySelector('#videoGrid .local-cell') : null;
+        }
+
+        // IMPORTANT: this client does NOT publish a dedicated screen feed - the
+        // share replaces the video track on the sharer's PRIMARY feed. A dedicated
+        // 'native-screen' feed only exists for the native (non-Blazor) pipeline.
+        // So: prefer a dedicated share feed when one exists, but fall back to the
+        // sharer's ordinary cell, which is where the shared screen actually shows
+        // for viewers of this app. (Requiring a share-role feed here was the bug
+        // that made drawing impossible on every viewer machine.)
+        const wantedIdentity = `uid:${normalized}`;
+        let fallbackCell = null;
+        let fallbackHasVideo = false;
+
+        for (const feedId of Object.keys(this.feeds || {})) {
+            const feed = this.feeds[feedId];
+            if (!feed) continue;
+            if (this.getFeedIdentityKey(feedId) !== wantedIdentity) continue;
+
+            // Screen-audio companion feeds render as hidden cells - never a host.
+            if (this.isFeedTaggedScreenAudio(feedId)) continue;
+
+            const cell = document.getElementById('remote-' + feedId);
+            if (!cell) continue;
+
+            const role = this.getDisplayRole(feed.display);
+            if (role === 'native-screen' || this.getFeedRole(feedId) === 'stream') {
+                return cell;
+            }
+
+            const hasVideo = !!this.feedHasLiveTrack?.(feed, 'video');
+            if (!fallbackCell || (hasVideo && !fallbackHasVideo)) {
+                fallbackCell = cell;
+                fallbackHasVideo = hasVideo;
+            }
+        }
+
+        return fallbackCell;
+    },
+
     buildScreenShareTargetLabel(...candidates) {
         const normalizedCandidates = candidates
             .map(x => (x || '').toString().trim())
@@ -383,6 +522,25 @@ window.webrtcManager = {
         } catch {
             // Ignore storage persistence failures.
         }
+    },
+
+    /**
+     * Trailing-debounced persist. Volume sliders fire `input` at pointer rate, and each write
+     * is a full map sanitise + JSON.stringify + synchronous localStorage.setItem.
+     */
+    schedulePersistedRemoteIdentityVolumes() {
+        if (this._identityVolumePersistTimerId) return;
+        this._identityVolumePersistTimerId = setTimeout(() => {
+            this._identityVolumePersistTimerId = 0;
+            this.savePersistedRemoteIdentityVolumes();
+        }, this.identityVolumePersistDebounceMs);
+    },
+
+    flushPersistedRemoteIdentityVolumes() {
+        if (!this._identityVolumePersistTimerId) return;
+        clearTimeout(this._identityVolumePersistTimerId);
+        this._identityVolumePersistTimerId = 0;
+        this.savePersistedRemoteIdentityVolumes();
     },
 
     getAttachmentVideoSavedVolume() {
@@ -495,7 +653,9 @@ window.webrtcManager = {
         const constraint = {
             width: { ideal: target.width },
             height: { ideal: target.height },
-            frameRate: { ideal: fps, max: fps }
+            // Same reasoning as the screen-share path: a camera asked for exactly its own
+            // rate as a hard maximum lands just under it.
+            frameRate: { ideal: fps, max: this.getFrameRateCeiling(fps) }
         };
         const cameraDeviceId = (this.currentConstraints?.cameraDeviceId || '').toString().trim();
         if (cameraDeviceId) {
@@ -630,13 +790,27 @@ window.webrtcManager = {
         this.clearScreenShareBitrateWarmupTimers();
         if (!this.isScreenSharing) return;
 
-        const delays = [250, 900, 2000];
-        for (const delayMs of delays) {
+        // Re-assert the bitrate as Janus settles, but ask for a keyframe only once.
+        //
+        // A 1080p keyframe is hundreds of kilobytes. Three of them inside two seconds -
+        // on top of the one screenshare-start already requested - hand the pacer a queue
+        // it then spends the next second draining, and that is exactly the window in
+        // which the share is trying to reach its target frame rate. The extra requests
+        // bought nothing: one keyframe is all a newly-attached subscriber needs.
+        const steps = [
+            { delayMs: 250, keyframe: false },
+            { delayMs: 900, keyframe: true },
+            { delayMs: 2000, keyframe: false }
+        ];
+
+        for (const step of steps) {
             const timerId = setTimeout(() => {
                 if (!this.isScreenSharing || !this.publisherPc) return;
                 this.applyBitrate(this.currentConstraints?.bitrateKbps || 2000).catch(() => { });
-                this.requestPublisherKeyframe(`screenshare-warmup-${delayMs}ms`).catch(() => { });
-            }, delayMs);
+                if (step.keyframe) {
+                    this.requestPublisherKeyframe(`screenshare-warmup-${step.delayMs}ms`).catch(() => { });
+                }
+            }, step.delayMs);
             this.screenShareBitrateWarmupTimers.push(timerId);
         }
     },
@@ -680,6 +854,10 @@ window.webrtcManager = {
     },
 
     async runPublisherVideoPerformanceGuard() {
+        if (!this.isAppVisible()) {
+            return;
+        }
+
         if (!this.isScreenSharing || !this.publisherPc || !this.publisherConfigured) {
             return;
         }
@@ -728,7 +906,12 @@ window.webrtcManager = {
             state.lowFpsStreak = 0;
         } else {
             state.lowFpsStreak = 0;
-            state.recoveryStreak = 0;
+            // Decay rather than reset. Recovery still wants a run of clean samples, but a
+            // single ambiguous one - a momentary bandwidth limit, fps a hair under target -
+            // used to throw the whole run away. Since 'bandwidth' counts as ambiguous and is
+            // common on a real link, the scale ratcheted down on every dip and in practice
+            // never climbed back: each quarter-step needed ten unbroken seconds.
+            state.recoveryStreak = Math.max(0, state.recoveryStreak - 1);
         }
 
         state.lastReason = qualityLimitationReason;
@@ -753,7 +936,10 @@ window.webrtcManager = {
             return;
         }
 
-        if (state.recoveryStreak >= 5 && state.scaleResolutionDownBy > (minRequiredScale + 0.01)) {
+        // Symmetric with the degrade threshold above. At a 2s cadence this was 10s of
+        // unbroken clean samples to win back a quarter-step that 6s of bad ones had cost,
+        // so quality drifted downwards over the life of a share.
+        if (state.recoveryStreak >= 3 && state.scaleResolutionDownBy > (minRequiredScale + 0.01)) {
             state.recoveryStreak = 0;
             const nextScale = Math.max(minRequiredScale, Math.round((state.scaleResolutionDownBy - 0.25) * 100) / 100);
             if (nextScale < state.scaleResolutionDownBy - 0.001) {
@@ -810,6 +996,7 @@ window.webrtcManager = {
     },
 
     async runPublisherHealthWatchdog() {
+        if (!this.isAppVisible()) return;
         if (!this.isAndroidWebRtcEnvironment()) return;
         if (!this.publisherPc || !this.publisherConfigured) return;
 
@@ -902,7 +1089,16 @@ window.webrtcManager = {
 
         const minKbps = this.clampPublisherBitrateKbps(minBitrateKbps);
         const maxKbps = Math.max(minKbps, this.clampPublisherBitrateKbps(maxBitrateKbps));
-        const startKbps = Math.max(minKbps, Math.min(maxKbps, Math.round(maxKbps * 0.9)));
+        // x-google-start-bitrate is libwebrtc's INITIAL bandwidth estimate, used before it
+        // has measured anything at all. At 90% of the cap, opening a 12 Mbps share meant
+        // pushing 10.8 Mbps into a link of unknown capacity from the first frame: the
+        // queue builds, packets drop, and the congestion controller answers with a hard
+        // multiplicative decrease. That is the shape of "never reaches a steady 30 or 60"
+        // and of a share that sags and then takes a long time to climb back.
+        //
+        // Transport-cc probes upward quickly when the path really is fat, so a modest
+        // start costs about a second of ramp and avoids the overshoot completely.
+        const startKbps = Math.max(minKbps, Math.min(maxKbps, this.publisherStartBitrateKbps));
         const lines = sdp.split(/\r?\n/);
         const videoPayloads = new Set();
         let inVideoSection = false;
@@ -1080,6 +1276,304 @@ window.webrtcManager = {
         this.remotePlaybackAudioNodes.delete(videoElement);
     },
 
+    resolveFeedUserId(feedId) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return '';
+
+        const feedDisplay = this.feeds[normalizedFeedId]?.display || this.hiddenRemoteFeedMeta[normalizedFeedId]?.display || '';
+        const parsed = this.parsePublisherDisplay((feedDisplay || '').toString());
+        return this.normalizeUserId(parsed.userId);
+    },
+
+    clearDrawerSpeakingState() {
+        const rows = document.querySelectorAll('[data-room-drag-user]');
+        for (const row of rows) {
+            if (!row) continue;
+            row.classList.remove('room-user-speaking');
+            const avatar = row.querySelector('.chat-type-avatar');
+            if (avatar) {
+                avatar.classList.remove('chat-type-avatar-speaking');
+            }
+        }
+    },
+
+    /**
+     * One document scan producing userId -> [{row, avatar}]. The speaking monitor used to run
+     * this unindexed attribute-selector walk once per speaker per tick, over a document that
+     * includes the whole chat scrollback, plus a nested query per matched row.
+     */
+    buildDrawerUserRowIndex() {
+        const index = new Map();
+        const rows = document.querySelectorAll('[data-room-drag-user]');
+        for (const row of rows) {
+            if (!row) continue;
+            const rowUserId = this.normalizeUserId(row.getAttribute('data-room-drag-user') || '');
+            if (!rowUserId) continue;
+
+            const entry = { row, avatar: row.querySelector('.chat-type-avatar') };
+            const existing = index.get(rowUserId);
+            if (existing) {
+                existing.push(entry);
+            } else {
+                index.set(rowUserId, [entry]);
+            }
+        }
+        return index;
+    },
+
+    setDrawerUserSpeakingState(userId, speaking, rowIndex = null) {
+        const normalizedUserId = this.normalizeUserId(userId);
+        if (!normalizedUserId) return;
+
+        const index = rowIndex || this.buildDrawerUserRowIndex();
+        const entries = index.get(normalizedUserId);
+        if (!entries) return;
+
+        for (const entry of entries) {
+            entry.row.classList.toggle('room-user-speaking', !!speaking);
+            if (entry.avatar) {
+                entry.avatar.classList.toggle('chat-type-avatar-speaking', !!speaking);
+            }
+        }
+    },
+
+    stopSpeakingMonitor() {
+        if (this.speakingMonitorTimer) {
+            clearInterval(this.speakingMonitorTimer);
+            this.speakingMonitorTimer = null;
+        }
+    },
+
+    sampleSpeakingLevel(entry) {
+        if (!entry?.analyzerNode || !entry?.dataArray) return 0;
+        try {
+            entry.analyzerNode.getByteTimeDomainData(entry.dataArray);
+        } catch {
+            return 0;
+        }
+
+        let sumSquares = 0;
+        for (let i = 0; i < entry.dataArray.length; i += 2) {
+            const sample = (entry.dataArray[i] - 128) / 128;
+            sumSquares += sample * sample;
+        }
+        const sampleCount = Math.max(1, Math.ceil(entry.dataArray.length / 2));
+        return Math.sqrt(sumSquares / sampleCount);
+    },
+
+    updateSpeakingIndicatorsFromAnalyzers() {
+        const analyzerEntries = Object.values(this.remoteSpeakingAnalyzers || {});
+        const localEntry = this.localSpeakingAnalyzer;
+        if (analyzerEntries.length === 0 && !localEntry) {
+            if (this.activeSpeakingUsers.size > 0) {
+                this.clearDrawerSpeakingState();
+                this.activeSpeakingUsers.clear();
+            }
+            this.stopSpeakingMonitor();
+            return;
+        }
+
+        const now = Date.now();
+        const nextActive = new Set();
+
+        for (const entry of analyzerEntries) {
+            if (!entry.userId) continue;
+
+            const rms = this.sampleSpeakingLevel(entry);
+
+            if (rms >= this.speakingRmsThreshold) {
+                entry.lastVoiceAt = now;
+            }
+
+            if ((now - (entry.lastVoiceAt || 0)) <= this.speakingHoldMs) {
+                nextActive.add(entry.userId);
+            }
+        }
+
+        if (localEntry?.userId) {
+            const localRms = this.sampleSpeakingLevel(localEntry);
+            if (localRms >= this.speakingRmsThreshold) {
+                localEntry.lastVoiceAt = now;
+            }
+            if ((now - (localEntry.lastVoiceAt || 0)) <= this.speakingHoldMs) {
+                nextActive.add(localEntry.userId);
+            }
+        }
+
+        // Build the row index once per tick, and only when there is state to apply — a silent
+        // room now costs zero DOM queries instead of one walk per tracked user.
+        const rowIndex = (nextActive.size > 0 || this.activeSpeakingUsers.size > 0)
+            ? this.buildDrawerUserRowIndex()
+            : null;
+
+        for (const userId of this.activeSpeakingUsers) {
+            if (!nextActive.has(userId)) {
+                this.setDrawerUserSpeakingState(userId, false, rowIndex);
+            }
+        }
+
+        // Reapply speaking classes on every tick so drawer rerenders don't lose glow state.
+        for (const userId of nextActive) {
+            this.setDrawerUserSpeakingState(userId, true, rowIndex);
+        }
+
+        this.activeSpeakingUsers = nextActive;
+    },
+
+    ensureSpeakingMonitor() {
+        if (this.speakingMonitorTimer) return;
+        this.speakingMonitorTimer = setInterval(() => {
+            this.updateSpeakingIndicatorsFromAnalyzers();
+        }, Math.max(120, parseInt(this.speakingMonitorIntervalMs, 10) || 250));
+    },
+
+    removeLocalSpeakingAnalyzer() {
+        const existing = this.localSpeakingAnalyzer;
+        if (!existing) return;
+        try { existing.sourceNode?.disconnect?.(); } catch { }
+        try { existing.analyzerNode?.disconnect?.(); } catch { }
+        try { existing.monitorGainNode?.disconnect?.(); } catch { }
+        this.localSpeakingAnalyzer = null;
+    },
+
+    ensureLocalSpeakingAnalyzer() {
+        const normalizedSelfUserId = this.normalizeUserId(this.userId || '');
+        if (!normalizedSelfUserId) {
+            this.removeLocalSpeakingAnalyzer();
+            return;
+        }
+
+        const localAudioTrack = this.localStream?.getAudioTracks?.().find(t => t && t.readyState === 'live') || null;
+        if (!localAudioTrack) {
+            this.removeLocalSpeakingAnalyzer();
+            return;
+        }
+
+        const context = this.ensureRemotePlaybackAudioContext();
+        if (!context) {
+            return;
+        }
+
+        const localAudioStream = new MediaStream([localAudioTrack]);
+        const streamIdentity = this.getMediaStreamIdentity(localAudioStream);
+        if (this.localSpeakingAnalyzer && this.localSpeakingAnalyzer.streamIdentity === streamIdentity) {
+            this.localSpeakingAnalyzer.userId = normalizedSelfUserId;
+            return;
+        }
+
+        this.removeLocalSpeakingAnalyzer();
+        try {
+            const sourceNode = context.createMediaStreamSource(localAudioStream);
+            const analyzerNode = context.createAnalyser();
+            analyzerNode.fftSize = 512;
+            analyzerNode.smoothingTimeConstant = 0.72;
+
+            const monitorGainNode = context.createGain();
+            monitorGainNode.gain.value = 0;
+
+            sourceNode.connect(analyzerNode);
+            analyzerNode.connect(monitorGainNode);
+            monitorGainNode.connect(context.destination);
+
+            this.localSpeakingAnalyzer = {
+                sourceNode,
+                analyzerNode,
+                monitorGainNode,
+                dataArray: new Uint8Array(analyzerNode.fftSize),
+                streamIdentity,
+                userId: normalizedSelfUserId,
+                lastVoiceAt: 0
+            };
+            this.ensureSpeakingMonitor();
+        } catch {
+            // Ignore local analyzer creation failures.
+        }
+    },
+
+    removeRemoteSpeakingAnalyzer(feedId) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+
+        const existing = this.remoteSpeakingAnalyzers[normalizedFeedId];
+        if (!existing) return;
+
+        try { existing.sourceNode?.disconnect?.(); } catch { }
+        try { existing.analyzerNode?.disconnect?.(); } catch { }
+        try { existing.monitorGainNode?.disconnect?.(); } catch { }
+        delete this.remoteSpeakingAnalyzers[normalizedFeedId];
+    },
+
+    ensureRemoteSpeakingAnalyzer(feedId, stream) {
+        const normalizedFeedId = this.normalizeFeedId(feedId);
+        if (!normalizedFeedId) return;
+        if (this.isFeedTaggedScreenAudio(normalizedFeedId) || this.getFeedRole(normalizedFeedId) === 'stream') {
+            this.removeRemoteSpeakingAnalyzer(normalizedFeedId);
+            return;
+        }
+
+        const audioTracks = stream?.getAudioTracks?.().filter(t => t && t.readyState === 'live') || [];
+        if (audioTracks.length === 0) {
+            this.removeRemoteSpeakingAnalyzer(normalizedFeedId);
+            return;
+        }
+
+        const context = this.ensureRemotePlaybackAudioContext();
+        if (!context) {
+            return;
+        }
+
+        const userId = this.resolveFeedUserId(normalizedFeedId);
+        if (!userId) {
+            return;
+        }
+
+        const streamIdentity = this.getMediaStreamIdentity(stream);
+        const existing = this.remoteSpeakingAnalyzers[normalizedFeedId];
+        if (existing && existing.streamIdentity === streamIdentity && existing.userId === userId) {
+            return;
+        }
+
+        this.removeRemoteSpeakingAnalyzer(normalizedFeedId);
+
+        try {
+            const sourceNode = context.createMediaStreamSource(stream);
+            const analyzerNode = context.createAnalyser();
+            analyzerNode.fftSize = 512;
+            analyzerNode.smoothingTimeConstant = 0.72;
+
+            const monitorGainNode = context.createGain();
+            monitorGainNode.gain.value = 0;
+
+            sourceNode.connect(analyzerNode);
+            analyzerNode.connect(monitorGainNode);
+            monitorGainNode.connect(context.destination);
+
+            this.remoteSpeakingAnalyzers[normalizedFeedId] = {
+                sourceNode,
+                analyzerNode,
+                monitorGainNode,
+                dataArray: new Uint8Array(analyzerNode.fftSize),
+                streamIdentity,
+                userId,
+                lastVoiceAt: 0
+            };
+            this.ensureSpeakingMonitor();
+        } catch {
+            // Ignore analyzer creation failures.
+        }
+    },
+
+    resetRemoteSpeakingState() {
+        this.stopSpeakingMonitor();
+        this.removeLocalSpeakingAnalyzer();
+        for (const feedId of Object.keys(this.remoteSpeakingAnalyzers || {})) {
+            this.removeRemoteSpeakingAnalyzer(feedId);
+        }
+        this.remoteSpeakingAnalyzers = {};
+        this.clearDrawerSpeakingState();
+        this.activeSpeakingUsers.clear();
+    },
+
     normalizeRemotePlaybackStream(stream, feedId, preferredTrack = null) {
         if (!stream) return stream;
 
@@ -1156,7 +1650,182 @@ window.webrtcManager = {
     normalizeVideoCodec(codec) {
         const normalized = (codec || 'h264').toString().trim().toLowerCase();
         if (normalized === 'auto') return 'h264';
-        return ['h264', 'vp8', 'vp9', 'h265'].includes(normalized) ? normalized : 'h264';
+        // hvc1 is the same codec under its container fourcc; the settings layer accepts
+        // it, so fold it in rather than silently demoting to h264.
+        if (normalized === 'hvc1') return 'h265';
+        // av1 belongs here: leaving it out meant a selected AV1 was rewritten to h264
+        // before resolveJanusVideoCodec ever saw it, so the setting could never take
+        // effect no matter what the device supported.
+        return ['h264', 'vp8', 'vp9', 'h265', 'av1'].includes(normalized) ? normalized : 'h264';
+    },
+
+    normalizeH264ProfileOverrideValue(rawOverride) {
+        const normalized = (rawOverride || '').toString().trim().toLowerCase();
+        if (!normalized) return '';
+
+        const parts = normalized.split(':', 2);
+        const profileLevelId = (parts[0] || '').trim();
+        if (!/^[0-9a-f]{6}$/.test(profileLevelId)) {
+            return '';
+        }
+
+        const packetizationModeRaw = (parts[1] || '').trim();
+        if (!packetizationModeRaw) {
+            return profileLevelId;
+        }
+
+        const packetizationMode = parseInt(packetizationModeRaw, 10);
+        if (!Number.isFinite(packetizationMode) || packetizationMode < 0) {
+            return profileLevelId;
+        }
+
+        return `${profileLevelId}:${packetizationMode}`;
+    },
+
+    extractFmtpValue(fmtp, key) {
+        if (!fmtp || !key) return '';
+        const regex = new RegExp(`(?:^|;)\\s*${key}=([^;\\s]+)\\s*(?:;|$)`, 'i');
+        const match = regex.exec(fmtp.toString());
+        return (match?.[1] || '').trim();
+    },
+
+    parseH264CodecDescriptor(fmtp) {
+        const profileLevelId = this.extractFmtpValue(fmtp, 'profile-level-id').toLowerCase();
+        const packetizationRaw = this.extractFmtpValue(fmtp, 'packetization-mode');
+        const packetizationMode = Number.isFinite(parseInt(packetizationRaw, 10))
+            ? parseInt(packetizationRaw, 10)
+            : 0;
+
+        return {
+            profileLevelId: /^[0-9a-f]{6}$/.test(profileLevelId) ? profileLevelId : '',
+            packetizationMode
+        };
+    },
+
+    parseH264OverrideValue(rawOverride) {
+        const normalized = this.normalizeH264ProfileOverrideValue(rawOverride);
+        if (!normalized) {
+            return { profileLevelId: '', packetizationMode: null };
+        }
+
+        const parts = normalized.split(':', 2);
+        const profileLevelId = (parts[0] || '').trim();
+        if (!/^[0-9a-f]{6}$/.test(profileLevelId)) {
+            return { profileLevelId: '', packetizationMode: null };
+        }
+
+        const packetizationRaw = (parts[1] || '').trim();
+        if (!packetizationRaw) {
+            return { profileLevelId, packetizationMode: null };
+        }
+
+        const packetizationMode = parseInt(packetizationRaw, 10);
+        if (!Number.isFinite(packetizationMode) || packetizationMode < 0) {
+            return { profileLevelId, packetizationMode: null };
+        }
+
+        return { profileLevelId, packetizationMode };
+    },
+
+    getH264ProfileRank(profileLevelId) {
+        if (!/^[0-9a-f]{6}$/i.test(profileLevelId || '')) {
+            return 0;
+        }
+
+        const normalized = profileLevelId.toLowerCase();
+        const profileIdc = parseInt(normalized.slice(0, 2), 16);
+        const profileIop = parseInt(normalized.slice(2, 4), 16);
+        switch (profileIdc) {
+            case 0xf4: return 800; // High 4:4:4 Predictive
+            case 0x7a: return 700; // High 4:2:2
+            case 0x6e: return 600; // High 10
+            case 0x64: return 500; // High
+            case 0x4d: return 400; // Main
+            case 0x58: return 300; // Extended
+            case 0x42:
+                return (profileIop & 0x40) !== 0 ? 200 : 250; // Constrained Baseline / Baseline
+            default:
+                return 100;
+        }
+    },
+
+    getH264CodecPreferenceScore(profileLevelId, packetizationMode) {
+        const normalized = (profileLevelId || '').toString().trim().toLowerCase();
+        const levelIdc = /^[0-9a-f]{6}$/.test(normalized)
+            ? parseInt(normalized.slice(4, 6), 16)
+            : 0;
+        const profileRank = this.getH264ProfileRank(normalized);
+        const pmBonus = packetizationMode === 1 ? 20 : 0;
+        return profileRank + levelIdc + pmBonus;
+    },
+
+    getH264CodecCapabilities() {
+        try {
+            const senderCaps = window.RTCRtpSender?.getCapabilities?.('video');
+            const codecs = senderCaps?.codecs || [];
+            const unique = new Map();
+
+            for (const codec of codecs) {
+                const mime = (codec?.mimeType || '').toString().toLowerCase();
+                if (mime !== 'video/h264') {
+                    continue;
+                }
+
+                const fmtp = (codec?.sdpFmtpLine || '').toString();
+                const details = this.parseH264CodecDescriptor(fmtp);
+                if (!details.profileLevelId) {
+                    continue;
+                }
+
+                const key = `${details.profileLevelId}:${details.packetizationMode}`;
+                if (unique.has(key)) {
+                    continue;
+                }
+
+                unique.set(key, {
+                    profileLevelId: details.profileLevelId,
+                    packetizationMode: details.packetizationMode,
+                    sdpFmtpLine: fmtp
+                });
+            }
+
+            const result = [...unique.values()];
+            result.sort((a, b) =>
+                this.getH264CodecPreferenceScore(b.profileLevelId, b.packetizationMode)
+                - this.getH264CodecPreferenceScore(a.profileLevelId, a.packetizationMode));
+
+            return result;
+        } catch {
+            return [];
+        }
+    },
+
+    getDefaultH264ProfileOverride() {
+        const caps = this.getH264CodecCapabilities();
+        if (!Array.isArray(caps) || caps.length === 0) {
+            return '';
+        }
+
+        const best = caps[0];
+        if (!best?.profileLevelId) {
+            return '';
+        }
+
+        return `${best.profileLevelId}:${best.packetizationMode ?? 0}`;
+    },
+
+    resolveEffectiveH264Override() {
+        const explicit = this.parseH264OverrideValue(this.currentConstraints?.h264ProfileOverride);
+        if (explicit.profileLevelId) {
+            return explicit;
+        }
+
+        const auto = this.parseH264OverrideValue(this.getDefaultH264ProfileOverride());
+        if (auto.profileLevelId) {
+            return auto;
+        }
+
+        return { profileLevelId: '', packetizationMode: null };
     },
 
     getBrowserVideoCodecSupport() {
@@ -1169,13 +1838,18 @@ window.webrtcManager = {
             if (mime === 'video/h264') support.add('h264');
             if (mime === 'video/vp8') support.add('vp8');
             if (mime === 'video/vp9') support.add('vp9');
+            // Chromium reports AV1 as video/AV1; older builds used video/AV01. Missing
+            // this was why AV1 never appeared in settings even on hardware that encodes
+            // it - every other layer (normalizeVideoCodec, the C# filter,
+            // mapSdpVideoCodecToJanus) already knew about av1, only the probe did not.
+            if (mime === 'video/av1' || mime === 'video/av01') support.add('av1');
         }
         return support;
     },
 
     getSupportedVideoCodecs() {
         const support = this.getBrowserVideoCodecSupport();
-        const ordered = ['h264', 'h265', 'vp9', 'vp8'];
+        const ordered = ['h264', 'h265', 'av1', 'vp9', 'vp8'];
         const supported = ordered.filter(codec => support.has(codec));
         if (supported.length > 0) {
             return supported;
@@ -1201,6 +1875,11 @@ window.webrtcManager = {
         }
         if (preferred === 'vp8') {
             return pick('vp8') || pick('h264') || pick('vp9') || pick('h265') || 'h264';
+        }
+        if (preferred === 'av1') {
+            // Without this branch a selected AV1 fell through to the h264 return below,
+            // so even a device that advertised AV1 silently published h264.
+            return pick('av1') || pick('h264') || pick('vp9') || pick('vp8') || 'h264';
         }
         return 'h264';
     },
@@ -1496,7 +2175,20 @@ window.webrtcManager = {
 
     updatePublisherStreamHint(feedId, streams) {
         const key = String(feedId);
-        const previous = this.publisherStreamHints[key] || {};
+        const existing = this.publisherStreamHints[key];
+
+        // Nothing to learn from: listparticipants does not report streams at all, so
+        // writing a hint here invented "this publisher has neither audio nor video"
+        // out of an absent field. That false negative is permanent and silently
+        // disables repair, because needVideoRefresh is gated on hint.hasVideo - a feed
+        // discovered by the participant sweep could never be told apart from one whose
+        // publisher genuinely sends nothing. Absent has to stay absent so the recovery
+        // paths can distinguish "unknown" from "known to have none".
+        if (!Array.isArray(streams) && !existing) {
+            return;
+        }
+
+        const previous = existing || {};
         const normalized = this.normalizeSubscribeStreams(streams, feedId);
         let hasVideo = !!previous.hasVideo;
         let hasAudio = !!previous.hasAudio;
@@ -1545,7 +2237,13 @@ window.webrtcManager = {
         feed.nextRefreshAt = now + delay + 400;
 
         setTimeout(() => {
-            this.requestExistingSubscriberRefresh(feedId, reason, options).catch(() => { });
+            // Logged, not swallowed: this is the recovery path for a feed that is already
+            // missing media, so a failure here is the difference between "audio came back"
+            // and "that person is silent for the rest of the call".
+            this.requestExistingSubscriberRefresh(feedId, reason, options)
+                .catch(err => this.logError(
+                    'subscribe',
+                    `Subscriber refresh for feed ${feedId} (${reason}) failed: ${err?.message || err}`));
         }, delay);
     },
 
@@ -1571,7 +2269,15 @@ window.webrtcManager = {
             if (missingAudio && hint && hint.hasAudio === false) return;
         }
 
-        let streams = this.normalizeSubscribeStreams(hint.streams, feedId);
+        // hint can be absent entirely, and the guards above say so themselves (hint?.,
+        // hint &&). A publisher discovered by the listparticipants sweep rather than by a
+        // publishers event never gets one, because Janus does not report streams there -
+        // which is precisely when callers pass force:true and skip those guards. So this
+        // line threw, before the log below, into a caller that swallowed it: audio
+        // recovery silently never ran for exactly the feeds that needed it, leaving
+        // nothing in the log to find. No hint means "subscribe to whatever they
+        // publish", which is what normalizeSubscribeStreams returns for undefined.
+        let streams = this.normalizeSubscribeStreams(hint?.streams, feedId);
         if (preferVideoOnly) {
             streams = this.selectVideoPreferredSubscribeStreams(streams, feedId);
         }
@@ -1615,7 +2321,29 @@ window.webrtcManager = {
         return this.participantAvatarDirectory[key] || '';
     },
 
+    /**
+     * Memoized on the raw display string — a feed's display is immutable for its lifetime, and
+     * this sits under getFeedRole/getFeedIdentityKey, which run per feed per sibling per pass.
+     *
+     * The returned object is SHARED between callers. Treat it as read-only.
+     */
     parsePublisherDisplay(display) {
+        if (!display || typeof display !== 'string') {
+            return { userId: '', displayName: '', role: '' };
+        }
+
+        const cache = this._displayParseCache || (this._displayParseCache = new Map());
+        const cached = cache.get(display);
+        if (cached) return cached;
+
+        const parsed = this.parsePublisherDisplayUncached(display);
+        // Bounded: displays churn as publishers come and go over a long call.
+        if (cache.size >= this.displayParseCacheLimit) cache.clear();
+        cache.set(display, parsed);
+        return parsed;
+    },
+
+    parsePublisherDisplayUncached(display) {
         const fallback = { userId: '', displayName: '', role: '' };
         if (!display || typeof display !== 'string') return fallback;
 
@@ -1846,28 +2574,230 @@ window.webrtcManager = {
         }
     },
 
-    scheduleCellOverlayHide(cell, delayMs = 5000) {
+    hideCellOverlayControls(cell) {
         if (!cell) return;
         this.clearCellOverlayHideTimer(cell);
-        const hideDelay = Math.max(400, parseInt(delayMs, 10) || 5000);
+        cell.classList.remove('controls-visible');
+    },
+
+    scheduleCellOverlayHide(cell, delayMs = null) {
+        if (!cell) return;
+        this.clearCellOverlayHideTimer(cell);
+        // Fullscreen turns the cell into the whole screen, where a lingering
+        // toolbar is far more intrusive - hide it faster there.
+        const isFullscreenCell = document.fullscreenElement === cell;
+        const fallbackDelay = isFullscreenCell ? 3000 : 5000;
+        const hideDelay = Math.max(400, parseInt(delayMs, 10) || fallbackDelay);
         const timer = setTimeout(() => {
             this.controlOverlayHideTimers.delete(cell);
             if (!cell.isConnected) return;
             const activeElement = document.activeElement;
-            if (activeElement && cell.contains(activeElement)) return;
+            if (activeElement && cell.contains(activeElement)) {
+                // Keyboard focus pins the overlay (someone tabbing through the
+                // controls must not have them vanish mid-navigation)...
+                let keyboardFocus = false;
+                try { keyboardFocus = activeElement.matches(':focus-visible'); } catch { }
+                if (keyboardFocus) return;
+
+                // ...but a mouse/touch click parks focus on the button it hit, and
+                // in fullscreen that residual focus must not hold the overlay open.
+                if (document.fullscreenElement === cell) {
+                    try { activeElement.blur(); } catch { }
+                } else {
+                    return;
+                }
+            }
             cell.classList.remove('controls-visible');
         }, hideDelay);
         this.controlOverlayHideTimers.set(cell, timer);
     },
 
+    // ─── Per-cell video zoom (wheel / pinch / drag-pan) ────────────────────────
+    //
+    // The transform is published as a CSS custom property on the cell and applied
+    // by CSS to BOTH the <video> and the annotation canvas, so drawn ink stays
+    // registered with the frame while zoomed. State lives per cell element; a
+    // removed cell takes its state with it.
+
+    cellZoomStates: new WeakMap(),
+
+    getCellZoom(cell) {
+        return this.cellZoomStates.get(cell) || { s: 1, tx: 0, ty: 0 };
+    },
+
+    setCellZoom(cell, s, tx, ty) {
+        if (!cell) return;
+        s = Math.min(8, Math.max(1, s));
+
+        // Clamp the pan so the (scaled) video always covers the cell - no gaps.
+        const rect = cell.getBoundingClientRect();
+        tx = Math.min(0, Math.max(rect.width * (1 - s), tx));
+        ty = Math.min(0, Math.max(rect.height * (1 - s), ty));
+
+        if (s <= 1.001) {
+            this.cellZoomStates.delete(cell);
+            cell.classList.remove('video-zoomed');
+            cell.style.removeProperty('--video-zoom');
+            this.updateZoomBadge(cell, 1);
+            return;
+        }
+
+        this.cellZoomStates.set(cell, { s, tx, ty });
+        cell.classList.add('video-zoomed');
+        cell.style.setProperty('--video-zoom', `translate(${tx}px, ${ty}px) scale(${s})`);
+        this.updateZoomBadge(cell, s);
+    },
+
+    /// Zooms keeping the content under (clientX, clientY) stationary.
+    zoomCellAt(cell, clientX, clientY, factor) {
+        const rect = cell.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+
+        const { s, tx, ty } = this.getCellZoom(cell);
+        const ns = Math.min(8, Math.max(1, s * factor));
+        const cx = clientX - rect.left;
+        const cy = clientY - rect.top;
+        const contentX = (cx - tx) / s;
+        const contentY = (cy - ty) / s;
+        this.setCellZoom(cell, ns, cx - (contentX * ns), cy - (contentY * ns));
+    },
+
+    updateZoomBadge(cell, scale) {
+        let badge = cell.querySelector('.video-zoom-badge');
+        if (scale <= 1.001) {
+            badge?.remove();
+            return;
+        }
+
+        if (!badge) {
+            badge = document.createElement('button');
+            badge.type = 'button';
+            badge.className = 'video-zoom-badge';
+            badge.title = 'Reset zoom';
+            badge.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                this.setCellZoom(cell, 1, 0, 0);
+            });
+            cell.appendChild(badge);
+        }
+
+        badge.textContent = `${scale.toFixed(1)}×`;
+    },
+
+    isZoomExemptTarget(target) {
+        return !!(target.closest?.('.video-controls')
+            || target.closest?.('.video-info-panel')
+            || target.closest?.('.remote-volume-panel')
+            || target.closest?.('.video-zoom-badge')
+            || target.closest?.('.annotation-toolbar-host')
+            || target.closest?.('.annotation-toolbar'));
+    },
+
+    bindCellZoomInteraction(cell) {
+        if (!cell || cell.dataset.zoomBound === '1') return;
+        cell.dataset.zoomBound = '1';
+
+        // Wheel: Ctrl+wheel anywhere (the desktop zoom convention); plain wheel
+        // only in fullscreen, where there is nothing else the wheel could scroll.
+        cell.addEventListener('wheel', (ev) => {
+            const isFullscreen = document.fullscreenElement === cell;
+            if (!ev.ctrlKey && !isFullscreen) return;
+            if (this.isZoomExemptTarget(ev.target)) return;
+
+            ev.preventDefault();
+            const factor = Math.exp(-ev.deltaY * 0.0015);
+            this.zoomCellAt(cell, ev.clientX, ev.clientY, factor);
+        }, { passive: false });
+
+        // Pointer gestures: two pointers pinch, one pointer pans once zoomed in.
+        // While annotation drawing is active the canvas captures its pointerdowns
+        // and stops propagation, so drawing naturally wins over pan - wheel zoom
+        // still works because wheel events keep bubbling.
+        const activePointers = new Map();
+        let pinchOrigin = null;
+        let panOrigin = null;
+        let gestureMoved = false;
+
+        cell.addEventListener('pointerdown', (ev) => {
+            if (this.isZoomExemptTarget(ev.target)) return;
+
+            activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+            const zoom = this.getCellZoom(cell);
+
+            if (activePointers.size === 2) {
+                const [a, b] = [...activePointers.values()];
+                pinchOrigin = {
+                    dist: Math.hypot(a.x - b.x, a.y - b.y),
+                    s: zoom.s, tx: zoom.tx, ty: zoom.ty
+                };
+                panOrigin = null;
+            } else if (activePointers.size === 1 && zoom.s > 1) {
+                panOrigin = { x: ev.clientX, y: ev.clientY, tx: zoom.tx, ty: zoom.ty };
+                gestureMoved = false;
+                try { cell.setPointerCapture(ev.pointerId); } catch { }
+            }
+        });
+
+        cell.addEventListener('pointermove', (ev) => {
+            if (!activePointers.has(ev.pointerId)) return;
+            activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+            if (activePointers.size === 2 && pinchOrigin?.dist > 0) {
+                const [a, b] = [...activePointers.values()];
+                const dist = Math.hypot(a.x - b.x, a.y - b.y);
+                if (dist <= 0) return;
+
+                const rect = cell.getBoundingClientRect();
+                const centerX = ((a.x + b.x) / 2) - rect.left;
+                const centerY = ((a.y + b.y) / 2) - rect.top;
+                const ns = Math.min(8, Math.max(1, pinchOrigin.s * (dist / pinchOrigin.dist)));
+                const contentX = (centerX - pinchOrigin.tx) / pinchOrigin.s;
+                const contentY = (centerY - pinchOrigin.ty) / pinchOrigin.s;
+                this.setCellZoom(cell, ns, centerX - (contentX * ns), centerY - (contentY * ns));
+                gestureMoved = true;
+                ev.preventDefault();
+            } else if (panOrigin) {
+                const dx = ev.clientX - panOrigin.x;
+                const dy = ev.clientY - panOrigin.y;
+                if (Math.abs(dx) + Math.abs(dy) > 4) gestureMoved = true;
+                const zoom = this.getCellZoom(cell);
+                this.setCellZoom(cell, zoom.s, panOrigin.tx + dx, panOrigin.ty + dy);
+                ev.preventDefault();
+            }
+        });
+
+        const endPointer = (ev) => {
+            activePointers.delete(ev.pointerId);
+            if (activePointers.size < 2) pinchOrigin = null;
+            if (activePointers.size === 0) panOrigin = null;
+
+            if (gestureMoved) {
+                gestureMoved = false;
+                // The click that follows a drag/pinch must not toggle spotlight.
+                cell.dataset.suppressTileClick = '1';
+                setTimeout(() => cell.removeAttribute('data-suppress-tile-click'), 150);
+            }
+        };
+        cell.addEventListener('pointerup', endPointer);
+        cell.addEventListener('pointercancel', endPointer);
+    },
+
     bindCellOverlayAutoHide(cell) {
         if (!cell || cell.dataset.overlayAutoHideBound === '1') return;
 
-        const reveal = () => this.showCellOverlayControls(cell, true);
-        const hideNow = () => {
-            this.clearCellOverlayHideTimer(cell);
-            cell.classList.remove('controls-visible');
+        // Every interactive cell also gets the zoom gestures; both binders guard
+        // against double-binding themselves.
+        this.bindCellZoomInteraction(cell);
+
+        // A stroke in progress must never summon the overlay. The annotation canvas
+        // stops its own pointer events, but a reveal can still be reached by a move
+        // that began outside it - and the toolbar fading in under the user's finger
+        // halfway through a line is exactly what they are trying to avoid.
+        const reveal = () => {
+            if (window.screenAnnotation?.isDrawing?.()) return;
+            this.showCellOverlayControls(cell, true);
         };
+        const hideNow = () => this.hideCellOverlayControls(cell);
 
         cell.addEventListener('mouseenter', reveal);
         cell.addEventListener('mousemove', reveal);
@@ -1892,7 +2822,14 @@ window.webrtcManager = {
             if (cell.dataset.allowTileSpotlight !== '1') {
                 return;
             }
-            if (ev.target.closest('.video-controls') || ev.target.closest('.video-info-panel')) {
+            // A pan/pinch gesture ends in a click; that click is not a request to
+            // change the spotlight.
+            if (cell.dataset.suppressTileClick === '1') {
+                return;
+            }
+            if (ev.target.closest('.video-controls')
+                || ev.target.closest('.video-info-panel')
+                || ev.target.closest('.annotation-toolbar-host')) {
                 return;
             }
             this.toggleSpotlight(streamKey);
@@ -1985,6 +2922,10 @@ window.webrtcManager = {
     },
 
     localHasVisibleVideoTrack() {
+        if (this.currentConstraints?.hideLocalPreview === true) {
+            return false;
+        }
+
         const activeStream = this.isScreenSharing && this.screenStream ? this.screenStream : this.localStream;
         if (!activeStream) return false;
 
@@ -1995,6 +2936,30 @@ window.webrtcManager = {
         if (!hasLiveVideo) return false;
         if (!this.isScreenSharing && this.isCameraOff) return false;
         return true;
+    },
+
+    applyLocalPreviewVisibility() {
+        const cell = document.querySelector('#videoGrid .local-cell');
+        const hidden = this.currentConstraints?.hideLocalPreview === true;
+        if (cell) {
+            cell.classList.toggle('local-preview-hidden', hidden);
+        }
+    },
+
+    setLocalPreviewHidden(hidden) {
+        const nextHidden = !!hidden;
+        if ((this.currentConstraints?.hideLocalPreview === true) === nextHidden) {
+            this.updateLocalFeedAvatarFallback();
+            return;
+        }
+
+        this.currentConstraints.hideLocalPreview = nextHidden;
+        this.updateLocalFeedAvatarFallback();
+        this.notifyDotNet('OnHideLocalPreviewChanged', nextHidden);
+    },
+
+    toggleLocalPreviewHidden() {
+        this.setLocalPreviewHidden(!(this.currentConstraints?.hideLocalPreview === true));
     },
 
     ensureLocalFeedAvatarFallback() {
@@ -2048,7 +3013,10 @@ window.webrtcManager = {
 
         const fallback = this.ensureLocalFeedAvatarFallback();
         if (!fallback) return;
+        const controls = cell.querySelector('.video-controls');
+        this.ensureLocalFeedVisibilityControl(controls);
 
+        this.applyLocalPreviewVisibility();
         const hasVideo = this.localHasVisibleVideoTrack();
         fallback.classList.toggle('visible', !hasVideo);
         cell.classList.toggle('video-cell-no-video', !hasVideo);
@@ -2122,6 +3090,7 @@ window.webrtcManager = {
             cell.appendChild(controls);
         }
         this.ensureSpotlightButton(controls, 'local');
+        this.ensureLocalFeedVisibilityControl(controls);
 
         let infoBtn = controls.querySelector('.video-info-btn');
         if (!infoBtn) {
@@ -2145,6 +3114,26 @@ window.webrtcManager = {
         this.applySpotlightLayout();
     },
 
+    ensureLocalFeedVisibilityControl(controls) {
+        if (!controls) return;
+
+        let button = controls.querySelector('.video-visibility-btn.local-visibility-btn');
+        if (!button) {
+            button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'video-control-btn video-visibility-btn local-visibility-btn';
+            button.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                this.toggleLocalPreviewHidden();
+            });
+            controls.insertBefore(button, controls.firstChild || null);
+        }
+
+        const hidden = this.currentConstraints?.hideLocalPreview === true;
+        button.textContent = hidden ? 'Show' : 'Hide';
+        button.classList.toggle('active', hidden);
+    },
+
     createStreamInfoPanel(streamKey) {
         const panel = document.createElement('div');
         panel.className = 'video-info-panel';
@@ -2160,6 +3149,7 @@ window.webrtcManager = {
             '<div class="video-info-row"><span>Encoder</span><strong data-field="encoderImpl">n/a</strong></div>',
             '<div class="video-info-row"><span>Decoder</span><strong data-field="decoderImpl">n/a</strong></div>',
             '<div class="video-info-row"><span>GPU Enc/Dec</span><strong data-field="gpuAccel">n/a</strong></div>',
+            '<div class="video-info-row"><span>Transport</span><strong data-field="transport">n/a</strong></div>',
             '<div class="video-info-row"><span>Updated</span><strong data-field="updated">-</strong></div>'
         ].join('');
         return panel;
@@ -2229,6 +3219,13 @@ window.webrtcManager = {
     },
 
     async refreshOpenStreamInfoPanels() {
+        const nowMs = Date.now();
+        const minRefreshIntervalMs = this.isAppVisible() ? 1500 : 5000;
+        if ((nowMs - (this.lastStreamInfoRefreshAtMs || 0)) < minRefreshIntervalMs) {
+            return;
+        }
+        this.lastStreamInfoRefreshAtMs = nowMs;
+
         const keys = Object.keys(this.openStreamInfoPanels);
         for (const streamKey of keys) {
             const cell = this.getStreamCell(streamKey);
@@ -2260,6 +3257,7 @@ window.webrtcManager = {
         const encoderImplEl = panel.querySelector('[data-field="encoderImpl"]');
         const decoderImplEl = panel.querySelector('[data-field="decoderImpl"]');
         const gpuAccelEl = panel.querySelector('[data-field="gpuAccel"]');
+        const transportEl = panel.querySelector('[data-field="transport"]');
         const updatedEl = panel.querySelector('[data-field="updated"]');
 
         if (bitrateEl) {
@@ -2291,6 +3289,9 @@ window.webrtcManager = {
         }
         if (gpuAccelEl) {
             gpuAccelEl.textContent = stats.gpuEncodeDecode || 'n/a';
+        }
+        if (transportEl) {
+            transportEl.textContent = stats.transport || 'n/a';
         }
         if (updatedEl) {
             updatedEl.textContent = stats.updatedAt || '-';
@@ -2540,6 +3541,7 @@ window.webrtcManager = {
             encoderImplementation: 'n/a',
             decoderImplementation: 'n/a',
             gpuEncodeDecode: 'n/a',
+            transport: 'n/a',
             updatedAt: new Date().toLocaleTimeString()
         };
 
@@ -2623,11 +3625,33 @@ window.webrtcManager = {
             }
 
             snapshot.resolution = this.getResolutionForStream(streamKey, videoReport);
+            snapshot.transport = this.getTransportInfoFromStats(stats);
         } catch (err) {
             this.log('stats', `getStats failed for ${streamKey}: ${err.message}`);
         }
 
         return snapshot;
+    },
+
+    getTransportInfoFromStats(stats) {
+        // Find the active (nominated/succeeded) candidate pair
+        let activePair = null;
+        stats.forEach(report => {
+            if (report.type === 'candidate-pair' && (report.nominated || report.state === 'succeeded')) {
+                activePair = report;
+            }
+        });
+        if (!activePair) return 'n/a';
+
+        const localCandidate = stats.get(activePair.localCandidateId);
+        const remoteCandidate = stats.get(activePair.remoteCandidateId);
+        const localType = localCandidate?.candidateType || '?';
+        const remoteType = remoteCandidate?.candidateType || '?';
+        const protocol = (localCandidate?.protocol || activePair.transportId || '').toUpperCase();
+
+        const isTurn = localType === 'relay' || remoteType === 'relay';
+        const label = isTurn ? 'TURN (relay)' : localType === 'host' && remoteType === 'host' ? 'Direct (host)' : `${localType}/${remoteType}`;
+        return protocol ? `${label} [${protocol}]` : label;
     },
 
     getCodecFromSdp(sdp, kind) {
@@ -2811,6 +3835,39 @@ window.webrtcManager = {
         throw lastError || new Error(`${scope}: Failed to set local description`);
     },
 
+    getH264PreferenceWeightForCodec(codec, effectivePreference) {
+        if (!codec) {
+            return 0;
+        }
+
+        const fmtp = (codec?.sdpFmtpLine || '').toString();
+        const details = this.parseH264CodecDescriptor(fmtp);
+        if (!details.profileLevelId) {
+            return 0;
+        }
+
+        let bonus = 0;
+        if (effectivePreference?.profileLevelId && details.profileLevelId === effectivePreference.profileLevelId) {
+            bonus += 10_000;
+            if (effectivePreference.packetizationMode !== null
+                && details.packetizationMode === effectivePreference.packetizationMode) {
+                bonus += 2_000;
+            }
+        }
+
+        return bonus + this.getH264CodecPreferenceScore(details.profileLevelId, details.packetizationMode);
+    },
+
+    orderH264CodecsByPreference(codecs, effectivePreference) {
+        if (!Array.isArray(codecs) || codecs.length <= 1) {
+            return Array.isArray(codecs) ? [...codecs] : [];
+        }
+
+        return [...codecs].sort((a, b) =>
+            this.getH264PreferenceWeightForCodec(b, effectivePreference)
+            - this.getH264PreferenceWeightForCodec(a, effectivePreference));
+    },
+
     findPublisherVideoTransceiver() {
         if (!this.publisherPc) return null;
         return this.publisherPc.getTransceivers().find(t =>
@@ -2869,15 +3926,25 @@ window.webrtcManager = {
 
             let preferredCodecs = primaryCodecs.filter(c => isMime(c, preferredMimes));
             let fallbackCodecs = [];
+            const effectiveH264Preference = this.resolveEffectiveH264Override();
 
             // H265 preferred: fallback to H264 only.
             if (preferred === 'h265') {
                 fallbackCodecs = primaryCodecs.filter(c => isMime(c, h264Mimes) && !preferredCodecs.includes(c));
+                fallbackCodecs = this.orderH264CodecsByPreference(fallbackCodecs, effectiveH264Preference);
             }
 
             // H264 preferred: fallback to VP8 only.
             if (preferred === 'h264') {
+                preferredCodecs = this.orderH264CodecsByPreference(preferredCodecs, effectiveH264Preference);
                 fallbackCodecs = primaryCodecs.filter(c => isMime(c, vp8Mimes) && !preferredCodecs.includes(c));
+                if (effectiveH264Preference.profileLevelId) {
+                    const mode = effectiveH264Preference.packetizationMode ?? 0;
+                    this.log(
+                        'codec',
+                        `${scope}: prioritizing H264 profile ${effectiveH264Preference.profileLevelId} pm=${mode}${this.currentConstraints?.h264ProfileOverride ? ' (explicit)' : ' (auto default)'}`
+                    );
+                }
             }
 
             if (preferredCodecs.length === 0) {
@@ -3099,8 +4166,45 @@ window.webrtcManager = {
                 this.notifyHostDesktopFullscreen('exit');
                 this._desktopFullscreenRequested = false;
             }
+
+            // Entering fullscreen on a video cell: the click that launched it left
+            // focus on the fullscreen button, which would pin the controls overlay
+            // open. Drop that residual focus and start the auto-hide cycle.
+            const fullscreenCell = document.fullscreenElement;
+            if (fullscreenCell && fullscreenCell.classList?.contains('video-cell')) {
+                const active = document.activeElement;
+                if (active && fullscreenCell.contains(active)) {
+                    let keyboardFocus = false;
+                    try { keyboardFocus = active.matches(':focus-visible'); } catch { }
+                    if (!keyboardFocus) {
+                        try { active.blur(); } catch { }
+                    }
+                }
+                // Element fullscreen renders only the cell's subtree, so anything
+                // outside it - including the annotation toolbar - is invisible.
+                // Physically move the toolbar host into the cell for the duration.
+                const toolbarHost = document.getElementById('annotationToolbarHost');
+                if (toolbarHost && !fullscreenCell.contains(toolbarHost)) {
+                    fullscreenCell.appendChild(toolbarHost);
+                }
+                this.showCellOverlayControls(fullscreenCell, true);
+            } else {
+                this.restoreAnnotationToolbarHost();
+            }
         };
         document.addEventListener('fullscreenchange', this._fullscreenChangeHandler);
+    },
+
+    /// Returns the annotation toolbar host to its Blazor anchor after it was
+    /// reparented into a fullscreen cell. Must run before remote cells are torn
+    /// down, or the host would be deleted along with the cell it sits in.
+    restoreAnnotationToolbarHost() {
+        const toolbarHost = document.getElementById('annotationToolbarHost');
+        const anchor = document.getElementById('annotationToolbarAnchor');
+        if (!toolbarHost || !anchor || toolbarHost.previousElementSibling === anchor) {
+            return;
+        }
+        try { anchor.insertAdjacentElement('afterend', toolbarHost); } catch { }
     },
 
     removeFullscreenSyncListener() {
@@ -3166,6 +4270,14 @@ window.webrtcManager = {
         return new Promise(r => setTimeout(r, ms));
     },
 
+    isAppVisible() {
+        try {
+            return typeof document === 'undefined' || !document.hidden;
+        } catch {
+            return true;
+        }
+    },
+
     log(area, msg, ...extra) {
         console.log(`[WebRTC:${area}]`, msg, ...extra);
     },
@@ -3173,6 +4285,89 @@ window.webrtcManager = {
     logError(area, msg, ...extra) {
         console.error(`[WebRTC:${area}]`, msg, ...extra);
         this.notifyDotNet('OnError', `${area}: ${msg}`);
+    },
+
+    // ─── Trickle ICE batching ───────────────────────────────────────────────────
+    //
+    // Every gathered candidate used to be its own authenticated POST. On a Windows host with
+    // VPN/Hyper-V adapters that is 15-30 requests per PeerConnection during gathering, and a
+    // call opens one PC per remote feed. Candidates are buffered per handle and flushed as a
+    // single array; end-of-candidates is never delayed, because holding it back stalls ICE.
+
+    _trickleBatches: null,
+    trickleBatchWindowMs: 50,
+
+    getTrickleBatch(handleId) {
+        const key = String(handleId || '');
+        if (!key) return null;
+
+        const batches = this._trickleBatches || (this._trickleBatches = new Map());
+        let batch = batches.get(key);
+        if (!batch) {
+            batch = { key, candidates: [], timerId: 0, chain: Promise.resolve() };
+            batches.set(key, batch);
+        }
+        return batch;
+    },
+
+    queueTrickleCandidate(handleId, candidate) {
+        const batch = this.getTrickleBatch(handleId);
+        if (!batch) return;
+
+        if (candidate) {
+            batch.candidates.push(candidate);
+            if (!batch.timerId) {
+                batch.timerId = setTimeout(() => this.flushTrickleBatch(batch.key), this.trickleBatchWindowMs);
+            }
+            return;
+        }
+
+        // End-of-candidates: drain what is buffered, then send the terminator. Both go on the
+        // per-handle chain so neither can overtake a batch that is already in flight.
+        this.flushTrickleBatch(batch.key);
+        this.enqueueTricklePost(batch, null);
+    },
+
+    flushTrickleBatch(handleId) {
+        const key = String(handleId || '');
+        const batch = this._trickleBatches?.get(key);
+        if (!batch) return;
+
+        if (batch.timerId) {
+            clearTimeout(batch.timerId);
+            batch.timerId = 0;
+        }
+
+        if (batch.candidates.length === 0) return;
+
+        // A lone candidate still posts in the original single-object shape.
+        const payload = batch.candidates.length === 1 ? batch.candidates[0] : batch.candidates;
+        batch.candidates = [];
+        this.enqueueTricklePost(batch, payload);
+    },
+
+    enqueueTricklePost(batch, payload) {
+        batch.chain = batch.chain
+            .then(() => this.apiPost(
+                `/api/janus/session/${this.janusSessionId}/handle/${batch.key}/trickle`,
+                payload))
+            .catch(err => this.log('trickle', `ICE trickle failed for handle ${batch.key}: ${err.message}`));
+    },
+
+    clearTrickleBatch(handleId) {
+        const key = String(handleId || '');
+        const batch = this._trickleBatches?.get(key);
+        if (!batch) return;
+        if (batch.timerId) clearTimeout(batch.timerId);
+        this._trickleBatches.delete(key);
+    },
+
+    clearAllTrickleBatches() {
+        if (!this._trickleBatches) return;
+        for (const batch of this._trickleBatches.values()) {
+            if (batch.timerId) clearTimeout(batch.timerId);
+        }
+        this._trickleBatches.clear();
     },
 
     async sendJanusBitrateConfigure(bitrateBps) {
@@ -3191,10 +4386,22 @@ window.webrtcManager = {
         }
     },
 
+    /// True once there is a publisher PeerConnection that Janus has answered, i.e. once
+    /// a local track can actually reach anyone. IsInCall goes true as soon as the hub
+    /// join returns, which is well before this.
+    isPublisherReadyForMedia() {
+        return !!this.publisherPc && this.publisherConfigured === true;
+    },
+
+    notifyPublisherReadyChanged() {
+        this.notifyDotNet('OnPublisherReadyChanged', this.isPublisherReadyForMedia());
+    },
+
     async markPublisherConfigured(source) {
         if (this.publisherConfigured) return;
         this.publisherConfigured = true;
         this.log('publish', `Publisher configured (${source})`);
+        this.notifyPublisherReadyChanged();
         this.startPublisherHealthWatchdog();
 
         if (this.pendingJanusBitrateBps > 0) {
@@ -3227,6 +4434,36 @@ window.webrtcManager = {
             try { this.iceServers = JSON.parse(config.iceServers); } catch { }
         }
 
+        this.currentConstraints.micDeviceId = config.micDeviceId || null;
+        this.currentConstraints.cameraDeviceId = config.cameraDeviceId || null;
+        this.currentConstraints.resolution = config.resolution || this.currentConstraints.resolution || '1280x720';
+        this.currentConstraints.fps = parseInt(config.fps, 10) || this.currentConstraints.fps || 30;
+        this.currentConstraints.bitrateKbps = this.clampPublisherBitrateKbps(
+            config.bitrateKbps ?? this.currentConstraints.bitrateKbps ?? 2000
+        );
+        this.currentConstraints.preferredVideoCodec = this.normalizeVideoCodec(
+            config.preferredVideoCodec || this.currentConstraints.preferredVideoCodec || 'h264'
+        );
+        this.currentConstraints.h264ProfileOverride = this.normalizeH264ProfileOverrideValue(
+            config.h264ProfileOverride
+        );
+        this.currentConstraints.hideLocalPreview = config.hideLocalPreview === true;
+        this.currentConstraints.screenShareAudioEnabled = config.screenShareAudioEnabled !== false;
+        this.currentConstraints.screenShareAutoGainEnabled = config.screenShareAutoGainEnabled !== false;
+        this.currentConstraints.noiseSuppressionEnabled = config.noiseSuppressionEnabled !== false;
+        this.currentConstraints.voiceGateEnabled = config.voiceGateEnabled === true;
+        this.currentConstraints.voiceGateAuto = config.voiceGateAuto !== false;
+        this.currentConstraints.voiceGateThreshold = parseInt(config.voiceGateThreshold, 10) || 30;
+
+        const effectiveH264 = this.resolveEffectiveH264Override();
+        if (this.currentConstraints.preferredVideoCodec === 'h264' && effectiveH264.profileLevelId) {
+            const mode = effectiveH264.packetizationMode ?? 0;
+            this.log(
+                'codec',
+                `init: H264 profile preference ${effectiveH264.profileLevelId} pm=${mode}${this.currentConstraints.h264ProfileOverride ? ' (explicit)' : ' (auto default)'}`
+            );
+        }
+
         this.isMuted = true;
         this.isCameraOff = true;
         this.isScreenSharing = false;
@@ -3243,6 +4480,11 @@ window.webrtcManager = {
         this.stopPublisherHealthWatchdog();
         this.clearScreenShareBitrateWarmupTimers();
         this.controlOverlayHideTimers = new WeakMap();
+        this.lastParticipantCheckAtMs = 0;
+        this.lastRemoteFeedHealthRunAtMs = 0;
+        this.lastStreamInfoRefreshAtMs = 0;
+        this.remoteFeedHealthCursor = 0;
+        this.resetRemoteSpeakingState();
 
         this.log('init', `session=${config.janusSessionId}, handle=${config.janusHandleId}, room=${config.janusRoomId}`);
         this.log('init', `serverBaseUrl=${config.serverBaseUrl}`);
@@ -3300,20 +4542,19 @@ window.webrtcManager = {
     // ─── Media ──────────────────────────────────────────────────────────────────
 
     async startLocalStream(constraints) {
+        this.removeLocalSpeakingAnalyzer();
         if (this.localStream) {
             this.localStream.getTracks().forEach(t => t.stop());
         }
+        // setupAudioPipeline pulls the raw capture track out of localStream, so the loop above
+        // never reaches it — it has to be released explicitly or the mic stays open.
+        this.releaseRawMicTrack();
 
         // Merge with stored constraints
         if (constraints) {
             Object.assign(this.currentConstraints, constraints);
         }
-        const c = this.currentConstraints;
-        c.preferredVideoCodec = this.normalizeVideoCodec(c.preferredVideoCodec);
-        this.enforceAndroidHardwareCodecPreference('startLocalStream');
-        c.screenShareAudioEnabled = c.screenShareAudioEnabled !== false;
-        c.screenShareAutoGainEnabled = c.screenShareAutoGainEnabled !== false;
-        c.bitrateKbps = this.clampPublisherBitrateKbps(c.bitrateKbps);
+        const c = this.normalizeCurrentConstraints('startLocalStream');
 
         // Parse resolution
         let width = 1280, height = 720;
@@ -3327,9 +4568,11 @@ window.webrtcManager = {
 
         const fps = parseInt(c.fps) || 30;
 
+        // Always disable browser's native noiseSuppression — DTLN handles it via AudioWorklet when enabled.
+        const noiseSuppression = false;
         const audioConstraint = c.micDeviceId
-            ? { deviceId: { exact: c.micDeviceId } }
-            : true;
+            ? { deviceId: { exact: c.micDeviceId }, noiseSuppression, echoCancellation: true, autoGainControl: true }
+            : { noiseSuppression, echoCancellation: true, autoGainControl: true };
 
         const videoConstraint = {
             width: { ideal: width },
@@ -3355,10 +4598,12 @@ window.webrtcManager = {
             }
         ];
 
+        const defaultAudioConstraint = { noiseSuppression, echoCancellation: true, autoGainControl: true };
+
         if (c.micDeviceId || c.cameraDeviceId) {
             attempts.push({
                 label: 'audio+video (default devices)',
-                constraints: { audio: true, video: defaultVideoConstraint }
+                constraints: { audio: defaultAudioConstraint, video: defaultVideoConstraint }
             });
         }
 
@@ -3370,7 +4615,7 @@ window.webrtcManager = {
         if (c.micDeviceId) {
             attempts.push({
                 label: 'audio-only (default mic)',
-                constraints: { audio: true, video: false }
+                constraints: { audio: defaultAudioConstraint, video: false }
             });
         }
 
@@ -3422,7 +4667,7 @@ window.webrtcManager = {
         this.ensureLocalFeedCellControls();
 
         // Set up audio volume control via Web Audio API
-        this.setupAudioPipeline();
+        await this.setupAudioPipeline();
 
         // Apply current mute/camera state
         this.localStream.getAudioTracks().forEach(t => t.enabled = !this.isMuted);
@@ -3432,16 +4677,65 @@ window.webrtcManager = {
             this.localStream.getVideoTracks().forEach(t => t.enabled = true);
         }
         this.updateLocalFeedAvatarFallback();
+        this.ensureLocalSpeakingAnalyzer();
     },
 
-    setupAudioPipeline() {
+    /** Coerce currentConstraints into their canonical shape. Shared by every path that mutates them. */
+    normalizeCurrentConstraints(scope) {
+        const c = this.currentConstraints;
+        c.preferredVideoCodec = this.normalizeVideoCodec(c.preferredVideoCodec);
+        c.h264ProfileOverride = this.normalizeH264ProfileOverrideValue(c.h264ProfileOverride);
+        c.hideLocalPreview = c.hideLocalPreview === true;
+        this.enforceAndroidHardwareCodecPreference(scope);
+        c.screenShareAudioEnabled = c.screenShareAudioEnabled !== false;
+        c.screenShareAutoGainEnabled = c.screenShareAutoGainEnabled !== false;
+        c.bitrateKbps = this.clampPublisherBitrateKbps(c.bitrateKbps);
+        return c;
+    },
+
+    /**
+     * The raw getUserMedia capture track. setupAudioPipeline swaps localStream's audio for the
+     * processed graph output, so this is the only remaining handle on the actual microphone —
+     * both for rebuilding the graph and for releasing the device.
+     */
+    _rawMicTrack: null,
+
+    releaseRawMicTrack() {
+        if (!this._rawMicTrack) return;
+        try { this._rawMicTrack.stop(); } catch { }
+        this._rawMicTrack = null;
+    },
+
+    // DTLN WASM state
+    _dtlnWasmBinary: null,
+    _dtlnWasmModule: null,
+    _dtlnWasmModuleCloneUnsupported: false,
+    _dtlnWorkletNode: null,
+    _dtlnWorkletReady: false,
+
+    async setupAudioPipeline() {
+        // Resolve the capture track BEFORE tearing anything down.
+        //
+        // After the first build, localStream's only audio track is this graph's own
+        // MediaStreamAudioDestinationNode output — the raw mic was swapped out below. Closing the
+        // context kills that output, so a rebuild that read localStream would feed the new graph
+        // a dead track and publish silence. Always go back to the retained capture track.
+        const audioTrack = (this._rawMicTrack && this._rawMicTrack.readyState === 'live')
+            ? this._rawMicTrack
+            : this.localStream?.getAudioTracks()[0];
+
         // Clean up previous
+        this.stopVoiceGate();
+        this._destroyDtlnWorklet();
         if (this.audioContext) {
             try { this.audioContext.close(); } catch { }
         }
 
-        const audioTrack = this.localStream?.getAudioTracks()[0];
-        if (!audioTrack) return;
+        if (!audioTrack || audioTrack.readyState !== 'live') {
+            this._rawMicTrack = null;
+            return;
+        }
+        this._rawMicTrack = audioTrack;
 
         this.audioContext = new AudioContext();
 
@@ -3454,15 +4748,44 @@ window.webrtcManager = {
         const source = this.audioContext.createMediaStreamSource(new MediaStream([audioTrack]));
         this.gainNode = this.audioContext.createGain();
 
+        // AnalyserNode for voice gate level detection
+        this.voiceGateAnalyser = this.audioContext.createAnalyser();
+        this.voiceGateAnalyser.fftSize = 512;
+        this.voiceGateAnalyser.smoothingTimeConstant = 0.3;
+
         // Route through a MediaStreamDestination so gain control works WITHOUT
         // playing audio through the speakers (which caused echo).
         this.audioDestination = this.audioContext.createMediaStreamDestination();
-        source.connect(this.gainNode);
+
+        // Build pipeline: source → [dtln?] → analyser → gain → destination
+        const useDtln = this.currentConstraints.noiseSuppressionEnabled === true;
+        let dtlnNode = null;
+
+        if (useDtln) {
+            try {
+                dtlnNode = await this._createDtlnWorkletNode();
+            } catch (err) {
+                this.logError('audio', 'Failed to create DTLN worklet, falling back: ' + err.message);
+            }
+        }
+
+        if (dtlnNode) {
+            source.connect(dtlnNode);
+            dtlnNode.connect(this.voiceGateAnalyser);
+            this.log('audio', 'DTLN noise suppression active (WASM AudioWorklet)');
+        } else {
+            source.connect(this.voiceGateAnalyser);
+        }
+        this.voiceGateAnalyser.connect(this.gainNode);
         this.gainNode.connect(this.audioDestination);
 
-        // Replace the raw audio track with the gain-processed track
+        // Publish the gain-processed track instead of the raw capture. On a rebuild the track
+        // being dropped here is the PREVIOUS graph's output, not the mic, so clear whatever is
+        // there rather than assuming it is `audioTrack`.
         const processedTrack = this.audioDestination.stream.getAudioTracks()[0];
-        this.localStream.removeTrack(audioTrack);
+        for (const existing of this.localStream.getAudioTracks()) {
+            this.localStream.removeTrack(existing);
+        }
         this.localStream.addTrack(processedTrack);
 
         // Also replace in publisher PeerConnection if already set up
@@ -3474,7 +4797,290 @@ window.webrtcManager = {
             }
         }
 
-        this.log('audio', 'Audio pipeline set up (gain → MediaStreamDestination, no echo)');
+        // Start voice gate if enabled
+        if (this.currentConstraints.voiceGateEnabled) {
+            this.startVoiceGate();
+        }
+
+        this.log('audio', `Audio pipeline set up (dtln=${!!dtlnNode}, voiceGate=${this.currentConstraints.voiceGateEnabled})`);
+    },
+
+    /**
+     * Resolve the DTLN WASM into whichever form this WebView can hand to the worklet.
+     *
+     * Preferred form is a compiled WebAssembly.Module: it costs far less resident memory than
+     * the ~5.8 MB of raw bytes and skips re-compilation worklet-side on every pipeline rebuild.
+     * Raw bytes are kept only where a Module cannot be structured-cloned into an
+     * AudioWorkletGlobalScope.
+     */
+    async _ensureDtlnWasmSource() {
+        if (this._dtlnWasmModule || this._dtlnWasmBinary) return;
+
+        const resp = await fetch('js/dtln_rs.wasm');
+        if (!resp.ok) throw new Error(`Failed to fetch dtln_rs.wasm: ${resp.status}`);
+        const bytes = await resp.arrayBuffer();
+        this.log('audio', `DTLN WASM loaded (${(bytes.byteLength / 1024).toFixed(0)} KB)`);
+
+        if (!this._dtlnWasmModuleCloneUnsupported) {
+            try {
+                this._dtlnWasmModule = await WebAssembly.compile(bytes);
+                return; // raw bytes drop out of scope here
+            } catch (err) {
+                this.log('audio', `DTLN WASM compile failed, keeping raw bytes: ${err.message}`);
+            }
+        }
+
+        this._dtlnWasmBinary = bytes;
+    },
+
+    async _postDtlnWasmSource(node) {
+        await this._ensureDtlnWasmSource();
+
+        if (this._dtlnWasmModule) {
+            try {
+                node.port.postMessage({ type: 'wasm-binary', wasmBinary: this._dtlnWasmModule });
+                return;
+            } catch (err) {
+                // postMessage throws DataCloneError synchronously where Module cloning into an
+                // AudioWorkletGlobalScope is unsupported — use that as the feature detect.
+                this.log('audio', `DTLN Module clone unsupported, falling back to bytes: ${err.message}`);
+                this._dtlnWasmModuleCloneUnsupported = true;
+                this._dtlnWasmModule = null;
+                await this._ensureDtlnWasmSource();
+            }
+        }
+
+        const bytes = this._dtlnWasmBinary;
+        if (!bytes) throw new Error('DTLN WASM unavailable');
+        const copy = bytes.slice(0);
+        node.port.postMessage({ type: 'wasm-binary', wasmBinary: copy }, [copy]);
+    },
+
+    async _createDtlnWorkletNode() {
+        const ctx = this.audioContext;
+
+        // Register the worklet processor (idempotent — browser caches it)
+        await ctx.audioWorklet.addModule('js/dtln-worklet.js');
+
+        // Create the worklet node
+        const node = new AudioWorkletNode(ctx, 'dtln-processor', {
+            processorOptions: { sampleRate: ctx.sampleRate },
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [1],
+        });
+
+        // Wait for the worklet to request and initialize the WASM
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('DTLN worklet init timeout')), 10000);
+            node.port.onmessage = (e) => {
+                if (e.data.type === 'request-wasm') {
+                    this._postDtlnWasmSource(node).catch(err => {
+                        clearTimeout(timeout);
+                        reject(err);
+                    });
+                } else if (e.data.type === 'ready') {
+                    clearTimeout(timeout);
+                    resolve();
+                } else if (e.data.type === 'error') {
+                    clearTimeout(timeout);
+                    reject(new Error(e.data.error));
+                }
+            };
+        });
+
+        this._dtlnWorkletNode = node;
+        this._dtlnWorkletReady = true;
+        return node;
+    },
+
+    _destroyDtlnWorklet() {
+        if (this._dtlnWorkletNode) {
+            // Drop the port handler first — it closes over `node` and the WASM source.
+            try { this._dtlnWorkletNode.port.onmessage = null; } catch { }
+            try { this._dtlnWorkletNode.port.close(); } catch { }
+            try { this._dtlnWorkletNode.disconnect(); } catch { }
+            this._dtlnWorkletNode = null;
+        }
+        this._dtlnWorkletReady = false;
+    },
+
+    /**
+     * Release the cached DTLN WASM. Called on manager stop — keeping it across a call avoids
+     * a re-fetch on every settings save, but nothing should retain it once the call is over.
+     */
+    releaseDtlnWasmCache() {
+        this._dtlnWasmBinary = null;
+        this._dtlnWasmModule = null;
+    },
+
+    // ─── Voice Gate ──────────────────────────────────────────────────────────────
+
+    _voiceGateOpen: true,
+    _voiceGateHoldUntil: 0,
+    _voiceGateTimerId: 0,
+    // 50 Hz — far under the 5ms attack / 250ms hold constants, and independent of refresh rate.
+    voiceGatePollIntervalMs: 20,
+    _voiceGateRmsBuffer: null,
+    _voiceGateAutoFloor: 0, // tracked ambient noise floor (RMS)
+    _voiceGateAutoFloorSamples: 0,
+
+    startVoiceGate() {
+        this.stopVoiceGate();
+        if (!this.voiceGateAnalyser) return;
+
+        const bufLen = this.voiceGateAnalyser.fftSize;
+        this._voiceGateRmsBuffer = new Float32Array(bufLen);
+        this._voiceGateOpen = true;
+        this._voiceGateHoldUntil = 0;
+        this._voiceGateAutoFloor = 0;
+        this._voiceGateAutoFloorSamples = 0;
+
+        const holdMs = 250; // keep gate open 250ms after voice stops
+        const attackMs = 5; // near-instant gate open
+        const releaseMs = 40; // smooth gate close to avoid clicks
+        // Auto mode: multiplier above the noise floor to open the gate
+        const autoMargin = 2.5;
+
+        // The gate used to self-arm a requestAnimationFrame every frame, so it ran at display
+        // refresh rate — 2.75x more often than intended on a 165 Hz panel, and it kept the frame
+        // loop scheduled for the whole call even in an audio-only call. It now runs on a fixed
+        // tick. The floor-tracking constants below were tuned per frame at a nominal 60 Hz, so
+        // re-express them for the tick or the adaptation rate changes with it.
+        const tickMs = this.voiceGatePollIntervalMs;
+        const framesPerTick = 60 / (1000 / tickMs);
+        const floorDecay = Math.pow(0.997, framesPerTick);
+        const floorRise = 1 - Math.pow(1 - 0.03, framesPerTick);
+        const calibrationTicks = Math.max(1, Math.round(0.5 * (1000 / tickMs))); // ~0.5s
+
+        const poll = () => {
+            if (!this.voiceGateAnalyser || !this._voiceGateRmsBuffer) {
+                // Previously the rAF chain simply stopped rescheduling here, which could strand
+                // the gain at 0. stopVoiceGate restores it.
+                this.stopVoiceGate();
+                return;
+            }
+
+            this.voiceGateAnalyser.getFloatTimeDomainData(this._voiceGateRmsBuffer);
+
+            // Compute RMS level
+            let sumSq = 0;
+            for (let i = 0; i < this._voiceGateRmsBuffer.length; i++) {
+                sumSq += this._voiceGateRmsBuffer[i] * this._voiceGateRmsBuffer[i];
+            }
+            const rms = Math.sqrt(sumSq / this._voiceGateRmsBuffer.length);
+
+            let threshold;
+            const isAuto = this.currentConstraints.voiceGateAuto !== false;
+
+            if (isAuto) {
+                // Auto mode: track ambient noise floor and set threshold above it
+                if (this._voiceGateAutoFloorSamples < calibrationTicks) {
+                    // Calibration phase (~0.5s): collect initial noise floor
+                    this._voiceGateAutoFloor = this._voiceGateAutoFloorSamples === 0
+                        ? rms
+                        : Math.max(this._voiceGateAutoFloor, rms);
+                    this._voiceGateAutoFloorSamples++;
+                    threshold = rms + 0.01; // keep gate open during calibration
+                } else {
+                    // Running: track floor — decays slowly, rises quickly if
+                    // ambient gets louder while gate is closed (not speaking)
+                    if (!this._voiceGateOpen && rms > this._voiceGateAutoFloor) {
+                        this._voiceGateAutoFloor += (rms - this._voiceGateAutoFloor) * floorRise;
+                    } else if (rms < this._voiceGateAutoFloor) {
+                        this._voiceGateAutoFloor *= floorDecay;
+                    }
+                    // Threshold = noise floor * margin, with a minimum floor
+                    const floor = Math.max(this._voiceGateAutoFloor, 0.001);
+                    threshold = floor * autoMargin;
+                }
+            } else {
+                // Manual mode: convert threshold (1-100) to RMS scale
+                threshold = (this.currentConstraints.voiceGateThreshold || 30) / 1000;
+            }
+
+            const now = performance.now();
+
+            if (rms >= threshold) {
+                // Signal above threshold — open gate
+                this._voiceGateHoldUntil = now + holdMs;
+                if (!this._voiceGateOpen) {
+                    this._voiceGateOpen = true;
+                    if (this.gainNode) {
+                        this.gainNode.gain.cancelScheduledValues(this.audioContext.currentTime);
+                        this.gainNode.gain.linearRampToValueAtTime(1.0, this.audioContext.currentTime + attackMs / 1000);
+                    }
+                }
+            } else if (now > this._voiceGateHoldUntil && this._voiceGateOpen) {
+                // Signal below threshold and hold expired — close gate
+                this._voiceGateOpen = false;
+                if (this.gainNode) {
+                    this.gainNode.gain.cancelScheduledValues(this.audioContext.currentTime);
+                    this.gainNode.gain.linearRampToValueAtTime(0.0, this.audioContext.currentTime + releaseMs / 1000);
+                }
+            }
+
+        };
+
+        this._voiceGateTimerId = setInterval(poll, tickMs);
+        const mode = this.currentConstraints.voiceGateAuto !== false ? 'auto' : `manual(${this.currentConstraints.voiceGateThreshold}%)`;
+        this.log('audio', `Voice gate started (${mode}, ${tickMs}ms tick)`);
+    },
+
+    stopVoiceGate() {
+        if (this._voiceGateTimerId) {
+            clearInterval(this._voiceGateTimerId);
+            this._voiceGateTimerId = 0;
+        }
+        this._voiceGateRmsBuffer = null;
+        this._voiceGateAutoFloor = 0;
+        this._voiceGateAutoFloorSamples = 0;
+        // Restore full gain when gate is disabled
+        if (this._voiceGateOpen === false && this.gainNode && this.audioContext) {
+            try {
+                this.gainNode.gain.cancelScheduledValues(this.audioContext.currentTime);
+                this.gainNode.gain.setValueAtTime(1.0, this.audioContext.currentTime);
+            } catch { }
+        }
+        this._voiceGateOpen = true;
+    },
+
+    getVoiceGateMicLevel() {
+        // Returns mic RMS level as 0-100 for UI display, plus the effective threshold
+        if (!this.voiceGateAnalyser) return { level: 0, threshold: 0 };
+
+        const bufLen = this.voiceGateAnalyser.fftSize;
+        const buf = this._voiceGateRmsBuffer || new Float32Array(bufLen);
+        this.voiceGateAnalyser.getFloatTimeDomainData(buf);
+
+        let sumSq = 0;
+        for (let i = 0; i < buf.length; i++) {
+            sumSq += buf[i] * buf[i];
+        }
+        const rms = Math.sqrt(sumSq / buf.length);
+
+        // Scale RMS to 0-100 (typical speech RMS ~0.01-0.1)
+        const level = Math.min(100, Math.round(rms * 1000));
+
+        let threshold;
+        const isAuto = this.currentConstraints.voiceGateAuto !== false;
+        if (isAuto) {
+            const floor = Math.max(this._voiceGateAutoFloor || 0, 0.001);
+            threshold = Math.min(100, Math.round(floor * 2.5 * 1000));
+        } else {
+            threshold = this.currentConstraints.voiceGateThreshold || 30;
+        }
+
+        return { level, threshold };
+    },
+
+    applyVoiceGateSettings() {
+        const enabled = this.currentConstraints.voiceGateEnabled === true;
+        if (enabled && !this._voiceGateTimerId && this.voiceGateAnalyser) {
+            this.startVoiceGate();
+        } else if (!enabled && this._voiceGateTimerId) {
+            this.stopVoiceGate();
+        }
     },
 
     async ensureAudioContextActive() {
@@ -3862,18 +5468,52 @@ window.webrtcManager = {
         return out;
     },
 
-    getInterleavedAudioStats(samples) {
-        if (!samples || samples.length === 0) return { rms: 0, peak: 0 };
-        let sumSquares = 0;
-        let peak = 0;
-        for (let i = 0; i < samples.length; i++) {
-            const value = samples[i];
-            const absValue = Math.abs(value);
-            if (absValue > peak) peak = absValue;
-            sumSquares += value * value;
+    trackScheduledScreenAudioSource(source, startAt) {
+        const scheduled = this._screenAudioScheduled || (this._screenAudioScheduled = []);
+        const entry = { source, startAt };
+        scheduled.push(entry);
+        source.onended = () => {
+            const index = scheduled.indexOf(entry);
+            if (index >= 0) scheduled.splice(index, 1);
+        };
+    },
+
+    /** Cancels every queued chunk starting at or after `fromTime`. Used when the clock resyncs. */
+    dropScheduledScreenAudioFrom(fromTime) {
+        const scheduled = this._screenAudioScheduled;
+        if (!scheduled?.length) return;
+
+        let dropped = 0;
+        for (const entry of scheduled.slice()) {
+            if (entry.startAt < fromTime) continue;
+            try { entry.source.onended = null; } catch { }
+            try { entry.source.stop(); } catch { }
+            try { entry.source.disconnect(); } catch { }
+            const index = scheduled.indexOf(entry);
+            if (index >= 0) scheduled.splice(index, 1);
+            dropped++;
         }
-        const rms = Math.sqrt(sumSquares / samples.length);
-        return { rms, peak };
+        if (dropped > 0) {
+            this.log('screenshare', `Dropped ${dropped} queued screen-audio chunk(s) on resync`);
+        }
+    },
+
+    clearScheduledScreenAudio() {
+        const scheduled = this._screenAudioScheduled;
+        if (!scheduled?.length) return;
+        for (const entry of scheduled) {
+            try { entry.source.onended = null; } catch { }
+            try { entry.source.stop(); } catch { }
+            try { entry.source.disconnect(); } catch { }
+        }
+        scheduled.length = 0;
+    },
+
+    getScreenAudioScratchBuffer(frameCount) {
+        if (!this._screenAudioScratch || this._screenAudioScratch.length < frameCount) {
+            this._screenAudioScratch = new Float32Array(frameCount);
+        }
+        return this._screenAudioScratch;
     },
 
     updateWindowsScreenAudioAutoGain(rms, peak) {
@@ -3937,23 +5577,51 @@ window.webrtcManager = {
         }
 
         const interleaved = new Float32Array(rawBytes.buffer, rawBytes.byteOffset, frameCount * channels);
-        const stats = this.getInterleavedAudioStats(interleaved);
-        this.updateWindowsScreenAudioAutoGain(stats.rms, stats.peak);
         const buffer = this.screenAudioFallbackContext.createBuffer(channels, frameCount, sampleRate);
 
+        // De-interleave and accumulate RMS/peak in one pass over the samples, into a reused
+        // scratch buffer — this runs on the main thread for every captured chunk.
+        const scratch = this.getScreenAudioScratchBuffer(frameCount);
+        let sumSquares = 0;
+        let peak = 0;
+
         for (let ch = 0; ch < channels; ch++) {
-            const channelData = buffer.getChannelData(ch);
             for (let i = 0; i < frameCount; i++) {
-                channelData[i] = interleaved[i * channels + ch];
+                const value = interleaved[i * channels + ch];
+                scratch[i] = value;
+                const absValue = value < 0 ? -value : value;
+                if (absValue > peak) peak = absValue;
+                sumSquares += value * value;
             }
+            buffer.copyToChannel(scratch.subarray(0, frameCount), ch);
         }
+
+        const scannedSamples = frameCount * channels;
+        this.updateWindowsScreenAudioAutoGain(
+            scannedSamples > 0 ? Math.sqrt(sumSquares / scannedSamples) : 0,
+            peak);
 
         const source = this.screenAudioFallbackContext.createBufferSource();
         source.buffer = buffer;
         source.connect(this.screenAudioFallbackGain);
 
         const now = this.screenAudioFallbackContext.currentTime;
-        const startAt = Math.max(now + 0.01, this.screenAudioFallbackNextTime || now);
+        let startAt = Math.max(now + 0.01, this.screenAudioFallbackNextTime || now);
+
+        // The schedule only ever advanced by buffer.duration and was never compared against the
+        // context clock, so any burst or positive capture/render drift permanently grew the
+        // backlog — every future-scheduled node and its buffer stays alive until its start time.
+        if (startAt - now > this.screenAudioFallbackMaxLeadSeconds) {
+            this.log(
+                'screenshare',
+                `Screen-audio playout backlog ${(startAt - now).toFixed(3)}s exceeded ${this.screenAudioFallbackMaxLeadSeconds}s; resyncing to the context clock`);
+            startAt = now + 0.05;
+            // Pulling the schedule backwards would otherwise play this chunk on top of everything
+            // already queued past the new start time.
+            this.dropScheduledScreenAudioFrom(startAt);
+        }
+
+        this.trackScheduledScreenAudioSource(source, startAt);
         source.start(startAt);
         this.screenAudioFallbackNextTime = startAt + buffer.duration;
     },
@@ -3965,6 +5633,7 @@ window.webrtcManager = {
 
         this.screenAudioFallbackActive = false;
         this.screenAudioFallbackNextTime = 0;
+        this.clearScheduledScreenAudio();
 
         if (this.screenStream && this.screenAudioFallbackTrack) {
             try { this.screenStream.removeTrack(this.screenAudioFallbackTrack); } catch { }
@@ -4045,19 +5714,12 @@ window.webrtcManager = {
         const candidateBuffer = [];
         let handleConfigured = false;
 
-        pc.onicecandidate = async ({ candidate }) => {
+        pc.onicecandidate = ({ candidate }) => {
             if (!handleConfigured) {
                 candidateBuffer.push(candidate);
                 return;
             }
-            try {
-                await this.apiPost(
-                    `/api/janus/session/${this.janusSessionId}/handle/${this.janusHandleId}/trickle`,
-                    candidate
-                );
-            } catch (err) {
-                this.logError('trickle', 'ICE trickle failed: ' + err.message);
-            }
+            this.queueTrickleCandidate(this.janusHandleId, candidate);
         };
 
         // Create offer with codec/profile fallbacks and browser-default recovery.
@@ -4213,15 +5875,12 @@ window.webrtcManager = {
             this.log('publish', 'joinandconfigure response had no JSEP, waiting for async JSEP via polling');
         }
 
-        // Flush buffered ICE candidates now that handle is configured
+        // Flush buffered ICE candidates now that handle is configured. These accumulate into a
+        // single batch instead of one sequentially-awaited request each.
         for (const buffered of candidateBuffer) {
-            try {
-                await this.apiPost(
-                    `/api/janus/session/${this.janusSessionId}/handle/${this.janusHandleId}/trickle`,
-                    buffered
-                );
-            } catch { }
+            this.queueTrickleCandidate(this.janusHandleId, buffered);
         }
+        this.flushTrickleBatch(this.janusHandleId);
         this.log('publish', `Flushed ${candidateBuffer.length} buffered ICE candidates`);
 
         // Return existing publishers so init() can subscribe after polling starts
@@ -4287,19 +5946,12 @@ window.webrtcManager = {
             this.log('screenshare', `Screen-audio publisher PC state: ${pc.connectionState}`);
         };
 
-        pc.onicecandidate = async ({ candidate }) => {
+        pc.onicecandidate = ({ candidate }) => {
             if (!this.screenAudioPublisherConfigured) {
                 this.screenAudioPublisherPendingCandidates.push(candidate);
                 return;
             }
-            try {
-                await this.apiPost(
-                    `/api/janus/session/${this.janusSessionId}/handle/${this.screenAudioPublisherHandleId}/trickle`,
-                    candidate
-                );
-            } catch (err) {
-                this.log('screenshare', `Screen-audio trickle failed: ${err.message}`);
-            }
+            this.queueTrickleCandidate(this.screenAudioPublisherHandleId, candidate);
         };
 
         pc.addTrack(liveTrack, new MediaStream([liveTrack]));
@@ -4339,13 +5991,9 @@ window.webrtcManager = {
             }
 
             for (const buffered of this.screenAudioPublisherPendingCandidates) {
-                try {
-                    await this.apiPost(
-                        `/api/janus/session/${this.janusSessionId}/handle/${this.screenAudioPublisherHandleId}/trickle`,
-                        buffered
-                    );
-                } catch { }
+                this.queueTrickleCandidate(this.screenAudioPublisherHandleId, buffered);
             }
+            this.flushTrickleBatch(this.screenAudioPublisherHandleId);
             this.screenAudioPublisherPendingCandidates = [];
             return true;
         } catch (err) {
@@ -4405,8 +6053,21 @@ window.webrtcManager = {
                     if (!params.encodings || params.encodings.length === 0) {
                         params.encodings = [{}];
                     }
-                    params.encodings[0].minBitrate = minBitrateBps;
-                    params.encodings[0].maxBitrate = bitrateBps;
+
+                    // Skip the round trip when nothing would change. This is called from
+                    // the screen-share warmup, from every settings apply and from each
+                    // Janus configure, so the same values were being written over and over
+                    // - eight times in the first seconds of a share. Every setParameters
+                    // is a chance for the encoder's rate controller to be disturbed while
+                    // it is still finding its operating point, which is the worst possible
+                    // moment for it.
+                    const encoding = params.encodings[0];
+                    if (encoding.minBitrate === minBitrateBps && encoding.maxBitrate === bitrateBps) {
+                        continue;
+                    }
+
+                    encoding.minBitrate = minBitrateBps;
+                    encoding.maxBitrate = bitrateBps;
                     await sender.setParameters(params);
                     this.log('bitrate', `Set sender bitrate floor/cap to ${minBitrateKbps}/${clampedBitrateKbps} kbps`);
                 } catch (err) {
@@ -4714,7 +6375,12 @@ window.webrtcManager = {
                 this.logError('subscribe', `Feed ${feedId} ICE FAILED — cannot receive their media`);
                 this.scheduleFeedHardRecovery(feedId, 'ice-failed', 250);
             } else if (state === 'disconnected') {
-                this.scheduleFeedHardRecovery(feedId, 'ice-disconnected-timeout', 4500);
+                // 'disconnected' is not 'failed' - it is the state ICE sits in while consent
+                // checks are still in flight, and it commonly returns to 'connected' on its
+                // own. 4.5s was inside that window, so an ordinary blip was converted into a
+                // teardown. ICE reaches 'failed' by itself when it really is gone, and that
+                // path recovers in 250ms.
+                this.scheduleFeedHardRecovery(feedId, 'ice-disconnected-timeout', 9000);
             } else if (state === 'connected' || state === 'completed') {
                 this.cancelFeedHardRecovery(feedId);
             }
@@ -4725,7 +6391,7 @@ window.webrtcManager = {
             if (state === 'failed') {
                 this.scheduleFeedHardRecovery(feedId, 'pc-failed', 250);
             } else if (state === 'disconnected') {
-                this.scheduleFeedHardRecovery(feedId, 'pc-disconnected-timeout', 4500);
+                this.scheduleFeedHardRecovery(feedId, 'pc-disconnected-timeout', 9000);
             } else if (state === 'connected') {
                 this.cancelFeedHardRecovery(feedId);
             }
@@ -4797,18 +6463,18 @@ window.webrtcManager = {
                 }
                 this.applyRemoteFeedVolume(feedId, vid);
             }
+            if (streamForPlayback) {
+                this.ensureRemoteSpeakingAnalyzer(feedId, streamForPlayback);
+            } else if (feedState?.stream) {
+                this.ensureRemoteSpeakingAnalyzer(feedId, feedState.stream);
+            }
             this.refreshRemoteAudioRouting();
             this.refreshFloatContainerIfPresent();
         };
 
         // Trickle ICE for subscriber
-        subPc.onicecandidate = async ({ candidate }) => {
-            try {
-                await this.apiPost(
-                    `/api/janus/session/${this.janusSessionId}/handle/${subHandleId}/trickle`,
-                    candidate
-                );
-            } catch { }
+        subPc.onicecandidate = ({ candidate }) => {
+            this.queueTrickleCandidate(subHandleId, candidate);
         };
 
         // Set Janus's offer and create answer
@@ -4905,6 +6571,7 @@ window.webrtcManager = {
 
     removeFeed(feedId) {
         const streamKey = `remote-${feedId}`;
+        this.removeRemoteSpeakingAnalyzer(feedId);
         const removedIdentityKey = this.getFeedIdentityKey(feedId);
         const feed = this.feeds[feedId];
         if (feed) {
@@ -4913,6 +6580,7 @@ window.webrtcManager = {
                 feed.hardRecoveryTimer = null;
             }
             feed.pc.close();
+            this.clearTrickleBatch(feed.handleId);
             delete this.pendingSubscribes[feed.handleId];
             delete this.feeds[feedId];
         }
@@ -5117,6 +6785,7 @@ window.webrtcManager = {
     ensureRemoteFeedCell(feedId, display) {
         const videoGrid = document.getElementById('videoGrid');
         if (!videoGrid) return null;
+        this.ensureVideoPauseWatchdog();
         const streamKey = `remote-${feedId}`;
 
         let cell = document.getElementById('remote-' + feedId);
@@ -5154,6 +6823,8 @@ window.webrtcManager = {
 
         const vid = document.createElement('video');
         this.configureRemoteVideoElement(vid, feedId);
+        // A feed that joins after the output device was chosen must honour it too.
+        this.applySelectedSinkTo(vid);
         vid.dataset.feedId = String(feedId);
 
         const label = document.createElement('span');
@@ -5213,13 +6884,34 @@ window.webrtcManager = {
         if (!normalizedFeedId) return;
 
         const previous = this.hiddenRemoteFeedMeta[normalizedFeedId] || {};
+        const currentFeed = this.feeds[normalizedFeedId] || null;
+        const effectiveDisplay = (display || previous.display || '').toString();
+        const displayRole = this.getDisplayRole(effectiveDisplay);
+        const keywordStreamLike = /(screen|share|window|display|monitor|present|slides|application)/i.test(effectiveDisplay);
+        const streamLikeFromLiveFeed = !!currentFeed && (
+            this.feedHasLiveTrack(currentFeed, 'video')
+            || this.isFeedTaggedScreenAudio(normalizedFeedId)
+            || this.getFeedRole(normalizedFeedId) === 'stream'
+            || this.feedLooksLikeStreamShare(normalizedFeedId)
+        );
+        const streamLike = streamLikeFromLiveFeed
+            || previous.streamLike === true
+            || displayRole === 'screen-audio'
+            || displayRole === 'native-screen'
+            || keywordStreamLike;
+        const identityKey = this.getFeedIdentityKey(normalizedFeedId)
+            || previous.identityKey
+            || this.getDisplayIdentityKey(effectiveDisplay)
+            || '';
         const mergedStreams = this.normalizeSubscribeStreams(
             [...(previous.streams || []), ...(streamsHint || [])],
             normalizedFeedId
         );
         this.hiddenRemoteFeedMeta[normalizedFeedId] = {
-            display: display || previous.display || '',
-            streams: mergedStreams
+            display: effectiveDisplay,
+            streams: mergedStreams,
+            identityKey,
+            streamLike
         };
     },
 
@@ -5241,6 +6933,7 @@ window.webrtcManager = {
     suspendRemoteFeedSubscription(feedId, reason = 'hidden-preference') {
         const normalizedFeedId = this.normalizeFeedId(feedId);
         if (!normalizedFeedId) return;
+        this.removeRemoteSpeakingAnalyzer(normalizedFeedId);
 
         const feed = this.feeds[normalizedFeedId];
         if (!feed) {
@@ -5319,28 +7012,56 @@ window.webrtcManager = {
 
         const nextHidden = !!hidden;
         const targetFeed = this.feeds[normalizedFeedId] || null;
-        const targetIsStreamLike = !!targetFeed && (
+        const targetMeta = this.hiddenRemoteFeedMeta[normalizedFeedId] || {};
+        const targetDisplay = (targetFeed?.display || targetMeta.display || '').toString();
+        const targetDisplayRole = this.getDisplayRole(targetDisplay);
+        const targetKeywordStreamLike = /(screen|share|window|display|monitor|present|slides|application)/i.test(targetDisplay);
+        const targetIsStreamLike = (!!targetFeed && (
             this.feedHasLiveTrack(targetFeed, 'video')
             || this.isFeedTaggedScreenAudio(normalizedFeedId)
             || this.getFeedRole(normalizedFeedId) === 'stream'
             || this.feedLooksLikeStreamShare(normalizedFeedId)
-        );
+        )) || targetMeta.streamLike === true
+            || targetDisplayRole === 'screen-audio'
+            || targetDisplayRole === 'native-screen'
+            || targetKeywordStreamLike;
 
         const affectedFeedIds = new Set([normalizedFeedId]);
-        const identityKey = this.getFeedIdentityKey(normalizedFeedId);
+        const identityKey = this.getFeedIdentityKey(normalizedFeedId)
+            || targetMeta.identityKey
+            || this.getDisplayIdentityKey(targetDisplay);
         if (identityKey && targetIsStreamLike) {
-            const siblings = this.listIdentityFeeds(identityKey, false);
-            for (const siblingId of siblings) {
+            const siblingCandidates = new Set(this.listIdentityFeeds(identityKey, false).map(id => this.normalizeFeedId(id)));
+            for (const [candidateFeedId, candidateMeta] of Object.entries(this.hiddenRemoteFeedMeta || {})) {
+                const normalizedCandidate = this.normalizeFeedId(candidateFeedId);
+                if (!normalizedCandidate) continue;
+                const candidateIdentityKey = this.getFeedIdentityKey(normalizedCandidate)
+                    || candidateMeta?.identityKey
+                    || this.getDisplayIdentityKey(candidateMeta?.display || '');
+                if (candidateIdentityKey === identityKey) {
+                    siblingCandidates.add(normalizedCandidate);
+                }
+            }
+
+            for (const siblingId of siblingCandidates) {
                 const normalizedSibling = this.normalizeFeedId(siblingId);
                 if (!normalizedSibling || normalizedSibling === normalizedFeedId) continue;
-                const siblingFeed = this.feeds[normalizedSibling];
-                if (!siblingFeed) continue;
 
-                const siblingIsStreamLike =
+                const siblingFeed = this.feeds[normalizedSibling] || null;
+                const siblingMeta = this.hiddenRemoteFeedMeta[normalizedSibling] || {};
+                const siblingDisplay = (siblingFeed?.display || siblingMeta.display || '').toString();
+                const siblingDisplayRole = this.getDisplayRole(siblingDisplay);
+                const siblingKeywordStreamLike = /(screen|share|window|display|monitor|present|slides|application)/i.test(siblingDisplay);
+                const siblingIsStreamLike = (!!siblingFeed && (
                     this.isFeedTaggedScreenAudio(normalizedSibling)
                     || this.feedHasLiveTrack(siblingFeed, 'video')
                     || this.getFeedRole(normalizedSibling) === 'stream'
-                    || this.feedLooksLikeStreamShare(normalizedSibling);
+                    || this.feedLooksLikeStreamShare(normalizedSibling)
+                )) || siblingMeta.streamLike === true
+                    || siblingDisplayRole === 'screen-audio'
+                    || siblingDisplayRole === 'native-screen'
+                    || siblingKeywordStreamLike;
+
                 if (siblingIsStreamLike) {
                     affectedFeedIds.add(normalizedSibling);
                 }
@@ -5435,6 +7156,8 @@ window.webrtcManager = {
             video.style.opacity = hidden ? '0' : '';
             video.style.pointerEvents = hidden ? 'none' : '';
             if (!hidden) {
+                const volumePercent = this.getFeedVolumePercent(normalizedFeedId);
+                this.applyRemoteFeedVolumeToElement(video, normalizedFeedId, volumePercent);
                 this.tryResumeRemoteVideo(video, normalizedFeedId, 'show-hidden-stream');
             }
         }
@@ -5451,6 +7174,63 @@ window.webrtcManager = {
                 this.ensureRemoteFeedVolumeControl(feedCell, identityFeedId);
             }
         }
+    },
+
+    /// Speaker toggle that sits in front of a per-stream volume slider.
+    ///
+    /// Mute is represented by the slider's own value being 0 rather than a separate
+    /// flag, so the button, the slider and what is actually applied cannot disagree,
+    /// and dragging away from zero is itself an unmute. The level to come back to is
+    /// remembered on the button.
+    buildVolumeMuteButton(slider, applyValue) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'video-volume-mute-btn';
+        button._volumeBeforeMute = 100;
+
+        const sync = () => {
+            const muted = Number(slider.value) <= 0;
+            button.classList.toggle('muted', muted);
+            button.setAttribute('aria-pressed', muted ? 'true' : 'false');
+            button.setAttribute('aria-label', muted ? 'Unmute' : 'Mute');
+            button.title = muted ? 'Unmute' : 'Mute';
+            // Inline SVG rather than a font glyph: this is built outside Blazor, so it
+            // cannot reach the MudBlazor icon set the rest of the UI uses.
+            button.innerHTML = muted
+                ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M16.5 12A4.5 4.5 0 0 0 14 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.8 8.8 0 0 0 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 0 0 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>'
+                : '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>';
+        };
+
+        button.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const current = Number(slider.value) || 0;
+            if (current > 0) {
+                button._volumeBeforeMute = current;
+                slider.value = '0';
+            } else {
+                // 100 when they were already silent, so unmuting is never a no-op.
+                slider.value = String(button._volumeBeforeMute > 0 ? button._volumeBeforeMute : 100);
+            }
+
+            applyValue(slider.value);
+            sync();
+            this.flushPersistedRemoteIdentityVolumes();
+        });
+
+        slider.addEventListener('input', () => {
+            const value = Number(slider.value) || 0;
+            if (value > 0) {
+                button._volumeBeforeMute = value;
+            }
+            sync();
+        });
+
+        // Exposed so the reconcile pass below can refresh the icon after writing the
+        // slider's value straight, which does not raise an input event.
+        button.syncMuteState = sync;
+
+        sync();
+        return button;
     },
 
     ensureRemoteFeedVolumeControl(cell, feedId) {
@@ -5476,15 +7256,20 @@ window.webrtcManager = {
             micSlider.step = '1';
             micSlider.value = '100';
             micSlider.className = 'video-volume-slider video-volume-slider-mic';
-            micSlider.addEventListener('input', () => {
+            const applyMicVolume = (value) => {
                 const targetFeedId = volumePanel.dataset.feedId || normalizedFeedId;
                 const identityKey = this.getFeedIdentityKey(targetFeedId);
                 if (identityKey) {
-                    this.setIdentityRoleVolume(identityKey, 'mic', micSlider.value);
+                    this.setIdentityRoleVolume(identityKey, 'mic', value, { skipPanel: volumePanel });
                 } else {
-                    this.setRemoteFeedVolume(targetFeedId, micSlider.value);
+                    this.setRemoteFeedVolume(targetFeedId, value);
                 }
-            });
+                micValue.textContent = `${value}%`;
+            };
+            micSlider.addEventListener('input', () => applyMicVolume(micSlider.value));
+            const micMuteButton = this.buildVolumeMuteButton(micSlider, applyMicVolume);
+            // Commit the debounced write as soon as the drag ends.
+            micSlider.addEventListener('change', () => this.flushPersistedRemoteIdentityVolumes());
 
             const micValue = document.createElement('span');
             micValue.className = 'video-volume-label video-volume-label-mic';
@@ -5504,15 +7289,20 @@ window.webrtcManager = {
             streamSlider.step = '1';
             streamSlider.value = '100';
             streamSlider.className = 'video-volume-slider video-volume-slider-stream';
-            streamSlider.addEventListener('input', () => {
+            const applyStreamVolume = (value) => {
                 const targetFeedId = volumePanel.dataset.feedId || normalizedFeedId;
                 const identityKey = this.getFeedIdentityKey(targetFeedId);
                 if (identityKey) {
-                    this.setIdentityRoleVolume(identityKey, 'stream', streamSlider.value);
+                    this.setIdentityRoleVolume(identityKey, 'stream', value, { skipPanel: volumePanel });
                 } else {
-                    this.setRemoteFeedVolume(targetFeedId, streamSlider.value);
+                    this.setRemoteFeedVolume(targetFeedId, value);
                 }
-            });
+                streamValue.textContent = `${value}%`;
+            };
+            streamSlider.addEventListener('input', () => applyStreamVolume(streamSlider.value));
+            const streamMuteButton = this.buildVolumeMuteButton(streamSlider, applyStreamVolume);
+            // Commit the debounced write as soon as the drag ends.
+            streamSlider.addEventListener('change', () => this.flushPersistedRemoteIdentityVolumes());
 
             const streamValue = document.createElement('span');
             streamValue.className = 'video-volume-label video-volume-label-stream';
@@ -5525,8 +7315,8 @@ window.webrtcManager = {
             volumePanel.addEventListener('mousedown', stopPropagation);
             volumePanel.addEventListener('pointerdown', stopPropagation);
 
-            micRow.append(micCaption, micSlider, micValue);
-            streamRow.append(streamCaption, streamSlider, streamValue);
+            micRow.append(micCaption, micMuteButton, micSlider, micValue);
+            streamRow.append(streamCaption, streamMuteButton, streamSlider, streamValue);
             volumePanel.append(micRow, streamRow);
             cell.appendChild(volumePanel);
         }
@@ -5552,6 +7342,11 @@ window.webrtcManager = {
         const streamLabel = volumePanel.querySelector('.video-volume-label-stream');
         if (streamSlider) streamSlider.value = String(streamVolume);
         if (streamLabel) streamLabel.textContent = `${streamVolume}%`;
+
+        // The writes above bypass the input event the buttons listen to, so a feed that
+        // reconnects at 0% would otherwise come back showing an unmuted speaker.
+        volumePanel.querySelectorAll('.video-volume-mute-btn')
+            .forEach(button => button.syncMuteState?.());
     },
 
     getRemoteFeedDisplayName(feedId, display) {
@@ -5633,12 +7428,53 @@ window.webrtcManager = {
         return (feedId ?? '').toString();
     },
 
+    // ─── Pass-scoped memo for derived feed state ────────────────────────────────
+    //
+    // getFeedRole/listIdentityFeeds/feedLooksLikeStreamShare are mutually recursive across
+    // siblings, so a single routing pass re-derives the same values O(N^2)-to-O(N^3) times.
+    // These values also depend on live track state, which changes without any of our code
+    // running — so the memo is deliberately scoped to one synchronous pass rather than cached
+    // across time. Nested passes share the outermost memo via the depth counter.
+
+    _feedDerivedMemo: null,
+    _feedDerivedMemoDepth: 0,
+
+    withFeedDerivedMemo(fn) {
+        if (this._feedDerivedMemoDepth === 0) {
+            this._feedDerivedMemo = {
+                identity: new Map(),
+                role: new Map(),
+                streamShare: new Map(),
+                liveAudio: new Map(),
+                identityFeeds: new Map()
+            };
+        }
+        this._feedDerivedMemoDepth++;
+        try {
+            return fn();
+        } finally {
+            this._feedDerivedMemoDepth--;
+            if (this._feedDerivedMemoDepth <= 0) {
+                this._feedDerivedMemoDepth = 0;
+                this._feedDerivedMemo = null;
+            }
+        }
+    },
+
     getFeedIdentityKey(feedId) {
         const key = this.normalizeFeedId(feedId);
         if (!key) return '';
         const feed = this.feeds[key];
         if (!feed) return '';
 
+        const memo = this._feedDerivedMemo?.identity;
+        if (memo?.has(key)) return memo.get(key);
+        const computed = this.computeFeedIdentityKey(key, feed);
+        memo?.set(key, computed);
+        return computed;
+    },
+
+    computeFeedIdentityKey(key, feed) {
         const parsed = this.parsePublisherDisplay((feed.display || '').toString());
         if (parsed.userId) {
             const normalizedUser = this.normalizeUserId(parsed.userId);
@@ -5664,6 +7500,19 @@ window.webrtcManager = {
     feedHasLiveTrack(feed, kind) {
         if (!feed) return false;
 
+        // Audio liveness is the hot one — it is probed for every sibling of every feed.
+        const memo = kind === 'audio' ? this._feedDerivedMemo?.liveAudio : null;
+        if (memo) {
+            const cached = memo.get(feed);
+            if (cached !== undefined) return cached;
+            const computed = this.computeFeedHasLiveTrack(feed, kind);
+            memo.set(feed, computed);
+            return computed;
+        }
+        return this.computeFeedHasLiveTrack(feed, kind);
+    },
+
+    computeFeedHasLiveTrack(feed, kind) {
         const liveFromStream = kind === 'audio'
             ? feed.stream?.getAudioTracks?.().some(t => t && t.readyState === 'live')
             : feed.stream?.getVideoTracks?.().some(t => t && t.readyState === 'live');
@@ -5675,6 +7524,16 @@ window.webrtcManager = {
 
     listIdentityFeeds(identityKey, requireLiveAudio = false) {
         if (!identityKey) return [];
+
+        const memo = this._feedDerivedMemo?.identityFeeds;
+        const memoKey = requireLiveAudio ? `live:${identityKey}` : `all:${identityKey}`;
+        if (memo?.has(memoKey)) return memo.get(memoKey);
+        const computed = this.computeIdentityFeeds(identityKey, requireLiveAudio);
+        memo?.set(memoKey, computed);
+        return computed;
+    },
+
+    computeIdentityFeeds(identityKey, requireLiveAudio) {
         const feeds = [];
         for (const [feedId, feed] of Object.entries(this.feeds)) {
             if (!feed) continue;
@@ -5691,6 +7550,14 @@ window.webrtcManager = {
         const feed = this.feeds[key];
         if (!feed) return false;
 
+        const memo = this._feedDerivedMemo?.streamShare;
+        if (memo?.has(key)) return memo.get(key);
+        const computed = this.computeFeedLooksLikeStreamShare(key, feed);
+        memo?.set(key, computed);
+        return computed;
+    },
+
+    computeFeedLooksLikeStreamShare(key, feed) {
         if (feed.roleHint === 'stream') return true;
         if (feed.roleHint === 'mic') return false;
 
@@ -5735,6 +7602,16 @@ window.webrtcManager = {
         const feed = this.feeds[key];
         if (!feed) return 'mic';
 
+        const memo = this._feedDerivedMemo?.role;
+        if (memo?.has(key)) return memo.get(key);
+        // Written only after computing, so a re-entrant call recomputes rather than reading a
+        // half-built value.
+        const computed = this.computeFeedRole(key, feed);
+        memo?.set(key, computed);
+        return computed;
+    },
+
+    computeFeedRole(key, feed) {
         const parsedDisplay = this.parsePublisherDisplay((feed.display || '').toString());
         if (parsedDisplay.role === 'screen-audio' || parsedDisplay.role === 'native-screen') {
             return 'stream';
@@ -5958,64 +7835,105 @@ window.webrtcManager = {
         this.setIdentityRoleVolume(identityKey, role, volumePercent);
     },
 
-    setIdentityRoleVolume(identityKey, role, value) {
+    setIdentityRoleVolume(identityKey, role, value, options = null) {
         if (!identityKey) return;
 
-        const normalizedRole = role === 'stream' ? 'stream' : 'mic';
-        const volumePercent = Math.max(0, Math.min(200, parseInt(value, 10) || 0));
-        const volumeState = this.getIdentityVolumeState(identityKey);
+        // Slider `input` fires at pointer rate; one memo for the whole update keeps the
+        // sibling role/identity derivation from being redone per feed.
+        this.withFeedDerivedMemo(() => {
+            const normalizedRole = role === 'stream' ? 'stream' : 'mic';
+            const volumePercent = Math.max(0, Math.min(200, parseInt(value, 10) || 0));
+            const volumeState = this.getIdentityVolumeState(identityKey);
 
-        if (normalizedRole === 'stream') {
-            volumeState.stream = volumePercent;
-        } else {
-            volumeState.mic = volumePercent;
-            // Keep stream tied to mic unless stream-specific volume is available.
-            if (!this.identityHasStreamAudioFeed(identityKey)) {
+            if (normalizedRole === 'stream') {
                 volumeState.stream = volumePercent;
+            } else {
+                volumeState.mic = volumePercent;
+                // Keep stream tied to mic unless stream-specific volume is available.
+                if (!this.identityHasStreamAudioFeed(identityKey)) {
+                    volumeState.stream = volumePercent;
+                }
             }
-        }
-        this.remoteIdentityVolumes[identityKey] = volumeState;
-        this.savePersistedRemoteIdentityVolumes();
+            this.remoteIdentityVolumes[identityKey] = volumeState;
+            this.schedulePersistedRemoteIdentityVolumes();
 
-        for (const [otherFeedId] of Object.entries(this.feeds)) {
-            const normalizedOther = String(otherFeedId);
-            if (this.getFeedIdentityKey(normalizedOther) !== identityKey) continue;
+            for (const [otherFeedId] of Object.entries(this.feeds)) {
+                const normalizedOther = String(otherFeedId);
+                if (this.getFeedIdentityKey(normalizedOther) !== identityKey) continue;
 
-            const otherRole = this.isFeedTaggedScreenAudio(normalizedOther)
-                ? 'stream'
-                : this.getFeedRole(normalizedOther);
-            this.remoteFeedVolumes[normalizedOther] =
-                otherRole === 'stream' ? volumeState.stream : volumeState.mic;
-        }
-
-        for (const [otherFeedId] of Object.entries(this.feeds)) {
-            const normalizedOther = String(otherFeedId);
-            if (this.getFeedIdentityKey(normalizedOther) !== identityKey) continue;
-
-            const otherCell = document.getElementById('remote-' + normalizedOther);
-            if (!otherCell) continue;
-            this.ensureRemoteFeedVolumeControl(otherCell, normalizedOther);
-
-            const otherVideo = otherCell.querySelector('video');
-            if (otherVideo) {
-                this.applyRemoteFeedVolumeToElement(otherVideo, normalizedOther, this.getFeedVolumePercent(normalizedOther));
+                const otherRole = this.isFeedTaggedScreenAudio(normalizedOther)
+                    ? 'stream'
+                    : this.getFeedRole(normalizedOther);
+                this.remoteFeedVolumes[normalizedOther] =
+                    otherRole === 'stream' ? volumeState.stream : volumeState.mic;
             }
+
+            const skipPanel = options?.skipPanel || null;
+            for (const [otherFeedId] of Object.entries(this.feeds)) {
+                const normalizedOther = String(otherFeedId);
+                if (this.getFeedIdentityKey(normalizedOther) !== identityKey) continue;
+
+                const otherCell = document.getElementById('remote-' + normalizedOther);
+                if (!otherCell) continue;
+                // Don't rewrite the panel the user is currently dragging — it costs a full
+                // control rebuild per pointer sample and fights the in-progress drag.
+                if (!skipPanel || !otherCell.contains(skipPanel)) {
+                    this.ensureRemoteFeedVolumeControl(otherCell, normalizedOther);
+                }
+
+                const otherVideo = otherCell.querySelector('video');
+                if (otherVideo) {
+                    this.applyRemoteFeedVolumeToElement(otherVideo, normalizedOther, this.getFeedVolumePercent(normalizedOther));
+                }
+            }
+        });
+        this.scheduleRemoteAudioRoutingRefresh();
+    },
+
+    /**
+     * Coalesce routing refreshes onto one frame. Bursts of feed churn (a join storm) and
+     * pointer-rate slider input otherwise trigger a full document sweep per event.
+     */
+    scheduleRemoteAudioRoutingRefresh() {
+        if (this._remoteAudioRoutingRafId || this._remoteAudioRoutingTimerId) return;
+        this._remoteAudioRoutingRafId = requestAnimationFrame(() => {
+            this._remoteAudioRoutingRafId = 0;
+            this.refreshRemoteAudioRouting();
+        });
+        // rAF is paused while the window is hidden — this makes sure a queued refresh still
+        // lands. Whichever fires first cancels the other.
+        this._remoteAudioRoutingTimerId = setTimeout(() => {
+            this._remoteAudioRoutingTimerId = 0;
+            this.refreshRemoteAudioRouting();
+        }, 100);
+    },
+
+    cancelScheduledRemoteAudioRoutingRefresh() {
+        if (this._remoteAudioRoutingRafId) {
+            cancelAnimationFrame(this._remoteAudioRoutingRafId);
+            this._remoteAudioRoutingRafId = 0;
         }
-        this.refreshRemoteAudioRouting();
+        if (this._remoteAudioRoutingTimerId) {
+            clearTimeout(this._remoteAudioRoutingTimerId);
+            this._remoteAudioRoutingTimerId = 0;
+        }
     },
 
     refreshRemoteAudioRouting() {
-        document.querySelectorAll('.video-cell[id^="remote-"] video')
-            .forEach(vid => {
-                const feedId = this.resolveFeedIdFromVideoElement(vid);
-                if (!feedId) return;
-                const volumePercent = this.getFeedVolumePercent(feedId);
-                this.applyRemoteFeedVolumeToElement(vid, feedId, volumePercent);
-                const cell = vid.closest('.video-cell');
-                if (cell) {
-                    this.ensureRemoteFeedAvatarFallback(cell, feedId, cell.dataset.display || '');
-                }
-            });
+        this.cancelScheduledRemoteAudioRoutingRefresh();
+        this.withFeedDerivedMemo(() => {
+            document.querySelectorAll('.video-cell[id^="remote-"] video')
+                .forEach(vid => {
+                    const feedId = this.resolveFeedIdFromVideoElement(vid);
+                    if (!feedId) return;
+                    const volumePercent = this.getFeedVolumePercent(feedId);
+                    this.applyRemoteFeedVolumeToElement(vid, feedId, volumePercent);
+                    const cell = vid.closest('.video-cell');
+                    if (cell) {
+                        this.ensureRemoteFeedAvatarFallback(cell, feedId, cell.dataset.display || '');
+                    }
+                });
+        });
     },
 
     isSilentFloatPreviewVideo(videoElement) {
@@ -6166,6 +8084,130 @@ window.webrtcManager = {
         this.applyRemoteFeedVolumeToElement(videoElement, normalizedFeedId, volumePercent);
     },
 
+    // ─── Per-user volume by userId (drawer context menu) ─────────────────────
+    // Identity keys are `uid:<userId>` whenever the publisher display carries a
+    // user id, which is how the drawer knows participants — so the menu can
+    // address a user's mic volume without knowing any feed ids. Works even
+    // before the user's feed lands: the identity state is read at feed attach.
+
+    getUserMicVolume(userId) {
+        const normalized = this.normalizeUserId(userId || '');
+        if (!normalized) return 100;
+        return this.getIdentityRoleVolumePercent(`uid:${normalized}`, 'mic');
+    },
+
+    setUserMicVolume(userId, value) {
+        const normalized = this.normalizeUserId(userId || '');
+        if (!normalized) return;
+        // setIdentityRoleVolume owns the whole pipeline: state, persistence,
+        // propagation to every live feed of the identity, tile panel refresh,
+        // and the routing sweep.
+        this.setIdentityRoleVolume(`uid:${normalized}`, 'mic', value);
+    },
+
+    // ─── Hide tiles of participants without video ────────────────────────────
+    // Purely visual: cells already carry `video-cell-no-video` (kept current on
+    // track changes), so a class on the grid lets CSS drop them. Audio is
+    // untouched — this deliberately does NOT go through the per-feed hide
+    // preference, which suppresses the hidden feed's audio.
+
+    hideNoVideoTiles: false,
+
+    setHideNoVideoTiles(enabled) {
+        this.hideNoVideoTiles = !!enabled;
+        this.applyHideNoVideoTiles();
+    },
+
+    applyHideNoVideoTiles() {
+        const grid = document.getElementById('videoGrid');
+        if (!grid) return;
+        grid.classList.toggle('hide-no-video-cells', !!this.hideNoVideoTiles);
+    },
+
+    // ─── Paused-video detection ──────────────────────────────────────────────
+    // A minimized captured window keeps its track alive but stops producing
+    // frames, so the tile freezes or goes black while everything reports
+    // "streaming". Each tile gets a frame watchdog: requestVideoFrameCallback
+    // stamps the last delivered frame, and a 1s sweep marks any tile whose
+    // live track has gone quiet as paused. The next frame clears it, which is
+    // the whole recovery story — nothing to renegotiate.
+
+    videoPauseWatchdogTimerId: 0,
+    videoPauseStallMilliseconds: 2000,
+
+    ensureVideoPauseWatchdog() {
+        if (this.videoPauseWatchdogTimerId) return;
+        if (typeof HTMLVideoElement === 'undefined'
+            || !HTMLVideoElement.prototype.requestVideoFrameCallback) {
+            return; // No rVFC (very old runtime): keep old behavior rather than guess.
+        }
+
+        this.videoPauseWatchdogTimerId = setInterval(() => {
+            try {
+                this.sweepVideoPauseStates();
+            } catch { }
+        }, 1000);
+    },
+
+    sweepVideoPauseStates() {
+        const videos = document.querySelectorAll('.video-cell video');
+        if (videos.length === 0) return;
+
+        const now = performance.now();
+        for (const video of videos) {
+            const cell = video.closest('.video-cell');
+            if (!cell) continue;
+
+            if (!video.dataset.pauseWatch) {
+                video.dataset.pauseWatch = '1';
+                video._lastFrameTs = now;
+                const arm = () => {
+                    try {
+                        video.requestVideoFrameCallback(() => {
+                            video._lastFrameTs = performance.now();
+                            // Recover immediately on the first frame instead of
+                            // waiting for the next sweep tick.
+                            const liveCell = video.closest('.video-cell');
+                            if (liveCell) this.setCellPausedState(liveCell, false);
+                            arm();
+                        });
+                    } catch { }
+                };
+                arm();
+            }
+
+            // The avatar fallback owns the "no track at all" case; paused is only
+            // meaningful while a live track exists but delivers nothing.
+            const hasLiveTrack = (video.srcObject?.getVideoTracks?.() || [])
+                .some(t => t && t.readyState === 'live');
+            const suppressedByFallback = cell.classList.contains('video-cell-no-video');
+            const stalled = hasLiveTrack
+                && !suppressedByFallback
+                && (now - (video._lastFrameTs || 0)) > this.videoPauseStallMilliseconds;
+
+            this.setCellPausedState(cell, stalled);
+        }
+    },
+
+    setCellPausedState(cell, paused) {
+        if (!cell) return;
+        const isPaused = cell.classList.contains('video-cell-paused');
+        if (paused === isPaused) return;
+
+        cell.classList.toggle('video-cell-paused', paused);
+        if (paused && !cell.querySelector('.video-paused-overlay')) {
+            const overlay = document.createElement('div');
+            overlay.className = 'video-paused-overlay';
+            overlay.innerHTML =
+                '<span class="material-icons" aria-hidden="true">pause_circle</span>'
+                + '<span>Video paused</span>';
+            cell.appendChild(overlay);
+        }
+
+        const feedId = cell.dataset?.feedId || (cell.classList.contains('local-cell') ? 'local' : '?');
+        this.log('screenshare', `Feed ${feedId} video ${paused ? 'paused (no frames from source)' : 'resumed'}`);
+    },
+
     getPrimaryRemoteFeedForFloat() {
         if (this.selectedSpotlightStreamKey) {
             if (this.selectedSpotlightStreamKey === 'local') {
@@ -6235,10 +8277,16 @@ window.webrtcManager = {
     async startPolling() {
         this.polling = true;
         this.lastPollActivityAt = Date.now();
+        // Fresh session: don't inherit the previous one's failure count, or its very first
+        // transient error would sleep the full backoff. Mirrors startKeepalive.
+        this.pollFailures = 0;
+        // Retires any loop still parked in a backoff sleep from a previous session — otherwise
+        // it wakes, sees this.polling true again, and races this one against the new session.
+        const generation = ++this.pollGeneration;
         this.log('poll', 'Polling loop started');
         let emptyPollResponses = 0;
 
-        while (this.polling) {
+        while (this.polling && generation === this.pollGeneration) {
             try {
                 this.pollAbort = new AbortController();
 
@@ -6247,6 +8295,7 @@ window.webrtcManager = {
                     this.pollAbort.signal
                 );
                 this.lastPollActivityAt = Date.now();
+                this.pollFailures = 0;
                 if (!this.polling) break;
                 if (!event) {
                     emptyPollResponses++;
@@ -6265,7 +8314,7 @@ window.webrtcManager = {
                 }
 
                 // Log FULL raw event for every non-keepalive (critical for debugging)
-                if (type !== 'keepalive') {
+                if (this.verbosePollEventLogging && type !== 'keepalive') {
                     const raw = JSON.stringify(event);
                     this.log('poll', `RAW EVENT (${raw.length} chars): ${raw.substring(0, 600)}`);
                 }
@@ -6282,7 +8331,7 @@ window.webrtcManager = {
                     // arrives here with the subscriber handle as the sender.
                     this.cleanupStalePendingSubscribes();
                     const pendingKeys = Object.keys(this.pendingSubscribes);
-                    if (pendingKeys.length > 0) {
+                    if (this.verbosePollEventLogging && pendingKeys.length > 0) {
                         this.log('poll', `Pending subscribes: [${pendingKeys.join(',')}], event sender: ${sender}`);
                     }
 
@@ -6390,12 +8439,25 @@ window.webrtcManager = {
                                         }
                                     }
                                     if (this.feeds[pub.id]) {
-                                        // Already subscribed — publisher updated their streams
-                                        // (e.g. started screen share, enabled video).
-                                        // Re-subscribe to pick up the new media.
-                                        this.log('poll', `Publisher ${pub.id} updated streams — re-subscribing`);
-                                        this.removeFeed(pub.id);
-                                        await this.initiateSubscribe(pub.id, pub.display, pub.streams);
+                                        // Already subscribed and the mismatch check above found
+                                        // nothing missing, so this publisher event needs no media
+                                        // change. Tearing the subscription down and rebuilding it
+                                        // here is what made remote users blink out of the grid and
+                                        // drop audio for seconds whenever anyone toggled a share:
+                                        // Janus keeps delivering the publisher's replaced track on
+                                        // the existing subscription, so a re-subscribe buys nothing
+                                        // and costs a full ICE/DTLS round trip.
+                                        //
+                                        // Anything genuinely missing is repaired by the
+                                        // scheduleExistingSubscriberRefresh branch above, which
+                                        // renegotiates in place and keeps the handle.
+                                        if (pub.display) {
+                                            // Keep the label/role fresh (a share start changes the
+                                            // display payload) without touching the transport.
+                                            this.feeds[pub.id].display = pub.display;
+                                            this.ensureRemoteFeedCell(pub.id, pub.display);
+                                        }
+                                        this.log('poll', `Publisher ${pub.id} stream update needs no resubscribe (audio/video already present)`);
                                     } else {
                                         await this.initiateSubscribe(pub.id, pub.display, pub.streams);
                                     }
@@ -6549,8 +8611,21 @@ window.webrtcManager = {
                     break;
                 }
 
-                this.log('poll', `Poll error (retrying in 1s): ${errMsg}`);
-                await this.sleep(1000);
+                // Only 404/458/459 above are terminal. Everything else — 5xx, DNS, TLS, offline —
+                // used to retry at a flat 1 Hz forever, so a degraded backend got one failed
+                // request per second per client until the user hung up manually.
+                this.pollFailures = (this.pollFailures || 0) + 1;
+                const backoffMs = Math.min(
+                    this.pollBackoffMaxMs,
+                    1000 * Math.pow(2, Math.min(this.pollFailures - 1, 5)));
+
+                if (this.pollFailures % this.pollFailureLogEscalation === 0) {
+                    this.logError('poll', `Poll has failed ${this.pollFailures} consecutive times; backing off toward ${this.pollBackoffMaxMs}ms`);
+                }
+
+                this.log('poll', `Poll error (retry ${this.pollFailures} in ${backoffMs}ms): ${errMsg}`);
+                await this.sleep(backoffMs);
+                if (generation !== this.pollGeneration) break;
             } finally {
                 this.pollAbort = null;
             }
@@ -6562,6 +8637,12 @@ window.webrtcManager = {
 
     startKeepalive() {
         this.keepaliveFailures = 0;
+        // Janus reaps a session after session_timeout without a keepalive, 60s by
+        // default. At 30s a single lost keepalive plus one slow round trip was enough
+        // to cross that line, and the server log shows exactly that outcome - repeated
+        // "Poll session <id> not found in Janus" for sessions belonging to live calls,
+        // each of which ends as a full client reconnect. 15s means four consecutive
+        // failures before the session can be reaped, at negligible cost.
         this.keepaliveTimer = setInterval(async () => {
             if (!this.polling) return;
             try {
@@ -6588,7 +8669,7 @@ window.webrtcManager = {
                     this.keepaliveFailures = 0; // Reset so we don't fire again
                 }
             }
-        }, 30_000);
+        }, 15_000);
     },
 
     stopKeepalive() {
@@ -6609,6 +8690,13 @@ window.webrtcManager = {
      */
     async checkForNewPublishers() {
         if (!this.polling || !this.janusRoomId) return;
+        const nowMs = Date.now();
+        const minIntervalMs = this.isAppVisible() ? 10000 : 30000;
+        if ((nowMs - (this.lastParticipantCheckAtMs || 0)) < minIntervalMs) {
+            return;
+        }
+        this.lastParticipantCheckAtMs = nowMs;
+
         try {
             this.cleanupStalePendingSubscribes();
             for (const [handleId, pending] of Object.entries(this.pendingSubscribes)) {
@@ -6652,6 +8740,12 @@ window.webrtcManager = {
                     const hint = this.publisherStreamHints[String(p.id)];
                     const hasAudio = this.hasIncomingAudioTrack(subscribedFeed.pc);
                     const hasVideo = this.hasIncomingVideoTrack(subscribedFeed.pc);
+                    if (hasAudio) {
+                        subscribedFeed.audioRecoveryAttempts = 0;
+                    }
+                    if (hasVideo) {
+                        subscribedFeed.videoRecoveryAttempts = 0;
+                    }
                     const preferVideoOnly = subscribedFeed.preferVideoOnly === true;
                     const needAudioRefresh = !preferVideoOnly && !!hint?.hasAudio && !hasAudio;
                     const needVideoRefresh = !!hint?.hasVideo && !hasVideo;
@@ -6665,11 +8759,45 @@ window.webrtcManager = {
                             requireVideo: needVideoRefresh
                         });
                     } else if (!preferVideoOnly && !hasAudio && this.getFeedRole(p.id) !== 'stream') {
-                        this.log('participants', `  subscribed feed ${p.id} missing mic audio without hint; scheduling forced audio refresh`);
-                        this.scheduleExistingSubscriberRefresh(p.id, 100, 'participant-check-no-audio', {
-                            requireAudio: true,
-                            force: true
-                        });
+                        // force:true deliberately bypasses the hint guard, because this is the
+                        // "no hint at all" case. But a publisher with no mic hardware or a denied
+                        // permission never produces audio, so without a cap this fires a subscribe
+                        // POST every participant-check tick for the whole call. Reset above once
+                        // audio actually arrives.
+                        const attempts = subscribedFeed.audioRecoveryAttempts || 0;
+                        if (attempts < this.maxAudioRecoveryAttempts) {
+                            subscribedFeed.audioRecoveryAttempts = attempts + 1;
+                            this.log('participants', `  subscribed feed ${p.id} missing mic audio without hint; scheduling forced audio refresh (${attempts + 1}/${this.maxAudioRecoveryAttempts})`);
+                            this.scheduleExistingSubscriberRefresh(p.id, 100, 'participant-check-no-audio', {
+                                requireAudio: true,
+                                force: true
+                            });
+                        } else {
+                            this.log('participants', `  skip audio recovery for ${p.id}: no audio after ${attempts} attempts`);
+                        }
+                    } else if (!hasVideo && !hint && !this.isFeedTaggedScreenAudio(p.id)) {
+                        // The video counterpart of the branch above, which did not exist: a
+                        // subscription that came up without video and never sees another
+                        // publisher event had nothing left to repair it, so joining a call where
+                        // someone was ALREADY sharing left their screen permanently blank. The
+                        // mismatch branch cannot cover it - it needs hint.hasVideo, and a feed
+                        // discovered by this sweep has no hint to read.
+                        //
+                        // Gated on the hint being absent rather than false, so the very common
+                        // camera-off participant (whose hint says so, from a real publishers
+                        // event) does not get renegotiated three times for nothing. Screen-audio
+                        // companion feeds are audio-only by design and never want this.
+                        const attempts = subscribedFeed.videoRecoveryAttempts || 0;
+                        if (attempts < this.maxAudioRecoveryAttempts) {
+                            subscribedFeed.videoRecoveryAttempts = attempts + 1;
+                            this.log('participants', `  subscribed feed ${p.id} missing video without hint; scheduling forced video refresh (${attempts + 1}/${this.maxAudioRecoveryAttempts})`);
+                            this.scheduleExistingSubscriberRefresh(p.id, 100, 'participant-check-no-video', {
+                                requireVideo: true,
+                                force: true
+                            });
+                        } else {
+                            this.log('participants', `  skip video recovery for ${p.id}: no video after ${attempts} attempts`);
+                        }
                     } else {
                         this.log('participants', `  skip already subscribed: ${p.id}`);
                     }
@@ -6696,7 +8824,7 @@ window.webrtcManager = {
     },
 
     startParticipantCheck() {
-        // First check after 2 seconds, then every 5 seconds
+        // First check after 2 seconds, then throttled checks.
         setTimeout(() => this.checkForNewPublishers(), 2000);
         this.participantCheckTimer = setInterval(() => {
             this.checkForNewPublishers();
@@ -6728,7 +8856,12 @@ window.webrtcManager = {
     async getInboundVideoHealthStats(peerConnection) {
         if (!peerConnection || typeof peerConnection.getStats !== 'function') return null;
         try {
-            const stats = await peerConnection.getStats();
+            // Scope the query to the inbound video track. A selector-less getStats() builds and
+            // marshals the entire stats graph (transports, candidate pairs, codecs, both
+            // directions) just to read three counters off one inbound-rtp entry.
+            const videoTrack = peerConnection.getReceivers?.()
+                ?.find(r => r?.track?.kind === 'video')?.track || null;
+            const stats = await peerConnection.getStats(videoTrack);
             const videoReport = this.extractMediaRtpReport(stats, 'inbound', 'video');
             if (!videoReport) return null;
             return {
@@ -6742,12 +8875,41 @@ window.webrtcManager = {
         }
     },
 
+    /// Cheap liveness probe, used before anything that destroys working state in order
+    /// to rebuild it. Doubles as a keepalive.
+    async isBackendReachable() {
+        if (!this.janusSessionId) return false;
+        try {
+            await this.apiPost(`/api/janus/session/${this.janusSessionId}/keepalive`, {});
+            return true;
+        } catch {
+            return false;
+        }
+    },
+
     async forceResubscribeFeed(feedId, reason) {
         const normalizedFeedId = this.normalizeFeedId(feedId);
         if (!normalizedFeedId) return;
 
         const existing = this.feeds[normalizedFeedId];
         if (!existing) return;
+
+        // Ask the server whether this is even possible before tearing anything down.
+        // This removes the feed and rebuilds it from a fresh attach, so when the backend
+        // cannot answer the participant just disappears and stays gone - which is exactly
+        // what the captured session shows: both feeds destroyed, both re-attaches
+        // returning 502, two empty tiles until the whole call restarted.
+        //
+        // The consecutive-poll-failure check cannot cover this. The poll is a long poll,
+        // so at the moment an ICE timeout fires it is still in flight and the counter is
+        // still zero - which is why that guard did not fire in the capture. A direct
+        // probe is the only thing that answers the question at the time it is asked.
+        if (!(await this.isBackendReachable())) {
+            this.log(
+                'subscribe',
+                `Skipping hard re-subscribe for feed ${normalizedFeedId} (${reason}): backend unreachable, keeping the existing subscription`);
+            return;
+        }
 
         const display = existing.display || '';
         const hint = this.publisherStreamHints[normalizedFeedId];
@@ -6758,7 +8920,19 @@ window.webrtcManager = {
         delete this.pendingSubscribeFeeds[normalizedFeedId];
         this.log('subscribe', `Feed ${normalizedFeedId} forcing hard re-subscribe (${reason})`);
         this.removeFeed(normalizedFeedId);
-        await this.initiateSubscribe(subscribeFeedId, display, streamsHint);
+
+        try {
+            await this.initiateSubscribe(subscribeFeedId, display, streamsHint);
+        } catch (err) {
+            // The cell and the subscription are already gone by this point, so letting
+            // this escape would drop the participant out of the grid AND abort the health
+            // watchdog's sweep partway through - it awaits this inside a try/finally with
+            // no catch. Log and leave them to the listparticipants check, which
+            // re-subscribes within 5s.
+            this.logError(
+                'subscribe',
+                `Hard re-subscribe failed for feed ${normalizedFeedId} (${reason}): ${err?.message || err}; waiting for participant check`);
+        }
     },
 
     cancelFeedHardRecovery(feedId) {
@@ -6789,6 +8963,28 @@ window.webrtcManager = {
         feed.hardRecoveryTimer = setTimeout(async () => {
             const current = this.feeds[key];
             if (!current?.pc) return;
+
+            // Re-check at fire time. ICE 'disconnected' is usually transient and heals on
+            // its own; the state can be back well before the timer runs, and the cancel on
+            // 'connected' can also race this callback. A hard re-subscribe on a connection
+            // that already recovered costs a full attach + ICE + DTLS round trip and a
+            // visible gap in that person's tile, for nothing.
+            const iceState = current.pc.iceConnectionState;
+            const pcState = current.pc.connectionState;
+            if (iceState === 'connected' || iceState === 'completed' || pcState === 'connected') {
+                this.log('subscribe', `Skipping hard recovery for feed ${key} (${reason}): recovered (ice=${iceState}, pc=${pcState})`);
+                return;
+            }
+
+            // Free early-out for a sustained outage, before paying for the probe in
+            // forceResubscribeFeed. It lags - the long poll is still in flight when an ICE
+            // timeout first fires, so this reads zero on the first failure - which is why
+            // the authoritative check lives there rather than here.
+            if ((this.pollFailures || 0) > 0) {
+                this.log('subscribe', `Deferring hard recovery for feed ${key} (${reason}): backend unreachable (${this.pollFailures} consecutive poll failure(s))`);
+                return;
+            }
+
             try {
                 await this.forceResubscribeFeed(key, reason);
             } catch (err) {
@@ -6799,11 +8995,34 @@ window.webrtcManager = {
 
     async checkRemoteFeedHealth() {
         if (this.remoteFeedHealthBusy) return;
+        if (!this.polling) return;
+        if (this.isScreenSharing) return;
+
+        const now = Date.now();
+        const minIntervalMs = this.isAppVisible() ? 4000 : 12000;
+        if ((now - (this.lastRemoteFeedHealthRunAtMs || 0)) < minIntervalMs) {
+            return;
+        }
+        this.lastRemoteFeedHealthRunAtMs = now;
+
+        const allFeedEntries = Object.entries(this.feeds || {});
+        if (allFeedEntries.length === 0) {
+            return;
+        }
+
+        const maxFeedsPerRun = this.isAppVisible() ? 3 : 1;
+        const feedsToInspect = [];
+        const startIndex = Math.max(0, this.remoteFeedHealthCursor % allFeedEntries.length);
+        const takeCount = Math.min(maxFeedsPerRun, allFeedEntries.length);
+        for (let i = 0; i < takeCount; i++) {
+            feedsToInspect.push(allFeedEntries[(startIndex + i) % allFeedEntries.length]);
+        }
+        this.remoteFeedHealthCursor = (startIndex + takeCount) % Math.max(1, allFeedEntries.length);
+
         this.remoteFeedHealthBusy = true;
 
         try {
-        const now = Date.now();
-        for (const [feedId, feed] of Object.entries(this.feeds || {})) {
+        for (const [feedId, feed] of feedsToInspect) {
             if (!feed?.pc) continue;
             if (!this.feedHasLiveTrack(feed, 'video')) continue;
 
@@ -6954,6 +9173,14 @@ window.webrtcManager = {
     },
 
     async toggleCamera() {
+        // Before the publisher is negotiated there is no sender to attach to, so this
+        // used to light the camera up locally and publish nothing - the preview looked
+        // right while nobody else ever saw a frame.
+        if (!this.isPublisherReadyForMedia()) {
+            this.log('media', 'Ignoring camera toggle: publisher is not negotiated yet');
+            return;
+        }
+
         const nextCameraOff = !this.isCameraOff;
         let shouldRenegotiate = false;
 
@@ -7053,6 +9280,15 @@ window.webrtcManager = {
     },
 
     async startScreenShare() {
+        // Same reason as toggleCamera, and it cannot be deferred either: getDisplayMedia
+        // needs the user gesture that opened the picker, so replaying the intent once the
+        // publisher comes up is not an option. Refuse now; the UI keeps the control
+        // disabled until OnPublisherReadyChanged says otherwise.
+        if (!this.isPublisherReadyForMedia()) {
+            this.logError('screenshare', 'Cannot start screen share yet: publisher is not negotiated');
+            return;
+        }
+
         if (!navigator?.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
             const message = this.isAndroidWebRtcEnvironment()
                 ? 'Screen sharing is not supported on this Android WebView build.'
@@ -7077,40 +9313,82 @@ window.webrtcManager = {
                 cursor: 'always',
                 width: { ideal: targetResolution.width },
                 height: { ideal: targetResolution.height },
-                frameRate: { ideal: fps, max: fps }
+                // Ceiling rather than the target itself - see getFrameRateCeiling. This is
+                // the very first limiter the frames meet, so pinning it here cost frames
+                // before any of the later tuning could matter.
+                frameRate: { ideal: fps, max: this.getFrameRateCeiling(fps) }
             };
-            const captureScreenAudio = this.currentConstraints.screenShareAudioEnabled !== false;
-            this.log('screenshare', `Screen-share audio capture ${captureScreenAudio ? 'enabled' : 'disabled'} by settings`);
+            // Display audio is ALWAYS requested: the share picker carries its own
+            // "share audio" consent, and that choice belongs to the user at pick
+            // time. The settings switch governs only the native Windows fallback
+            // that steps in when the browser grants no display audio.
+            const nativeFallbackAllowed = this.currentConstraints.screenShareAudioEnabled !== false;
+            this.log('screenshare', `Native screen-audio fallback ${nativeFallbackAllowed ? 'enabled' : 'disabled'} by settings`);
+
+            // Chromium-specific options alongside the standard constraints. Anything that
+            // does not implement them ignores unknown dictionary members, so this stays
+            // safe on other engines.
+            const displayMediaOptions = (withAudio) => ({
+                video: {
+                    ...videoConstraints,
+                    // A hint, not a constraint - it only preselects the picker's tab, and
+                    // a window can still be chosen. Worth knowing this is safe to remove:
+                    // it was added on the theory that only whole-screen shares can carry
+                    // audio, which turned out to be false. Windows 11 captures per-window
+                    // audio through WASAPI process loopback, so biasing the picker buys
+                    // nothing for audio and only nudges away from app shares.
+                    displaySurface: 'monitor'
+                },
+                // 'include' is already Chromium's default; stating it is the documented
+                // way to ask, and it costs nothing.
+                systemAudio: withAudio ? 'include' : 'exclude',
+                // Lets the sharer swap which window or screen is being shared without
+                // stopping and re-picking.
+                surfaceSwitching: 'include',
+                // false keeps the captured audio playing on the sharer's own speakers.
+                // Suppressing it would silence the game or app for the person sharing it -
+                // a different problem from the app's own playback being recaptured, which
+                // is what setSystemScreenShareAppPlaybackSuppressed handles.
+                audio: withAudio ? { suppressLocalAudioPlayback: false } : false
+            });
 
             let stream;
-            if (captureScreenAudio) {
-                // Try with system audio capture first, fall back to video-only
-                // (audio capture is not supported in all environments / screen types)
-                try {
-                    stream = await navigator.mediaDevices.getDisplayMedia({
-                        video: videoConstraints,
-                        audio: true
-                    });
-                } catch (audioErr) {
-                    // If user cancelled the picker, don't retry
-                    if (audioErr.name === 'NotAllowedError' || audioErr.name === 'AbortError') {
-                        throw audioErr;
-                    }
-                    this.log('screenshare', `Audio capture unavailable (${audioErr.message}), sharing video-only`);
-                    stream = await navigator.mediaDevices.getDisplayMedia({
-                        video: videoConstraints,
-                        audio: false
-                    });
+            // Try with system audio capture first, fall back to video-only
+            // (audio capture is not supported in all environments / screen types)
+            try {
+                stream = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions(true));
+            } catch (audioErr) {
+                // If user cancelled the picker, don't retry
+                if (audioErr.name === 'NotAllowedError' || audioErr.name === 'AbortError') {
+                    throw audioErr;
                 }
-            } else {
-                stream = await navigator.mediaDevices.getDisplayMedia({
-                    video: videoConstraints,
-                    audio: false
-                });
+                // The name matters more than the message when this is reported: NotReadableError
+                // is the OS refusing to open the audio endpoint (a virtual or exclusive-mode
+                // default output, typically), which is worth telling apart from the surface
+                // simply not offering audio.
+                this.log('screenshare', `Audio capture unavailable (${audioErr.name}: ${audioErr.message}), sharing video-only`);
+                stream = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions(false));
             }
 
             const sharedVideoTrack = stream.getVideoTracks()[0] || null;
             this.applyVideoTrackContentHint(sharedVideoTrack, 'screenshare');
+
+            // Instant sender-side pause state: minimizing the captured window mutes
+            // the capture track well before the frame watchdog would notice.
+            if (sharedVideoTrack) {
+                sharedVideoTrack.addEventListener('mute', () => {
+                    this.log('screenshare', 'Share source stopped producing frames (window minimized?)');
+                    const localCell = document.getElementById('localVideo')?.closest('.video-cell');
+                    this.setCellPausedState(localCell, true);
+                });
+                sharedVideoTrack.addEventListener('unmute', () => {
+                    this.log('screenshare', 'Share source resumed producing frames');
+                    const localVideo = document.getElementById('localVideo');
+                    if (localVideo) localVideo._lastFrameTs = performance.now();
+                    this.setCellPausedState(localVideo?.closest('.video-cell'), false);
+                });
+            }
+            this.ensureVideoPauseWatchdog();
             const videoSettings = sharedVideoTrack?.getSettings?.() || {};
             const displaySurface = (videoSettings.displaySurface || '').toString();
             const trackLabel = (sharedVideoTrack?.label || '').toString();
@@ -7120,6 +9398,9 @@ window.webrtcManager = {
             const shareTarget = this.classifyScreenShareTarget(displaySurface, `${targetLabel} ${trackLabel}`);
             const isSystemShare = shareTarget === 'system';
             const treatAsWindowShare = shareTarget !== 'system';
+            // Remembered so a mid-share settings toggle can engage the native audio
+            // fallback with the same target the share was started with.
+            this.activeScreenShareTarget = { targetLabel, displaySurface, shareTarget };
             await this.tuneScreenShareVideoTrackForPerformance(
                 sharedVideoTrack,
                 fps,
@@ -7128,8 +9409,10 @@ window.webrtcManager = {
             );
 
             // Some Windows builds attach display-audio slightly after getDisplayMedia resolves.
-            // Give it a short grace window before engaging native fallback.
-            if (captureScreenAudio && stream.getAudioTracks().length === 0) {
+            // Give it a short grace window before engaging native fallback. Gated on the
+            // fallback setting: without a fallback to avoid, a late display track is
+            // picked up by the stream's onaddtrack reconcile instead.
+            if (nativeFallbackAllowed && stream.getAudioTracks().length === 0) {
                 const delayedAudioTrack = await this.waitForScreenShareAudioTrack(stream, 1100);
                 if (delayedAudioTrack) {
                     this.log('screenshare', 'Display audio track appeared after capture start; skipping native fallback');
@@ -7138,14 +9421,19 @@ window.webrtcManager = {
 
             // WebView2 often returns no display-audio track for window/screen picks.
             // On Windows desktop, request native loopback fallback via host bridge only when still needed.
-            if (captureScreenAudio && stream.getAudioTracks().length === 0) {
+            if (nativeFallbackAllowed && stream.getAudioTracks().length === 0) {
                 const preferProcessIsolation = treatAsWindowShare;
-                const allowSystemFallback = isSystemShare;
+                // 'unknown' also allows the system fallback. It used to be excluded,
+                // which turned "old WebView2 runtime reports neither displaySurface
+                // nor a recognizable label" into a guaranteed-silent full-screen
+                // share. The native side still tries process isolation first, so a
+                // real window share that lands here only widens to system loopback
+                // when the window's process cannot be resolved.
+                const allowSystemFallback = isSystemShare || shareTarget === 'unknown';
                 if (!allowSystemFallback) {
-                    const reason = shareTarget === 'unknown'
-                        ? 'share target classification uncertain'
-                        : 'window capture detected';
-                    this.log('screenshare', `${reason}; system audio fallback is disabled`);
+                    this.log('screenshare', 'window capture detected; system audio fallback is disabled');
+                } else if (shareTarget === 'unknown') {
+                    this.log('screenshare', 'share target classification uncertain; allowing system audio fallback as best effort');
                 }
 
                 const fallbackAudioTrack = await this.startWindowsScreenAudioFallback({
@@ -7181,8 +9469,10 @@ window.webrtcManager = {
                 );
             }
 
+            // Both of these key off actual track state now, not the settings switch:
+            // display audio can exist with the fallback disabled and vice versa.
             const preferredPreFallbackShutdown = this.selectPreferredScreenShareAudioTrack(stream);
-            if (captureScreenAudio && preferredPreFallbackShutdown
+            if (preferredPreFallbackShutdown
                 && this.isWindowsNativeFallbackAudioTrack(this.screenAudioFallbackTrack)
                 && preferredPreFallbackShutdown.id !== this.screenAudioFallbackTrack.id) {
                 this.log('screenshare', 'Browser display audio track available; disabling Windows native fallback to avoid double audio');
@@ -7190,9 +9480,9 @@ window.webrtcManager = {
             }
 
             const hasLiveShareAudioTrack = stream.getAudioTracks().some(t => t && t.readyState === 'live');
-            const shouldSuppressAppPlayback = captureScreenAudio && isSystemShare && hasLiveShareAudioTrack;
+            const shouldSuppressAppPlayback = isSystemShare && hasLiveShareAudioTrack;
             this.setSystemScreenShareAppPlaybackSuppressed(shouldSuppressAppPlayback);
-            if (!shouldSuppressAppPlayback && captureScreenAudio && isSystemShare) {
+            if (!shouldSuppressAppPlayback && isSystemShare) {
                 this.log('screenshare', 'System share has no active share-audio track; keeping in-app playback enabled');
             }
 
@@ -7213,8 +9503,11 @@ window.webrtcManager = {
                         await this.stopWindowsScreenAudioFallback(true);
                     }
 
+                    // Route whatever screen audio exists — the settings switch only
+                    // decides whether the native fallback gets STARTED, never whether
+                    // browser-granted display audio is published.
                     const preferredTrack = this.selectPreferredScreenShareAudioTrack(stream);
-                    if (this.currentConstraints.screenShareAudioEnabled !== false) {
+                    if (preferredTrack) {
                         const separateAudioReady = await this.ensureScreenAudioPublisher(preferredTrack);
                         if (this.publisherPc) {
                             const audioSender = this.findSenderByKind(this.publisherPc, 'audio');
@@ -7239,7 +9532,7 @@ window.webrtcManager = {
                             }
                         }
                     } else {
-                        await this.stopScreenAudioPublisher('screenshare-audio-disabled');
+                        await this.stopScreenAudioPublisher('no-screen-audio-track');
                     }
                 } catch (err) {
                     this.log('screenshare', `onaddtrack audio reconcile failed: ${err.message}`);
@@ -7251,7 +9544,9 @@ window.webrtcManager = {
             const outgoingMainMicTrack = this.localStream?.getAudioTracks?.()[0] || null;
             let outgoingMainAudioTrack = outgoingMainMicTrack;
             let usingSeparateScreenAudioPublisher = false;
-            if (this.currentConstraints.screenShareAudioEnabled !== false) {
+            // Publish is driven by track presence, not the settings switch: display
+            // audio granted in the picker always goes out.
+            if (outgoingScreenAudioTrack) {
                 usingSeparateScreenAudioPublisher = await this.ensureScreenAudioPublisher(outgoingScreenAudioTrack);
                 if (!usingSeparateScreenAudioPublisher) {
                     outgoingMainAudioTrack = await this.buildScreenShareOutgoingAudioTrack(outgoingScreenAudioTrack, outgoingMainMicTrack);
@@ -7265,7 +9560,7 @@ window.webrtcManager = {
                     }
                 }
             } else {
-                await this.stopScreenAudioPublisher('screenshare-audio-disabled');
+                await this.stopScreenAudioPublisher('no-screen-audio-track');
             }
 
             const localVideo = document.getElementById('localVideo');
@@ -7359,6 +9654,14 @@ window.webrtcManager = {
             }
 
             this.notifyDotNet('OnScreenShareChanged', true);
+            this.reportScreenShareTarget(targetLabel, displaySurface);
+            // Frame dimensions settle slightly after capture starts; re-report so the
+            // overlay resolves the right monitor.
+            setTimeout(() => {
+                if (this.isScreenSharing && this.screenStream === stream) {
+                    this.reportScreenShareTarget(targetLabel, displaySurface);
+                }
+            }, 900);
         } catch (err) {
             this.stopPublisherVideoPerformanceGuard();
             this.clearScreenShareBitrateWarmupTimers();
@@ -7375,6 +9678,7 @@ window.webrtcManager = {
             await this.stopMusicBotPlaybackInternal({ restorePublisherTrack: false, notifyState: true });
         }
 
+        this.activeScreenShareTarget = null;
         this.stopPublisherVideoPerformanceGuard();
         this.clearScreenShareBitrateWarmupTimers();
         await this.stopWindowsScreenAudioFallback(true);
@@ -7733,6 +10037,10 @@ window.webrtcManager = {
         this.stopPublisherVideoPerformanceGuard();
         this.stopPublisherHealthWatchdog();
         this.clearScreenShareBitrateWarmupTimers();
+        this.lastParticipantCheckAtMs = 0;
+        this.lastRemoteFeedHealthRunAtMs = 0;
+        this.lastStreamInfoRefreshAtMs = 0;
+        this.remoteFeedHealthCursor = 0;
         this.selectedSpotlightStreamKey = null;
         this.controlOverlayHideTimers = new WeakMap();
         const videoGrid = document.getElementById('videoGrid');
@@ -7743,10 +10051,18 @@ window.webrtcManager = {
         this.pttKeyDown = false;
         this.pttPressedCodes.clear();
         this.notifyHostPttConfig();
+        this.releaseDtlnWasmCache();
+        this.releaseRawMicTrack();
+        this.flushPersistedRemoteIdentityVolumes();
+        this.cancelScheduledRemoteAudioRoutingRefresh();
+        this.clearAllTrickleBatches();
+        this._displayParseCache = null;
+        this._screenAudioScratch = null;
         this.stopWindowsScreenAudioFallback(true).catch(() => { });
         this.cleanupScreenShareAudioMixTrack().catch(() => { });
         this.stopScreenAudioPublisher('manager-stop').catch(() => { });
         this.cleanupMusicBotGraph().catch(() => { });
+        this.stopMicTest().catch(() => { });
         this.musicBotActive = false;
         this.musicBotTitle = '';
         this.musicBotStreamUrl = '';
@@ -7768,12 +10084,16 @@ window.webrtcManager = {
             this.screenStream = null;
         }
 
+        this.stopVoiceGate();
+        this._destroyDtlnWorklet();
         if (this.audioContext) {
             try { this.audioContext.close(); } catch { }
             this.audioContext = null;
             this.gainNode = null;
             this.audioDestination = null;
+            this.voiceGateAnalyser = null;
         }
+        this.resetRemoteSpeakingState();
         if (this.remotePlaybackAudioContext) {
             try { this.remotePlaybackAudioContext.close(); } catch { }
             this.remotePlaybackAudioContext = null;
@@ -7792,6 +10112,7 @@ window.webrtcManager = {
         this.screenAudioPublisherConfigured = false;
         this.screenAudioPublisherPendingCandidates = [];
         this.publisherConfigured = false;
+        this.notifyPublisherReadyChanged();
         this.pendingJanusBitrateBps = 0;
 
         Object.keys(this.nativeScreenReceivers || {}).forEach(userId => {
@@ -7821,6 +10142,7 @@ window.webrtcManager = {
         }
 
         // Remove all remote video cells
+        this.restoreAnnotationToolbarHost();
         document.querySelectorAll('.video-cell:not(.local-cell)').forEach(el => el.remove());
 
         this.removeHostMessageListener();
@@ -7841,21 +10163,81 @@ window.webrtcManager = {
 
     async enumerateDevices() {
         try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
+            let devices = await navigator.mediaDevices.enumerateDevices();
+
+            // Until some media permission has been granted, browsers return the
+            // device list with deviceId and label blanked out. Opening Settings
+            // before ever joining a call is exactly that state, so every entry
+            // arrived with an empty id - indistinguishable from "Default" - and the
+            // pickers looked broken. Prime the permission once, then re-enumerate.
+            const needsPermission = devices.some(d =>
+                (d.kind === 'audioinput' || d.kind === 'videoinput' || d.kind === 'audiooutput')
+                && !d.deviceId);
+
+            if (needsPermission) {
+                this.log('devices', 'Device ids hidden; requesting permission to reveal them');
+                try {
+                    const probe = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                    probe.getTracks().forEach(t => { try { t.stop(); } catch { } });
+                    devices = await navigator.mediaDevices.enumerateDevices();
+                } catch (permErr) {
+                    // Denied or no mic: fall through with whatever we have rather
+                    // than failing the whole enumeration.
+                    this.log('devices', `Permission probe failed (${permErr.name || permErr.message}); listing unlabeled devices`);
+                }
+            }
+
             const filtered = devices
-                .filter(d => d.kind === 'audioinput' || d.kind === 'videoinput')
+                .filter(d => d.kind === 'audioinput' || d.kind === 'videoinput' || d.kind === 'audiooutput')
                 .map(d => ({
                     deviceId: d.deviceId,
-                    label: d.label || `${d.kind} (${d.deviceId.slice(0, 8)})`,
+                    label: d.label || `${d.kind} (${(d.deviceId || 'default').slice(0, 8)})`,
                     kind: d.kind
                 }));
-            this.log('devices', `Found ${filtered.length} devices`);
+
+            const counts = filtered.reduce((acc, d) => { acc[d.kind] = (acc[d.kind] || 0) + 1; return acc; }, {});
+            this.log('devices', `Found ${filtered.length} devices (${JSON.stringify(counts)})`);
             this.notifyDotNet('OnDevicesEnumerated', JSON.stringify(filtered));
             return filtered;
         } catch (err) {
             this.logError('devices', 'enumerateDevices failed: ' + err.message);
             return [];
         }
+    },
+
+    /// Routes playback to a chosen output device. setSinkId is Chromium-only and
+    /// rejects on elements that are not yet ready, so every call is best-effort and
+    /// failures are logged rather than thrown.
+    async setAudioOutputDevice(deviceId) {
+        const sinkId = (deviceId || '').toString().trim();
+        this.selectedSinkId = sinkId;
+
+        const elements = [
+            ...document.querySelectorAll('#videoGrid video, #videoGrid audio'),
+            this.micTestAudioElement
+        ].filter(Boolean);
+
+        let applied = 0;
+        for (const el of elements) {
+            if (typeof el.setSinkId !== 'function') continue;
+            try {
+                await el.setSinkId(sinkId);
+                applied++;
+            } catch (err) {
+                this.log('devices', `setSinkId failed on an element: ${err.message}`);
+            }
+        }
+
+        this.log('devices', `Audio output routed to ${sinkId || 'system default'} (${applied} element(s))`);
+        return applied;
+    },
+
+    /// Re-applies the chosen output device to an element that has just been created
+    /// (new remote feed, mic-test element), so later joins honour the setting.
+    applySelectedSinkTo(element) {
+        const sinkId = (this.selectedSinkId || '').toString();
+        if (!sinkId || !element || typeof element.setSinkId !== 'function') return;
+        element.setSinkId(sinkId).catch(() => { });
     },
 
     // ─── Volume control ─────────────────────────────────────────────────────────
@@ -7871,8 +10253,56 @@ window.webrtcManager = {
     setStreamVolume(level) {
         const clamped = Math.max(0, Math.min(2, Number(level) || 0));
         this.streamVolume = clamped;
+        if (this.micTestAudioElement) {
+            this.micTestAudioElement.volume = Math.max(0, Math.min(1, clamped));
+        }
         this.log('volume', `Set stream volume to ${clamped}`);
         this.refreshRemoteAudioRouting();
+    },
+
+    async startMicTest(micDeviceId) {
+        await this.stopMicTest();
+
+        const normalizedMicId = (micDeviceId || '').toString().trim();
+        const audioConstraint = normalizedMicId
+            ? { deviceId: { exact: normalizedMicId } }
+            : true;
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraint,
+            video: false
+        });
+
+        const audioElement = document.createElement('audio');
+        audioElement.autoplay = true;
+        audioElement.playsInline = true;
+        audioElement.muted = false;
+        audioElement.volume = Math.max(0, Math.min(1, Number(this.streamVolume) || 1));
+        audioElement.srcObject = stream;
+        await audioElement.play();
+
+        this.micTestStream = stream;
+        this.micTestAudioElement = audioElement;
+        this.micTestStreamIdentity = this.getMediaStreamIdentity(stream);
+        this.log('audio', `Mic test started${normalizedMicId ? ` (device=${normalizedMicId})` : ''}`);
+    },
+
+    async stopMicTest() {
+        if (this.micTestAudioElement) {
+            try { this.micTestAudioElement.pause(); } catch { }
+            try { this.micTestAudioElement.srcObject = null; } catch { }
+        }
+        this.micTestAudioElement = null;
+
+        if (this.micTestStream) {
+            const tracks = this.micTestStream.getTracks?.() || [];
+            for (const track of tracks) {
+                try { track.stop(); } catch { }
+            }
+        }
+
+        this.micTestStream = null;
+        this.micTestStreamIdentity = '';
     },
 
     // ─── Settings update ────────────────────────────────────────────────────────
@@ -7888,8 +10318,12 @@ window.webrtcManager = {
             settings.bitrateKbps ?? this.currentConstraints.bitrateKbps ?? 2000
         );
         const previousVideoCodec = this.normalizeVideoCodec(this.currentConstraints.preferredVideoCodec);
+        const previousH264Override = this.normalizeH264ProfileOverrideValue(this.currentConstraints.h264ProfileOverride);
         const requestedVideoCodec = this.normalizeVideoCodec(
             settings.preferredVideoCodec ?? this.currentConstraints.preferredVideoCodec
+        );
+        const requestedH264Override = this.normalizeH264ProfileOverrideValue(
+            settings.h264ProfileOverride ?? this.currentConstraints.h264ProfileOverride
         );
         const requestedScreenShareAudioEnabled =
             settings.screenShareAudioEnabled !== undefined
@@ -7899,19 +10333,80 @@ window.webrtcManager = {
             settings.screenShareAutoGainEnabled !== undefined
                 ? settings.screenShareAutoGainEnabled !== false
                 : this.currentConstraints.screenShareAutoGainEnabled !== false;
+        const requestedNoiseSuppressionEnabled =
+            settings.noiseSuppressionEnabled !== undefined
+                ? settings.noiseSuppressionEnabled !== false
+                : this.currentConstraints.noiseSuppressionEnabled !== false;
+        const requestedHideLocalPreview =
+            settings.hideLocalPreview !== undefined
+                ? settings.hideLocalPreview === true
+                : this.currentConstraints.hideLocalPreview === true;
+        const requestedVoiceGateEnabled =
+            settings.voiceGateEnabled !== undefined
+                ? settings.voiceGateEnabled === true
+                : this.currentConstraints.voiceGateEnabled === true;
+        const requestedVoiceGateAuto =
+            settings.voiceGateAuto !== undefined
+                ? settings.voiceGateAuto !== false
+                : this.currentConstraints.voiceGateAuto !== false;
+        const requestedVoiceGateThreshold =
+            settings.voiceGateThreshold !== undefined
+                ? (parseInt(settings.voiceGateThreshold, 10) || 30)
+                : (this.currentConstraints.voiceGateThreshold || 30);
         let needsPublisherStateRenegotiation = false;
 
-        // Re-acquire local stream with new device constraints
-        await this.startLocalStream({
+        const nextConstraints = {
             micDeviceId: settings.micDeviceId || null,
             cameraDeviceId: settings.cameraDeviceId || null,
             resolution: settings.resolution || '1280x720',
             fps: settings.fps || 30,
             bitrateKbps,
             preferredVideoCodec: requestedVideoCodec,
+            h264ProfileOverride: requestedH264Override,
+            noiseSuppressionEnabled: requestedNoiseSuppressionEnabled,
+            hideLocalPreview: requestedHideLocalPreview,
             screenShareAudioEnabled: requestedScreenShareAudioEnabled,
-            screenShareAutoGainEnabled: requestedScreenShareAutoGainEnabled
-        });
+            screenShareAutoGainEnabled: requestedScreenShareAutoGainEnabled,
+            voiceGateEnabled: requestedVoiceGateEnabled,
+            voiceGateAuto: requestedVoiceGateAuto,
+            voiceGateThreshold: requestedVoiceGateThreshold
+        };
+
+        // Only a device or capture-format change actually needs getUserMedia torn down and
+        // re-run. Doing it unconditionally also closed the AudioContext, destroyed and rebuilt
+        // the DTLN worklet, and re-enumerated devices — for a bitrate or voice-gate tweak.
+        const previous = this.currentConstraints;
+        const deviceChanged =
+            (previous.micDeviceId || null) !== nextConstraints.micDeviceId
+            || (previous.cameraDeviceId || null) !== nextConstraints.cameraDeviceId;
+        const formatChanged =
+            (previous.resolution || '1280x720') !== nextConstraints.resolution
+            || (parseInt(previous.fps, 10) || 30) !== (parseInt(nextConstraints.fps, 10) || 30);
+        const noiseSuppressionChanged =
+            (previous.noiseSuppressionEnabled !== false) !== requestedNoiseSuppressionEnabled;
+
+        const reacquiredLocalStream = deviceChanged || formatChanged || !this.localStream;
+
+        if (reacquiredLocalStream) {
+            await this.startLocalStream(nextConstraints);
+        } else {
+            Object.assign(this.currentConstraints, nextConstraints);
+            this.normalizeCurrentConstraints('updateSettings');
+
+            if (noiseSuppressionChanged) {
+                // Inserting or removing the DTLN node is a graph change; nothing cheaper works.
+                await this.setupAudioPipeline();
+                // The pipeline rebuild swapped localStream's audio track, so the analyzer is now
+                // bound to a dead one. Idempotent — no-ops when the stream identity is unchanged.
+                this.ensureLocalSpeakingAnalyzer();
+            } else {
+                this.applyVoiceGateSettings();
+            }
+
+            // Mirror the DOM sync startLocalStream does after acquiring.
+            this.updateLocalFeedAvatarFallback();
+            this.ensureLocalFeedCellControls();
+        }
 
         if (this.screenAudioFallbackActive) {
             this.applyWindowsScreenAudioFallbackGainMode('settings');
@@ -7930,23 +10425,66 @@ window.webrtcManager = {
                 const activeFps = parseInt(settings.fps ?? this.currentConstraints.fps, 10) || 30;
                 const audioSender = this.findSenderByKind(this.publisherPc, 'audio');
                 const micTrack = this.localStream.getAudioTracks()[0] || null;
+
+                // The settings switch governs only the native fallback capture.
+                // Browser display audio, once granted in the picker, keeps flowing
+                // regardless of the switch.
+                const nativeFallbackAllowed = this.currentConstraints.screenShareAudioEnabled !== false;
+
+                // Mid-share ENABLE: routing below can only use a track that already
+                // exists, and getDisplayMedia audio cannot be added without re-picking.
+                // So when the toggle comes on and the share has no audio track, engage
+                // the native fallback now with the share's remembered target - without
+                // this the switch silently did nothing until the next share.
+                if (nativeFallbackAllowed
+                    && this.screenStream
+                    && this.screenStream.getAudioTracks().length === 0
+                    && !this.screenAudioFallbackActive) {
+                    const target = this.activeScreenShareTarget || {};
+                    const midShareFallbackTrack = await this.startWindowsScreenAudioFallback({
+                        preferProcessIsolation: target.shareTarget !== 'system',
+                        allowSystemFallback: target.shareTarget === 'system' || target.shareTarget === 'unknown',
+                        targetLabel: target.targetLabel || '',
+                        displaySurface: target.displaySurface || ''
+                    });
+                    if (midShareFallbackTrack) {
+                        this.screenStream.addTrack(midShareFallbackTrack);
+                        this.log('screenshare', 'Settings enable: engaged native audio fallback mid-share');
+                    }
+                }
+
+                // Mid-share DISABLE: stop the native capture (and its WASAPI session).
+                // Display audio from the browser is deliberately left alone.
+                if (!nativeFallbackAllowed && this.screenAudioFallbackActive) {
+                    await this.stopWindowsScreenAudioFallback(true);
+                }
+
+                // Ended tracks must not win the preferred-track selection.
+                if (this.screenStream) {
+                    for (const staleTrack of this.screenStream.getAudioTracks()) {
+                        if (staleTrack.readyState === 'ended') {
+                            try { this.screenStream.removeTrack(staleTrack); } catch { }
+                        }
+                    }
+                }
+
                 const screenAudioTrack = this.selectPreferredScreenShareAudioTrack(this.screenStream);
                 let nextMainAudioTrack = micTrack;
                 let separateScreenAudioReady = false;
 
-                if (this.currentConstraints.screenShareAudioEnabled !== false) {
+                if (screenAudioTrack) {
                     separateScreenAudioReady = await this.ensureScreenAudioPublisher(screenAudioTrack);
                     if (!separateScreenAudioReady) {
                         nextMainAudioTrack = await this.buildScreenShareOutgoingAudioTrack(screenAudioTrack, micTrack);
                     }
                 } else {
-                    await this.stopScreenAudioPublisher('settings-disable-screenshare-audio');
+                    await this.stopScreenAudioPublisher('no-screen-audio-track');
                 }
 
                 if (audioSender) {
                     await audioSender.replaceTrack(nextMainAudioTrack);
                     await this.enforceSinglePublisherAudioSender(nextMainAudioTrack);
-                    if (!separateScreenAudioReady && this.currentConstraints.screenShareAudioEnabled !== false) {
+                    if (!separateScreenAudioReady && screenAudioTrack) {
                         const fallbackIsMixed = !!(nextMainAudioTrack && micTrack && nextMainAudioTrack.id !== micTrack.id);
                         this.log(
                             'screenshare',
@@ -8000,21 +10538,40 @@ window.webrtcManager = {
         }
 
         // Codec and transceiver-direction changes need renegotiation to take effect.
-        if (this.publisherPc && (needsPublisherStateRenegotiation || previousVideoCodec !== requestedVideoCodec)) {
+        const h264ProfileChanged = previousH264Override !== requestedH264Override;
+        const needsH264ProfileRenegotiation = requestedVideoCodec === 'h264' && h264ProfileChanged;
+        if (this.publisherPc && (needsPublisherStateRenegotiation || previousVideoCodec !== requestedVideoCodec || needsH264ProfileRenegotiation)) {
             if (previousVideoCodec !== requestedVideoCodec) {
                 this.log('settings', `Preferred video codec changed ${previousVideoCodec} -> ${requestedVideoCodec}`);
             }
+            if (needsH264ProfileRenegotiation) {
+                const effective = this.resolveEffectiveH264Override();
+                if (effective.profileLevelId) {
+                    this.log(
+                        'settings',
+                        `H264 profile preference changed ${previousH264Override || 'auto'} -> ${requestedH264Override || 'auto'} (effective ${effective.profileLevelId}:${effective.packetizationMode ?? 0})`
+                    );
+                } else {
+                    this.log('settings', `H264 profile preference changed ${previousH264Override || 'auto'} -> ${requestedH264Override || 'auto'}`);
+                }
+            }
             const renegotiateTag = needsPublisherStateRenegotiation && previousVideoCodec !== requestedVideoCodec
                 ? 'settings-camera-codec'
-                : (needsPublisherStateRenegotiation ? 'settings-camera-state' : 'settings-codec');
+                : (needsPublisherStateRenegotiation
+                    ? 'settings-camera-state'
+                    : (needsH264ProfileRenegotiation ? 'settings-h264-profile' : 'settings-codec'));
             await this.renegotiatePublisher(renegotiateTag);
         }
 
-        // Re-enumerate to refresh labels (some browsers only show labels after permission)
-        await this.enumerateDevices();
+        // Re-enumerate to refresh labels (some browsers only show labels after permission).
+        // Labels can only have changed if we actually went through getUserMedia again.
+        if (reacquiredLocalStream) {
+            await this.enumerateDevices();
+        }
     },
 
     rebindVideoElements() {
+        this.ensureVideoPauseWatchdog();
         const localVideo = document.getElementById('localVideo');
         if (localVideo) {
             if (this.isScreenSharing && this.screenStream) {
@@ -8052,6 +10609,9 @@ window.webrtcManager = {
 
             if (stream) {
                 vid.srcObject = stream;
+                this.ensureRemoteSpeakingAnalyzer(feedId, stream);
+            } else {
+                this.removeRemoteSpeakingAnalyzer(feedId);
             }
             this.applyRemoteFeedVolume(feedId, vid);
         }

@@ -12,6 +12,9 @@ public class MessageEntity
     public DateTime SentAt { get; set; } = DateTime.UtcNow;
     public string MentionedUserIdsJson { get; set; } = "[]";
     public bool IsDeleted { get; set; }
+    public DateTime? EditedAt { get; set; }
+    public Guid? ReplyToMessageId { get; set; }
+    public MessageEntity? ReplyTo { get; set; }
     public ChatRoomEntity Room { get; set; } = null!;
     public AppUser Sender { get; set; } = null!;
     public ICollection<AttachmentEntity> Attachments { get; set; } = [];

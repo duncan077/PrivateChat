@@ -1,0 +1,108 @@
+@inject IJSRuntime JS
+
+@* Formatting bar for the message composer. Insert buttons splice markdown around
+   the textarea selection via chat-input.js; the same shortcuts work from the
+   keyboard (Ctrl+B/I/E/K, Ctrl+Shift+X). The right side holds the mode switch:
+   Write <-> Preview, plus the expand toggle. *@
+
+<div class="chat-composer-toolbar" role="toolbar" aria-label="Message formatting">
+    <div class="chat-composer-toolbar-group">
+        <MudIconButton Icon="@Icons.Material.Filled.FormatBold" Size="Size.Small"
+                       Disabled="@InsertDisabled" title="Bold (Ctrl+B)"
+                       OnClick="@(() => WrapAsync("**", "**", "bold"))" />
+        <MudIconButton Icon="@Icons.Material.Filled.FormatItalic" Size="Size.Small"
+                       Disabled="@InsertDisabled" title="Italic (Ctrl+I)"
+                       OnClick="@(() => WrapAsync("*", "*", "italic"))" />
+        <MudIconButton Icon="@Icons.Material.Filled.FormatStrikethrough" Size="Size.Small"
+                       Disabled="@InsertDisabled" title="Strikethrough (Ctrl+Shift+X)"
+                       OnClick="@(() => WrapAsync("~~", "~~", "strikethrough"))" />
+        <MudIconButton Icon="@Icons.Material.Filled.Code" Size="Size.Small"
+                       Disabled="@InsertDisabled" title="Inline code (Ctrl+E)"
+                       OnClick="@(() => WrapAsync("`", "`", "code"))" />
+        <MudIconButton Icon="@Icons.Material.Filled.DataObject" Size="Size.Small"
+                       Disabled="@InsertDisabled" title="Code block"
+                       OnClick="CodeBlockAsync" />
+        <MudIconButton Icon="@Icons.Material.Filled.FormatQuote" Size="Size.Small"
+                       Disabled="@InsertDisabled" title="Quote"
+                       OnClick="@(() => PrefixAsync("> "))" />
+        <MudIconButton Icon="@Icons.Material.Filled.FormatListBulleted" Size="Size.Small"
+                       Disabled="@InsertDisabled" title="Bullet list"
+                       OnClick="@(() => PrefixAsync("- "))" />
+        <MudIconButton Icon="@Icons.Material.Filled.Link" Size="Size.Small"
+                       Disabled="@InsertDisabled" title="Link (Ctrl+K)"
+                       OnClick="@(() => WrapAsync("[", "](url)", "text"))" />
+    </div>
+
+    <div class="chat-composer-toolbar-group">
+        @if (OnOpenStickers.HasDelegate)
+        {
+            <MudIconButton Icon="@Icons.Material.Filled.EmojiEmotions" Size="Size.Small"
+                           Disabled="@Disabled" title="Stickers"
+                           OnClick="@(() => OnOpenStickers.InvokeAsync())" />
+        }
+        <MudIconButton Icon="@(Expanded ? Icons.Material.Filled.UnfoldLess : Icons.Material.Filled.UnfoldMore)"
+                       Size="Size.Small"
+                       title="@(Expanded ? "Shrink input" : "Expand input")"
+                       OnClick="@(() => ExpandedChanged.InvokeAsync(!Expanded))" />
+        <MudButton Size="Size.Small" Variant="@(PreviewActive ? Variant.Filled : Variant.Text)"
+                   Color="@(PreviewActive ? Color.Primary : Color.Default)"
+                   Class="chat-composer-preview-toggle"
+                   StartIcon="@(PreviewActive ? Icons.Material.Filled.EditNote : Icons.Material.Filled.Visibility)"
+                   OnClick="@(() => PreviewActiveChanged.InvokeAsync(!PreviewActive))">
+            @(PreviewActive ? "Write" : "Preview")
+        </MudButton>
+    </div>
+</div>
+
+@code {
+    /// <summary>Id of the element containing the composer textarea.</summary>
+    [Parameter, EditorRequired] public string HostId { get; set; } = string.Empty;
+
+    [Parameter] public bool Disabled { get; set; }
+    [Parameter] public bool PreviewActive { get; set; }
+    [Parameter] public EventCallback<bool> PreviewActiveChanged { get; set; }
+    [Parameter] public bool Expanded { get; set; }
+    [Parameter] public EventCallback<bool> ExpandedChanged { get; set; }
+
+    /// <summary>Optional — when set, the toolbar carries the sticker button.</summary>
+    [Parameter] public EventCallback OnOpenStickers { get; set; }
+
+    // Insertion needs the textarea, which is not rendered while previewing.
+    private bool InsertDisabled => Disabled || PreviewActive;
+
+    private async Task WrapAsync(string before, string after, string placeholder)
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("chatInput.wrapSelection", HostId, before, after, placeholder);
+        }
+        catch
+        {
+            // A missed insertion must not take the composer down.
+        }
+    }
+
+    private async Task PrefixAsync(string prefix)
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("chatInput.prefixLines", HostId, prefix);
+        }
+        catch
+        {
+            // Same as above.
+        }
+    }
+
+    private async Task CodeBlockAsync()
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("chatInput.insertCodeBlock", HostId);
+        }
+        catch
+        {
+            // Same as above.
+        }
+    }
+}

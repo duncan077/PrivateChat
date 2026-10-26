@@ -14,6 +14,17 @@
         </div>
     </div>
 
+    @* Screen-share annotation tools.
+       The anchor/host pair exists for fullscreen: element fullscreen renders only
+       the fullscreened cell's subtree, so webrtc-manager physically moves the host
+       div into the fullscreen cell (and back to the anchor on exit) to keep the
+       tools reachable. Blazor keeps patching the host's children by node
+       reference, so the temporary reparenting is invisible to it. *@
+    <div id="annotationToolbarAnchor" style="display:none"></div>
+    <div id="annotationToolbarHost" class="annotation-toolbar-host">
+        <AnnotationToolbar />
+    </div>
+
     @* Controls toolbar *@
     <MudStack Row AlignItems="AlignItems.Center" Justify="Justify.Center" Spacing="2" Class="call-controls-bar">
         @if (Store.PushToTalkEnabled)
@@ -29,15 +40,31 @@
                        Variant="Variant.Filled"
                        OnClick="ToggleMute" />
 
-        <MudIconButton Icon="@(Store.IsCameraOff ? Icons.Material.Filled.VideocamOff : Icons.Material.Filled.Videocam)"
-                       Color="@(Store.IsCameraOff ? Color.Error : Color.Default)"
-                       Variant="Variant.Filled"
-                       OnClick="ToggleCamera" />
+        @* Both are disabled until the publisher is negotiated. Pressing them earlier
+           started the local capture and published nothing, so the preview lit up while
+           nobody else received a frame. *@
+        <MudTooltip Text="@MediaControlTooltip">
+            <MudIconButton Icon="@(Store.IsCameraOff ? Icons.Material.Filled.VideocamOff : Icons.Material.Filled.Videocam)"
+                           Color="@(Store.IsCameraOff ? Color.Error : Color.Default)"
+                           Variant="Variant.Filled"
+                           Disabled="@(!Store.IsPublisherReady)"
+                           OnClick="ToggleCamera" />
+        </MudTooltip>
 
-        <MudIconButton Icon="@(Store.IsScreenSharing ? Icons.Material.Filled.StopScreenShare : Icons.Material.Filled.ScreenShare)"
-                       Color="@(Store.IsScreenSharing ? Color.Warning : Color.Default)"
-                       Variant="Variant.Filled"
-                       OnClick="ToggleScreenShare" />
+        <MudTooltip Text="@MediaControlTooltip">
+            <MudIconButton Icon="@(Store.IsScreenSharing ? Icons.Material.Filled.StopScreenShare : Icons.Material.Filled.ScreenShare)"
+                           Color="@(Store.IsScreenSharing ? Color.Warning : Color.Default)"
+                           Variant="Variant.Filled"
+                           Disabled="@(!Store.IsPublisherReady)"
+                           OnClick="ToggleScreenShare" />
+        </MudTooltip>
+
+        <MudTooltip Text="@(Store.HideNonVideoParticipants ? "Show all participants" : "Hide participants without video (audio stays on)")">
+            <MudIconButton Icon="@(Store.HideNonVideoParticipants ? Icons.Material.Filled.PersonOff : Icons.Material.Filled.People)"
+                           Color="@(Store.HideNonVideoParticipants ? Color.Primary : Color.Default)"
+                           Variant="Variant.Filled"
+                           OnClick="ToggleHideNonVideo" />
+        </MudTooltip>
 
         <MudIconButton Icon="@Icons.Material.Filled.CallEnd"
                        Color="Color.Error"
@@ -50,6 +77,10 @@
 @code {
     [Parameter] public Guid RoomId { get; set; }
     [Parameter] public string RoomName { get; set; } = "";
+
+    private string MediaControlTooltip => Store.IsPublisherReady
+        ? "Camera and screen share"
+        : "Connecting to the call - available in a moment";
 
     protected override void OnInitialized()
     {
@@ -66,6 +97,9 @@
         try
         {
             await WebRtc.RebindVideoElementsAsync();
+            // Blazor recreated #videoGrid, so the filter class must be re-stamped.
+            await WebRtc.SetHideNonVideoTilesAsync(Store.HideNonVideoParticipants);
+            await Store.RefreshAnnotationStateAsync();
         }
         catch
         {
@@ -99,6 +133,12 @@
                 await WebRtc.StartScreenShareAsync();
         }
         catch { }
+    }
+
+    private async Task ToggleHideNonVideo()
+    {
+        Store.ToggleHideNonVideoParticipants();
+        try { await WebRtc.SetHideNonVideoTilesAsync(Store.HideNonVideoParticipants); } catch { }
     }
 
     private void OnStoreChanged() => InvokeAsync(StateHasChanged);

@@ -9,6 +9,7 @@
 @inject IDialogService Dialogs
 @inject IJSRuntime JS
 @inject MembersPanelStore MembersPanel
+@inject MarkdownRenderService Md
 
 <div class="rooms-page">
    
@@ -25,6 +26,10 @@
                     </div>
 
                     <MudStack Row Wrap="Wrap.Wrap" AlignItems="AlignItems.Center" Spacing="1" Class="chat-toolbar-actions">
+                        <MudIconButton Icon="@Icons.Material.Filled.Search"
+                                       Size="Size.Small"
+                                       title="Search messages"
+                                       OnClick="OpenSearch" />
                         <MudIconButton Icon="@GetSelectedRoomNotificationIcon()"
                                        Size="Size.Small"
                                        Color="@GetSelectedRoomNotificationColor()"
@@ -32,7 +37,7 @@
                                        OnClick="CycleSelectedRoomNotificationMode" />
                         @if ((Store.SelectedRoom?.IsVoiceEnabled == true || Store.SelectedRoom?.IsVideoEnabled == true))
                         {
-                            @if (_joining)
+                            @if (_joining && _joiningRoomId == Store.SelectedRoomId)
                             {
                                 <MudButton StartIcon="@Icons.Material.Filled.HourglassTop" Size="Size.Small"
                                            Variant="Variant.Filled" Color="Color.Warning"
@@ -57,8 +62,11 @@
                                            title="@(Call.UseFloatingOverlayInActiveRoom ? "Show full call" : "Open chat and float call")"
                                            OnClick="ToggleChatCallLayout" />
                         }
-                        @if (Store.SelectedRoom?.OwnerId == Auth.CurrentUser?.Id)
+                        @if (Store.SelectedRoom?.OwnerId == Auth.CurrentUser?.Id || Store.CurrentUserRole >= UserRole.Admin)
                         {
+                            <MudButton StartIcon="@Icons.Material.Filled.DriveFileRenameOutline" Size="Size.Small"
+                                       Variant="Variant.Text" Color="Color.Default"
+                                       OnClick="OpenRenameRoom">Rename</MudButton>
                             <MudButton StartIcon="@Icons.Material.Filled.DeleteForever" Size="Size.Small"
                                        Variant="Variant.Text" Color="Color.Error"
                                        OnClick="DeleteSelectedRoom">Delete Room</MudButton>
@@ -81,10 +89,23 @@
             {
                 <div class="chat-messages-host">
                     <div class="chat-messages-area @(IsInlineCallVisible ? "call-active" : "")" @ref="_messagesContainerRef">
-                        @foreach (var msg in Store.Messages)
+                        @if (Store.HasMoreHistory && Store.Messages.Count > 0)
                         {
-                            var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
-                            <div class="chat-msg @(isOwn ? "own" : "") @(msg.IsDeleted ? "deleted" : "")">
+                            <div class="chat-load-older">
+                                <MudButton Size="Size.Small" Variant="Variant.Text"
+                                           Disabled="Store.IsLoadingOlder"
+                                           OnClick="LoadOlderMessages">
+                                    @(Store.IsLoadingOlder ? "Loading..." : "Load older messages")
+                                </MudButton>
+                            </div>
+                        }
+                        <VirtualMessageList TItem="ChatMessage" Items="Store.Messages" ItemKey="m => m.Id"
+                                            Context="msg" @ref="_virtualMessages" @key="Store.SelectedRoomId" WindowChanged="HandleMessageWindowChanged">
+                            @{
+                                var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
+                                var isEditing = _editingMessageId == msg.Id;
+                            }
+                            <div class="chat-msg @(isOwn ? "own" : "") @(msg.IsDeleted ? "deleted" : "")" @key="msg.Id" id="@($"msg-{msg.Id}")">
                                 <div class="chat-msg-header">
                                     <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
                                         @msg.SenderName
@@ -92,16 +113,69 @@
                                     <MudText Typo="Typo.caption" Color="Color.Secondary">
                                         @msg.SentAt.ToLocalTime().ToString("HH:mm")
                                     </MudText>
-                                    @if (isOwn || Store.CurrentUserRole >= UserRole.Moderator)
+                                    @if (msg.EditedAt != null && !msg.IsDeleted)
                                     {
-                                        <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
-                                                       Color="Color.Error" OnClick="() => DeleteMessage(msg.Id)"
-                                                       Style="padding:2px" title="Delete" />
+                                        <MudText Typo="Typo.caption" Color="Color.Secondary"
+                                                 title="@($"Edited {msg.EditedAt.Value.ToLocalTime():g}")">(edited)</MudText>
+                                    }
+                                    @if (!msg.IsDeleted && !isEditing)
+                                    {
+                                        <div class="chat-msg-actions">
+                                            <MudIconButton Icon="@Icons.Material.Filled.Reply" Size="Size.Small"
+                                                           OnClick="() => BeginReply(msg)"
+                                                           Style="padding:2px" title="Reply" />
+                                            @if (isOwn)
+                                            {
+                                                <MudIconButton Icon="@Icons.Material.Filled.Edit" Size="Size.Small"
+                                                               OnClick="() => BeginEditMessage(msg)"
+                                                               Style="padding:2px" title="Edit" />
+                                            }
+                                            @if (isOwn || Store.CurrentUserRole >= UserRole.Moderator)
+                                            {
+                                                <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                                                               Color="Color.Error" OnClick="() => DeleteMessage(msg.Id)"
+                                                               Style="padding:2px" title="Delete" />
+                                            }
+                                        </div>
                                     }
                                 </div>
-                                @if (!msg.IsDeleted)
+                                @if (isEditing)
                                 {
-                                    <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
+                                    <div class="chat-msg-edit" id="chatEditHost">
+                                        <MudTextField @bind-Value="_editText" Immediate="true"
+                                                      Variant="Variant.Outlined"
+                                                      Lines="1" MaxLines="8" Sizing="InputSizing.Auto"
+                                                      OnKeyDown="HandleEditKeyDown"
+                                                      Class="chat-input-field" />
+                                        <div class="chat-msg-edit-actions">
+                                            <MudButton Size="Size.Small" OnClick="CancelEditMessage">Cancel</MudButton>
+                                            <MudButton Size="Size.Small" Variant="Variant.Filled" Color="Color.Primary"
+                                                       Disabled="@string.IsNullOrWhiteSpace(_editText)"
+                                                       OnClick="SubmitEditMessage">Save</MudButton>
+                                        </div>
+                                        <MudText Typo="Typo.caption" Color="Color.Secondary">Enter to save · Esc to cancel</MudText>
+                                    </div>
+                                }
+                                else if (!msg.IsDeleted)
+                                {
+                                    @if (msg.ReplyPreview is { } quote)
+                                    {
+                                        <button type="button"
+                                                class="chat-msg-quote @(quote.IsUnavailable ? "unavailable" : string.Empty)"
+                                                disabled="@quote.IsUnavailable"
+                                                @onclick="() => JumpToRepliedMessage(msg)">
+                                            @if (quote.IsUnavailable)
+                                            {
+                                                <span class="chat-msg-quote-text">Message unavailable</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="chat-msg-quote-author">@quote.SenderName</span>
+                                                <span class="chat-msg-quote-text">@quote.Snippet</span>
+                                            }
+                                        </button>
+                                    }
+                                    <div class="chat-msg-body">@Md.Render(msg.Id, msg.Content, IsKnownMentionName)</div>
                                     var previewUrl = ExtractFirstHttpUrl(msg.Content);
                                     var preview = GetCachedLinkPreview(previewUrl);
                                     @if (preview != null && !string.IsNullOrWhiteSpace(preview.Url))
@@ -167,6 +241,11 @@
                                             }
                                         </div>
                                     }
+
+                                    <ReactionBar Reactions="msg.Reactions"
+                                                 CurrentUserId="Auth.CurrentUser?.Id"
+                                                 ResolveUserName="ResolveMemberName"
+                                                 Toggle="emoji => Store.ToggleReactionAsync(msg.Id, emoji)" />
                                 }
                                 else
                                 {
@@ -175,7 +254,7 @@
                                     </MudText>
                                 }
                             </div>
-                        }
+                        </VirtualMessageList>
                     </div>
                     <button type="button"
                             class="chat-jump-latest-button"
@@ -187,7 +266,8 @@
                 </div>
 
                 @* Input *@
-                <div class="chat-input-area @(IsInlineCallVisible ? "call-active" : "") @(_isAttachmentDragActive ? "drag-over" : "")"
+                <div id="chatAttachmentDropZone"
+                     class="chat-input-area @(IsInlineCallVisible ? "call-active" : "") @(_isAttachmentDragActive ? "drag-over" : "")"
                      @ondragenter="OnAttachmentDragEnter"
                      @ondragenter:preventDefault
                      @ondragover="OnAttachmentDragOver"
@@ -217,48 +297,94 @@
                         <MudText Typo="Typo.caption" Color="Color.Error" Class="mb-2">@_uploadError</MudText>
                     }
 
-                    <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-composer-row">
-                        <div class="file-picker-wrapper">
-                            <MudButton Variant="Variant.Text" Size="Size.Small" Class="file-picker-button"
-                                       Disabled="_uploading"
-                                       OnClick="TriggerFilePicker">
-                                <MudIcon Icon="@Icons.Material.Filled.AttachFile" Size="Size.Small" />
-                                <span class="ml-1">@(_uploading ? "Uploading..." : "Attach")</span>
+                    @if (Store.TypingSummary is { } typingSummary)
+                    {
+                        <MudText Typo="Typo.caption" Color="Color.Secondary" Class="chat-typing-indicator">@typingSummary</MudText>
+                    }
+
+                    @if (_replyTo != null)
+                    {
+                        <div class="chat-reply-banner">
+                            <MudIcon Icon="@Icons.Material.Filled.Reply" Size="Size.Small" />
+                            <span class="chat-reply-banner-text">
+                                Replying to <b>@_replyTo.SenderName</b> — @ReplySnippet(_replyTo.Content)
+                            </span>
+                            <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                                           OnClick="CancelReply" Style="padding:2px" title="Cancel reply" />
+                        </div>
+                    }
+
+                    <div class="chat-composer">
+                        <ComposerToolbar HostId="chatComposerHost"
+                                         Disabled="_uploading"
+                                         PreviewActive="_composerPreview"
+                                         PreviewActiveChanged="v => _composerPreview = v"
+                                         Expanded="_composerExpanded"
+                                         ExpandedChanged="v => _composerExpanded = v"
+                                         OnOpenStickers="OpenStickerPicker" />
+
+                        @if (_composerPreview)
+                        {
+                            <div class="chat-composer-preview chat-msg-body @(_composerExpanded ? "expanded" : string.Empty)" @ref="_composerPreviewRef">
+                                @if (string.IsNullOrWhiteSpace(_messageText))
+                                {
+                                    <span class="chat-composer-preview-empty">Nothing to preview yet.</span>
+                                }
+                                else
+                                {
+                                    @Md.Render(_composerPreviewId, _messageText, IsKnownMentionName)
+                                }
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="chat-input-mention-host" id="chatComposerHost">
+                                <MudTextField @bind-Value="_messageText" @bind-Value:after="OnMessageTextEdited" Placeholder="Type a message... (&#64;username)"
+                                              Variant="Variant.Text" Underline="false" Immediate="true"
+                                              Lines="1" MaxLines="@(_composerExpanded ? 18 : 8)" Sizing="InputSizing.Auto"
+                                              OnKeyDown="HandleKeyDown"
+                                              Class="chat-input-field chat-composer-field" />
+
+                                @if (_showMentionSuggestions && _mentionSuggestions.Count > 0)
+                                {
+                                    <div class="chat-mention-suggestions" role="listbox" aria-label="Mention suggestions">
+                                        @for (var i = 0; i < _mentionSuggestions.Count; i++)
+                                        {
+                                            var suggestion = _mentionSuggestions[i];
+                                            var isActive = i == _activeMentionSuggestionIndex;
+                                            <button type="button"
+                                                    class="chat-mention-suggestion-item @(isActive ? "active" : string.Empty)"
+                                                    title="@($"@{suggestion.UserName}")"
+                                                    @onclick="() => SelectMentionSuggestion(suggestion)">
+                                                <span class="chat-mention-suggestion-name">@($"@{suggestion.UserName}")</span>
+                                                <span class="chat-mention-suggestion-display">@suggestion.DisplayName</span>
+                                            </button>
+                                        }
+                                    </div>
+                                }
+                            </div>
+                        }
+
+                        <div class="chat-composer-bottom">
+                            <div class="file-picker-wrapper">
+                                <MudButton Variant="Variant.Text" Size="Size.Small" Class="file-picker-button"
+                                           Disabled="_uploading"
+                                           OnClick="TriggerFilePicker">
+                                    <MudIcon Icon="@Icons.Material.Filled.AttachFile" Size="Size.Small" />
+                                    <span class="ml-1">@(_uploading ? "Uploading..." : "Attach")</span>
+                                </MudButton>
+                                <InputFile @ref="_fileInput" OnChange="HandleAttachmentSelected" multiple
+                                           style="display:none" id="chatFileInput" />
+                            </div>
+
+                            <span class="chat-composer-hint">Enter to send · Shift+Enter for line break</span>
+
+                            <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SendMessage"
+                                       Disabled="@(_uploading || (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0))">
+                                Send
                             </MudButton>
-                            <InputFile @ref="_fileInput" OnChange="HandleAttachmentSelected" multiple
-                                       style="display:none" id="chatFileInput" />
                         </div>
-
-                        <div class="chat-input-mention-host">
-                            <MudTextField @bind-Value="_messageText" @bind-Value:after="OnMessageTextEdited" Placeholder="Type a message... (&#64;username)"
-                                          Variant="Variant.Outlined" Immediate="true" Dense="true"
-                                          OnKeyDown="HandleKeyDown"
-                                          Class="chat-input-field" />
-
-                            @if (_showMentionSuggestions && _mentionSuggestions.Count > 0)
-                            {
-                                <div class="chat-mention-suggestions" role="listbox" aria-label="Mention suggestions">
-                                    @for (var i = 0; i < _mentionSuggestions.Count; i++)
-                                    {
-                                        var suggestion = _mentionSuggestions[i];
-                                        var isActive = i == _activeMentionSuggestionIndex;
-                                        <button type="button"
-                                                class="chat-mention-suggestion-item @(isActive ? "active" : string.Empty)"
-                                                title="@($"@{suggestion.UserName}")"
-                                                @onclick="() => SelectMentionSuggestion(suggestion)">
-                                            <span class="chat-mention-suggestion-name">@($"@{suggestion.UserName}")</span>
-                                            <span class="chat-mention-suggestion-display">@suggestion.DisplayName</span>
-                                        </button>
-                                    }
-                                </div>
-                            }
-                        </div>
-
-                        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SendMessage"
-                                   Disabled="@(_uploading || (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0))">
-                            Send
-                        </MudButton>
-                    </MudStack>
+                    </div>
 
                     <div class="chat-input-drop-overlay" aria-hidden="@(!_isAttachmentDragActive)">
                         <InputFile OnChange="HandleAttachmentSelected"
@@ -278,7 +404,6 @@
         }
     </div>
 
-    @* Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Right: Members panel Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ *@
     @if (MembersPanel.IsVisible)
     {
     <div class="members-sidebar">
@@ -323,10 +448,11 @@
 
                     <MudListItem T="Guid" Value="member.UserId" Class="member-list-item">
                         <div class="member-entry member-entry-clickable"
+                             data-room-drag-user="@member.UserId"
                              title="Double-click to send a private message"
                              @ondblclick="() => OpenPrivateMessage(member)">
                             <MudStack Row AlignItems="AlignItems.Center" Spacing="2" Class="member-entry-main">
-                                <MudAvatar Size="Size.Small" Color="Color.Primary">
+                                <MudAvatar Size="Size.Small" Color="Color.Primary" Class="chat-type-avatar">
                                     @if (!string.IsNullOrWhiteSpace(memberAvatarUrl))
                                     {
                                         <img src="@memberAvatarUrl" alt="Profile" class="avatar-image-fill" />
@@ -373,10 +499,26 @@
                                                    OnClick="() => OpenPrivateMessage(member)" />
                                     @if (canModerateTarget)
                                     {
+                                        @if (CanKickFromCall(member.UserId))
+                                        {
+                                            <MudIconButton Icon="@Icons.Material.Filled.PhoneDisabled"
+                                                           Size="Size.Small"
+                                                           Color="Color.Warning"
+                                                           title="Kick from call"
+                                                           OnClick="() => KickUserFromCall(member.UserId)" />
+                                        }
+                                        @if (CanKickFromChat(member.UserId))
+                                        {
+                                            <MudIconButton Icon="@Icons.Material.Filled.PersonRemove"
+                                                           Size="Size.Small"
+                                                           Color="Color.Error"
+                                                           title="Kick from room"
+                                                           OnClick="() => KickUser(member.UserId)" />
+                                        }
                                         <MudIconButton Icon="@Icons.Material.Filled.AdminPanelSettings"
                                                        Size="Size.Small"
                                                        Color="Color.Secondary"
-                                                       title="Moderation settings"
+                                                       title="More moderation options"
                                                        OnClick="() => OpenModerationPopup(member.UserId)" />
                                     }
                                 </MudStack>
@@ -432,6 +574,37 @@
         </div>
     }
 
+    @if (_showRenameRoom)
+    {
+        <div class="create-room-overlay" @onclick="CancelRenameRoom">
+            <MudPaper Class="create-room-sheet" Elevation="8" @onclick:stopPropagation="true">
+                <MudText Typo="Typo.h6">Rename Room</MudText>
+                <MudText Typo="Typo.caption" Color="Color.Secondary">Enter a new name for "@Store.SelectedRoom?.Name".</MudText>
+
+                <MudStack Spacing="2" Class="mt-3">
+                    <MudTextField @bind-Value="_renameRoomName"
+                                  Label="New Room Name"
+                                  Variant="Variant.Outlined"
+                                  Immediate="true"
+                                  Required="true" />
+
+                    @if (!string.IsNullOrWhiteSpace(Store.Error))
+                    {
+                        <MudAlert Severity="Severity.Error" Dense="true">@Store.Error</MudAlert>
+                    }
+
+                    <MudStack Row Justify="Justify.FlexEnd" Spacing="1" Class="mt-1">
+                        <MudButton Variant="Variant.Text" Color="Color.Default" OnClick="CancelRenameRoom">Cancel</MudButton>
+                        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="RenameRoom"
+                                   Disabled="string.IsNullOrWhiteSpace(_renameRoomName)">
+                            Rename
+                        </MudButton>
+                    </MudStack>
+                </MudStack>
+            </MudPaper>
+        </div>
+    }
+
     @if (GetModerationTarget() is { } moderationTarget)
     {
         var canModerateTarget = CanModerateTarget(moderationTarget.UserId);
@@ -464,27 +637,6 @@
                 else
                 {
                     <MudStack Spacing="2">
-                        <MudStack Row Wrap="Wrap.Wrap" Spacing="1">
-                            @if (canKickFromCall)
-                            {
-                                <MudButton Size="Size.Small"
-                                           Variant="Variant.Outlined"
-                                           Color="Color.Warning"
-                                           OnClick="() => KickUserFromCallAndClose(moderationTarget.UserId)">
-                                    Kick From Call
-                                </MudButton>
-                            }
-
-                            @if (canKickFromChat)
-                            {
-                                <MudButton Size="Size.Small"
-                                           Variant="Variant.Outlined"
-                                           Color="Color.Error"
-                                           OnClick="() => KickUserFromChatAndClose(moderationTarget.UserId)">
-                                    Kick From Chat
-                                </MudButton>
-                            }
-                        </MudStack>
 
                         @if (canManageRoles)
                         {
@@ -542,7 +694,11 @@
 
     private string _messageText = "";
     private bool _showCreateRoom;
+    private bool _showRenameRoom;
+    private string _renameRoomName = "";
     private bool _joining;
+    private Guid? _joiningRoomId;
+    private int _joinCallOperationVersion;
     private bool _showAllMembersDuringCall = true;
     private bool _lastIsInAnyCall;
     private string _newRoomName = "";
@@ -556,13 +712,24 @@
     private Guid? _moderationTargetUserId;
     private ElementReference _messagesContainerRef;
     private ElementReference _jumpLatestButtonRef;
+    private VirtualMessageList<ChatMessage>? _virtualMessages;
     private bool _forceScrollToBottom;
     private int _lastRenderedMessageCount = -1;
+    private int _lastRenderedMessagesVersion = -1;
     private Guid? _lastRenderedMessagesRoomId;
+    private Guid? _editingMessageId;
+    private string _editText = string.Empty;
+    private ChatMessage? _replyTo;
+    private bool _composerPreview;
+    private bool _composerExpanded;
+    private ElementReference _composerPreviewRef;
+    // Stable id for the preview's render-cache slot; content changes re-render it.
+    private readonly Guid _composerPreviewId = Guid.NewGuid();
     private const long MaxUploadBytes = 50L * 1024 * 1024;
     private InputFile? _fileInput;
     private bool _isAttachmentDragActive;
     private int _attachmentDragDepth;
+    private bool _attachmentPasteInitialized;
 
     // Track call state to avoid re-rendering on every mute/PTT/camera change
     private bool _lastCallActive;
@@ -601,6 +768,7 @@
         if (!Auth.IsAuthenticated) return;
 
         Store.OnChange += OnStoreChanged;
+        Store.OnCurrentUserMoved += OnCurrentUserMoved;
         Call.OnChange += OnCallChanged;
         MembersPanel.OnChange += OnMembersPanelChanged;
         _lastIsInAnyCall = Call.IsInCall;
@@ -624,24 +792,56 @@
         if (!IsChatVisible || Store.SelectedRoomId == null)
             return;
 
+        if (!_attachmentPasteInitialized)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("chatAttachmentPaste.init", "chatFileInput", "chatAttachmentDropZone");
+                _attachmentPasteInitialized = true;
+            }
+            catch
+            {
+                // Ignore paste/drop hook initialization failures and keep chat usable.
+            }
+        }
+
         try
         {
             await JS.InvokeVoidAsync("chatScrollManager.init", _messagesContainerRef, _jumpLatestButtonRef, 20, 180);
+            await JS.InvokeVoidAsync("chatInput.init", "chatComposerHost");
+            if (_editingMessageId != null)
+            {
+                // The inline editor is a fresh textarea each time editing starts, so
+                // it needs its own Enter-to-submit hook.
+                await JS.InvokeVoidAsync("chatInput.init", "chatEditHost");
+            }
+            if (_composerPreview)
+            {
+                // Preview should look exactly like the sent message, highlighting
+                // included. The data-hl guard makes repeat calls cheap.
+                await JS.InvokeVoidAsync("chatCode.highlightNew", _composerPreviewRef);
+            }
             var roomId = Store.SelectedRoomId;
             var roomChanged = _lastRenderedMessagesRoomId != roomId;
             var messageCount = Store.Messages.Count;
-            var countChanged = messageCount != _lastRenderedMessageCount;
+            // In-place mutations (edit, delete) leave the count untouched but change
+            // message heights, so the version has to gate the scroll pass too.
+            var messagesVersion = Store.MessagesVersion;
+            var contentChanged = messageCount != _lastRenderedMessageCount ||
+                                 messagesVersion != _lastRenderedMessagesVersion;
             var shouldForce = _forceScrollToBottom || roomChanged || firstRender || _lastRenderedMessageCount < 0;
 
-            if (shouldForce || countChanged)
+            if (shouldForce || contentChanged)
             {
                 await JS.InvokeVoidAsync("chatScrollManager.onMessagesChanged", _messagesContainerRef, shouldForce);
+                await JS.InvokeVoidAsync("chatCode.highlightNew", _messagesContainerRef);
             }
 
             QueueVisibleLinkPreviewLoads();
 
             _lastRenderedMessagesRoomId = roomId;
             _lastRenderedMessageCount = messageCount;
+            _lastRenderedMessagesVersion = messagesVersion;
             _forceScrollToBottom = false;
         }
         catch
@@ -654,6 +854,13 @@
     {
         if (Store.SelectedRoomId == roomId) return;
 
+        if (_joining && _joiningRoomId != roomId)
+        {
+            _joinCallOperationVersion++;
+            _joining = false;
+            _joiningRoomId = null;
+        }
+
         var previousRoomId = Store.SelectedRoomId;
         var keepPreviousRoomSubscription =
             previousRoomId != null &&
@@ -662,14 +869,28 @@
 
         await Store.SelectRoomAsync(roomId, keepPreviousRoomSubscription);
         await Call.RefreshRoomParticipantsAsync(roomId);
+        _messageText = string.Empty;
+        _pendingAttachments.Clear();
+        _uploadError = null;
+        ClearMentionSuggestions();
+        CancelEditMessage();
+        CancelReply();
         _forceScrollToBottom = true;
         _lastRenderedMessageCount = -1;
+        _lastRenderedMessagesVersion = -1;
         _lastRenderedMessagesRoomId = null;
     }
 
     private void OnMessageTextEdited()
     {
         UpdateMentionSuggestions();
+
+        // Fire-and-forget: the store throttles, and a failed typing ping is not worth
+        // blocking keystrokes or surfacing.
+        if (!string.IsNullOrWhiteSpace(_messageText))
+        {
+            _ = Store.NotifyTypingAsync();
+        }
     }
 
     private async Task SendMessage()
@@ -683,10 +904,209 @@
         _pendingAttachments.Clear();
         _forceScrollToBottom = true;
         await InvokeAsync(StateHasChanged);
-        await Store.SendMessageAsync(text, attachments, mentionedUserIds);
+        // Sending returns you to writing mode; previewing an empty box is noise.
+        _composerPreview = false;
+        var replyTo = _replyTo;
+        _replyTo = null;
+        var sent = await Store.SendMessageAsync(text, attachments, mentionedUserIds, replyTo?.Id);
+        if (!sent)
+        {
+            // Failed sends surface Store.Error; put the user's text back instead of
+            // losing it to the eager clear above.
+            _messageText = text;
+            _pendingAttachments.AddRange(attachments);
+            _replyTo = replyTo;
+            await InvokeAsync(StateHasChanged);
+        }
     }
 
-    private async Task DeleteMessage(Guid messageId) => await Store.DeleteMessageAsync(messageId);
+    /// <summary>
+    /// Stickers are sent as an ordinary image attachment with no text, so they need no
+    /// special message type on the wire.
+    /// </summary>
+    private async Task OpenStickerPicker()
+    {
+        var dialog = await Dialogs.ShowAsync<StickerPickerDialog>("Stickers",
+            new DialogOptions { MaxWidth = MaxWidth.Small, FullWidth = true });
+
+        var result = await dialog.Result;
+        if (result is null || result.Canceled || result.Data is not CustomAssetInfo sticker) return;
+
+        var attachment = new AttachmentInfo
+        {
+            Id = sticker.Id,
+            FileName = $"{sticker.Name}.sticker",
+            ContentType = GuessStickerContentType(sticker.Url),
+            SizeBytes = 0,
+            Url = sticker.Url
+        };
+
+        _forceScrollToBottom = true;
+        await Store.SendMessageAsync(string.Empty, [attachment]);
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private static string GuessStickerContentType(string url) =>
+        Path.GetExtension(url).ToLowerInvariant() switch
+        {
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            _ => "image/jpeg"
+        };
+
+    private async Task OpenSearch()
+    {
+        var parameters = new DialogParameters
+        {
+            { nameof(SearchDialog.RoomId), Store.SelectedRoomId },
+            { nameof(SearchDialog.OnOpenConversation), EventCallback.Factory.Create<Guid>(this, OpenConversationFromSearch) }
+        };
+
+        await Dialogs.ShowAsync<SearchDialog>("Search messages", parameters,
+            new DialogOptions { MaxWidth = MaxWidth.Medium, FullWidth = true });
+    }
+
+    private void OpenConversationFromSearch(Guid peerUserId)
+        => Nav.NavigateTo($"/dm?userId={peerUserId}");
+
+    private void BeginReply(ChatMessage msg)
+    {
+        _replyTo = msg;
+        CancelEditMessage();
+    }
+
+    private void CancelReply() => _replyTo = null;
+
+    private static string ReplySnippet(string? content)
+    {
+        var text = (content ?? string.Empty).Replace('\n', ' ').Replace('\r', ' ').Trim();
+        return text.Length <= 80 ? text : text[..80] + "…";
+    }
+
+    private async Task LoadOlderMessages()
+    {
+        // The measured virtual list preserves its first visible message across prepends.
+        await Store.LoadOlderMessagesAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleMessageWindowChanged() => QueueVisibleLinkPreviewLoads();
+
+
+    /// <summary>
+    /// Scrolls to the quoted message when it is loaded; otherwise opens a read-only
+    /// context window, which avoids paging backwards an unbounded number of times.
+    /// </summary>
+    private async Task JumpToRepliedMessage(ChatMessage msg)
+    {
+        if (msg.ReplyToMessageId is not { } parentId || msg.ReplyPreview?.IsUnavailable == true)
+        {
+            return;
+        }
+
+        if (Store.Messages.Any(m => m.Id == parentId))
+        {
+            try
+            {
+                var scrolled = await JS.InvokeAsync<bool>("chatScrollManager.scrollToMessage",
+                    _messagesContainerRef, $"msg-{parentId}", true);
+                if (scrolled) return;
+            }
+            catch
+            {
+                // Fall through to the dialog.
+            }
+        }
+
+        if (Store.SelectedRoomId == null) return;
+
+        var parameters = new DialogParameters
+        {
+            { nameof(MessageContextDialog.RoomId), Store.SelectedRoomId.Value },
+            { nameof(MessageContextDialog.MessageId), parentId }
+        };
+
+        await Dialogs.ShowAsync<MessageContextDialog>("Message context", parameters,
+            new DialogOptions { MaxWidth = MaxWidth.Medium, FullWidth = true });
+    }
+
+    private string ResolveMemberName(Guid userId)
+    {
+        var member = Store.Members.FirstOrDefault(m => m.UserId == userId);
+        if (member != null)
+        {
+            return string.IsNullOrWhiteSpace(member.DisplayName) ? member.UserName : member.DisplayName;
+        }
+
+        var serverMember = Store.FindServerMember(userId);
+        if (serverMember != null)
+        {
+            return string.IsNullOrWhiteSpace(serverMember.DisplayName) ? serverMember.UserName : serverMember.DisplayName;
+        }
+
+        return string.Empty;
+    }
+
+    private bool IsKnownMentionName(string name) =>
+        name.Equals(MentionAllToken, StringComparison.OrdinalIgnoreCase) ||
+        Store.Members.Any(m => m.UserId != Guid.Empty &&
+                               !string.IsNullOrWhiteSpace(m.UserName) &&
+                               string.Equals(m.UserName.Trim(), name, StringComparison.OrdinalIgnoreCase));
+
+    private async Task DeleteMessage(Guid messageId)
+    {
+        if (_editingMessageId == messageId)
+        {
+            CancelEditMessage();
+        }
+
+        await Store.DeleteMessageAsync(messageId);
+    }
+
+    private void BeginEditMessage(ChatMessage msg)
+    {
+        _editingMessageId = msg.Id;
+        _editText = msg.Content;
+    }
+
+    private void CancelEditMessage()
+    {
+        _editingMessageId = null;
+        _editText = string.Empty;
+    }
+
+    private async Task SubmitEditMessage()
+    {
+        if (_editingMessageId == null || string.IsNullOrWhiteSpace(_editText)) return;
+
+        var messageId = _editingMessageId.Value;
+        var content = _editText;
+        // Re-extract mentions so the stored set matches the edited text.
+        var mentionedUserIds = ExtractMentionedUserIds(content);
+
+        if (await Store.EditMessageAsync(messageId, content, mentionedUserIds))
+        {
+            CancelEditMessage();
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task HandleEditKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+        {
+            CancelEditMessage();
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        if (e.Key == "Enter" && !e.ShiftKey)
+        {
+            await SubmitEditMessage();
+        }
+    }
 
     private async Task KickUser(Guid userId) => await Store.KickUserAsync(userId);
     private async Task KickUserFromCall(Guid userId) => await Store.KickUserFromCurrentCallAsync(userId);
@@ -722,8 +1142,31 @@
         _newRoomVideo = false;
     }
 
+    private void OpenRenameRoom()
+    {
+        _renameRoomName = Store.SelectedRoom?.Name ?? string.Empty;
+        _showRenameRoom = true;
+    }
+
+    private void CancelRenameRoom()
+    {
+        _showRenameRoom = false;
+        _renameRoomName = "";
+    }
+
+    private async Task RenameRoom()
+    {
+        if (string.IsNullOrWhiteSpace(_renameRoomName) || Store.SelectedRoomId == null) return;
+        await Store.RenameRoomAsync(Store.SelectedRoomId.Value, _renameRoomName);
+        if (string.IsNullOrWhiteSpace(Store.Error))
+        {
+            CancelRenameRoom();
+        }
+    }
+
     private void OpenCreateRoomDialogFromQuery()
     {
+        if (Store.CurrentUserRole < UserRole.Admin) return;
         _showCreateRoom = true;
         ClearCreateRoomQuery();
     }
@@ -742,14 +1185,18 @@
 
     private async Task JoinCall()
     {
-        if (Store.SelectedRoomId == null || _joining) return;
+        if (Store.SelectedRoomId == null) return;
 
+        var selectedRoomId = Store.SelectedRoomId.Value;
+        if (_joining && _joiningRoomId == selectedRoomId) return;
+
+        var operationVersion = ++_joinCallOperationVersion;
         _joining = true;
+        _joiningRoomId = selectedRoomId;
         StateHasChanged();
 
         try
         {
-            var selectedRoomId = Store.SelectedRoomId.Value;
             var isSwitchingRooms = Call.IsInCall && Call.ActiveRoomId != selectedRoomId;
             if (isSwitchingRooms)
             {
@@ -763,11 +1210,20 @@
                 }
             }
 
+            if (operationVersion != _joinCallOperationVersion || Store.SelectedRoomId != selectedRoomId)
+            {
+                return;
+            }
+
             // 1. Get Janus session from server
             var session = await Call.JoinCallAsync(selectedRoomId);
+            if (operationVersion != _joinCallOperationVersion || Store.SelectedRoomId != selectedRoomId)
+            {
+                return;
+            }
+
             if (session == null)
             {
-                _joining = false;
                 return;
             }
 
@@ -787,18 +1243,35 @@
                 session.IceServers
             );
 
+            if (operationVersion != _joinCallOperationVersion || Store.SelectedRoomId != selectedRoomId)
+            {
+                return;
+            }
+
             // Re-apply persisted call preferences after each fresh init.
             await WebRtc.ApplyStoredSettingsAsync();
             await SyncParticipantDirectoryAsync(force: true);
+            if (operationVersion != _joinCallOperationVersion || Store.SelectedRoomId != selectedRoomId)
+            {
+                return;
+            }
+
             Call.SetUseFloatingOverlayInActiveRoom(false);
         }
         catch (Exception ex)
         {
-            Call.SetError($"Failed to join call: {ex.Message}");
+            if (operationVersion == _joinCallOperationVersion)
+            {
+                Call.SetError($"Failed to join call: {ex.Message}");
+            }
         }
         finally
         {
-            _joining = false;
+            if (operationVersion == _joinCallOperationVersion)
+            {
+                _joining = false;
+                _joiningRoomId = null;
+            }
         }
     }
 
@@ -1257,6 +1730,13 @@
 
     private void OnStoreChanged()
     {
+        if (_joining && _joiningRoomId != Store.SelectedRoomId)
+        {
+            _joinCallOperationVersion++;
+            _joining = false;
+            _joiningRoomId = null;
+        }
+
         if (_moderationTargetUserId != null && !Store.ServerMembers.Any(member => member.UserId == _moderationTargetUserId.Value))
         {
             _moderationTargetUserId = null;
@@ -1560,7 +2040,7 @@
 
     private void QueueVisibleLinkPreviewLoads()
     {
-        foreach (var message in Store.Messages)
+        foreach (var message in _virtualMessages?.VisibleItems ?? [])
         {
             if (message.IsDeleted) continue;
             var url = ExtractFirstHttpUrl(message.Content);
@@ -1799,11 +2279,71 @@
         CancelPendingInactiveStop();
         _pendingInactiveStopCts?.Dispose();
         _pendingInactiveStopCts = null;
+        try
+        {
+            _ = JS.InvokeVoidAsync("chatAttachmentPaste.dispose");
+        }
+        catch
+        {
+            // Ignore JS interop failures during teardown/navigation.
+        }
         Store.OnChange -= OnStoreChanged;
+        Store.OnCurrentUserMoved -= OnCurrentUserMoved;
         Call.OnChange -= OnCallChanged;
         MembersPanel.OnChange -= OnMembersPanelChanged;
     }
 
     private void OnMembersPanelChanged() => InvokeAsync(StateHasChanged);
-}
 
+    private void OnCurrentUserMoved(Guid targetRoomId)
+    {
+        _ = InvokeAsync(async () =>
+        {
+            if (targetRoomId != Guid.Empty)
+            {
+                var targetRoute = $"/?roomId={targetRoomId:D}";
+                var uri = Nav.ToAbsoluteUri(Nav.Uri);
+                var currentRoomQuery = TryGetQueryGuid(uri.Query, "roomId", out var roomIdFromQuery)
+                    ? roomIdFromQuery
+                    : Guid.Empty;
+
+                if (currentRoomQuery != targetRoomId || !uri.AbsolutePath.Equals("/", StringComparison.OrdinalIgnoreCase))
+                {
+                    Nav.NavigateTo(targetRoute, replace: true);
+                }
+            }
+
+            // Auto-join the call in the new room if it supports voice/video
+            var newRoom = Store.Rooms.FirstOrDefault(r => r.Id == targetRoomId);
+            if (newRoom is { IsVoiceEnabled: true } or { IsVideoEnabled: true })
+            {
+                await JoinCall();
+            }
+        });
+    }
+
+    private static bool TryGetQueryGuid(string? query, string key, out Guid value)
+    {
+        value = Guid.Empty;
+        if (string.IsNullOrWhiteSpace(query)) return false;
+
+        var trimmed = query.TrimStart('?');
+        if (string.IsNullOrWhiteSpace(trimmed)) return false;
+
+        foreach (var pair in trimmed.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = pair.IndexOf('=');
+            var rawKey = separator >= 0 ? pair[..separator] : pair;
+            if (!rawKey.Equals(key, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var rawValue = separator >= 0 ? pair[(separator + 1)..] : string.Empty;
+            var decoded = Uri.UnescapeDataString(rawValue);
+            return Guid.TryParse(decoded, out value);
+        }
+
+        return false;
+    }
+}

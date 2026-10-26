@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <title>PrivateChat</title>
+    <title>ChatFlow</title>
     <base href="/" />
     <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700&display=swap" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet" />
@@ -15,8 +15,9 @@
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Sharp:FILL@0..1" rel="stylesheet" />
     <link href="_content/MudBlazor/MudBlazor.min.css" rel="stylesheet" />
     <link rel="stylesheet" href="css/app.css" />
+    <link rel="stylesheet" href="css/highlight-theme.css" />
     <link rel="stylesheet" href="ChatAppBlazor.styles.css" />
-    <link rel="icon" href="data:,">
+    <link rel="icon" type="image/png" href="favicon.png">
 </head>
 
 <body>
@@ -34,8 +35,15 @@
     <script src="_content/MudBlazor/MudBlazor.min.js"></script>
     <script src="_framework/blazor.webview.js" autostart="false"></script>
     <script src="js/chat-scroll.js"></script>
+    <script src="js/chat-virtual-list.js"></script>
+    <script src="js/chat-attachments.js"></script>
+    <script src="js/chat-input.js"></script>
+    <script src="js/highlight.min.js"></script>
+    <script src="js/chat-code.js"></script>
     <script src="js/overlay-drag.js"></script>
+    <script src="js/room-participant-drag.js"></script>
     <script src="js/webrtc-manager.js"></script>
+    <script src="js/screen-annotation.js"></script>
 
 </body>
 

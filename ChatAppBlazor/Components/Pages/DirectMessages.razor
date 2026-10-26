@@ -6,6 +6,9 @@
 @inject IJSRuntime JS
 @inject CallStore Call
 @inject WebRtcBridge WebRtc
+@inject MarkdownRenderService Md
+@inject IDialogService Dialogs
+@inject NavigationManager Nav
 
 <div class="dm-page">
 
@@ -38,6 +41,10 @@
                         </MudStack>
                     </div>
                     <MudStack Row Wrap="Wrap.Wrap" AlignItems="AlignItems.Center" Spacing="1" Class="chat-toolbar-actions">
+                        <MudIconButton Icon="@Icons.Material.Filled.Search"
+                                       Size="Size.Small"
+                                       title="Search messages"
+                                       OnClick="OpenSearch" />
                         <MudIconButton Icon="@(Store.IsSelectedContactNotificationsMuted ? Icons.Material.Filled.NotificationsOff : Icons.Material.Filled.NotificationsActive)"
                                        Size="Size.Small"
                                        Color="@(Store.IsSelectedContactNotificationsMuted ? Color.Warning : Color.Default)"
@@ -72,10 +79,23 @@
 
             <div class="chat-messages-host">
                 <div class="chat-messages-area" @ref="_messagesContainerRef">
-                    @foreach (var msg in Store.Messages)
+                    @if (Store.HasMoreHistory && Store.Messages.Count > 0)
                     {
-                        var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
-                        <div class="chat-msg @(isOwn ? "own" : "")">
+                        <div class="chat-load-older">
+                            <MudButton Size="Size.Small" Variant="Variant.Text"
+                                       Disabled="Store.IsLoadingOlder"
+                                       OnClick="LoadOlderMessages">
+                                @(Store.IsLoadingOlder ? "Loading..." : "Load older messages")
+                            </MudButton>
+                        </div>
+                    }
+                    <VirtualMessageList TItem="PrivateMessage" Items="Store.Messages" ItemKey="m => m.Id"
+                                            Context="msg" @ref="_virtualMessages" @key="Store.SelectedContactId" WindowChanged="HandleMessageWindowChanged">
+                            @{
+                                var isOwn = msg.SenderId == Auth.CurrentUser?.Id;
+                                var isEditing = _editingMessageId == msg.Id;
+                            }
+                            <div class="chat-msg @(isOwn ? "own" : "") @(msg.IsDeleted ? "deleted" : "")" @key="msg.Id" id="@($"msg-{msg.Id}")">
                             <div class="chat-msg-header">
                                 <MudText Typo="Typo.caption" Style="font-weight:600;color:var(--mud-palette-primary)">
                                     @msg.SenderName
@@ -83,12 +103,76 @@
                                 <MudText Typo="Typo.caption" Color="Color.Secondary">
                                     @msg.SentAt.ToLocalTime().ToString("HH:mm")
                                 </MudText>
+                                @if (isOwn && msg.IsRead && !msg.IsDeleted)
+                                {
+                                    <MudIcon Icon="@Icons.Material.Filled.DoneAll" Size="Size.Small"
+                                             Class="chat-msg-read-tick" title="Read" />
+                                }
+                                @if (msg.EditedAt != null && !msg.IsDeleted)
+                                {
+                                    <MudText Typo="Typo.caption" Color="Color.Secondary"
+                                             title="@($"Edited {msg.EditedAt.Value.ToLocalTime():g}")">(edited)</MudText>
+                                }
+                                @if (!msg.IsDeleted && !isEditing)
+                                {
+                                    <div class="chat-msg-actions">
+                                        <MudIconButton Icon="@Icons.Material.Filled.Reply" Size="Size.Small"
+                                                       OnClick="() => BeginReply(msg)"
+                                                       Style="padding:2px" title="Reply" />
+                                        @if (isOwn)
+                                        {
+                                        <MudIconButton Icon="@Icons.Material.Filled.Edit" Size="Size.Small"
+                                                       OnClick="() => BeginEditMessage(msg)"
+                                                       Style="padding:2px" title="Edit" />
+                                        <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                                                       Color="Color.Error" OnClick="() => DeleteMessage(msg.Id)"
+                                                       Style="padding:2px" title="Delete" />
+                                        }
+                                    </div>
+                                }
                             </div>
-                            <MudText Typo="Typo.body2" Class="chat-msg-body">@msg.Content</MudText>
-                            @{
-                                var previewUrl = ExtractFirstHttpUrl(msg.Content);
-                                var preview = GetCachedLinkPreview(previewUrl);
+                            @if (isEditing)
+                            {
+                                <div class="chat-msg-edit" id="dmEditHost">
+                                    <MudTextField @bind-Value="_editText" Immediate="true"
+                                                  Variant="Variant.Outlined"
+                                                  Lines="1" MaxLines="8" Sizing="InputSizing.Auto"
+                                                  OnKeyDown="HandleEditKeyDown"
+                                                  Class="chat-input-field" />
+                                    <div class="chat-msg-edit-actions">
+                                        <MudButton Size="Size.Small" OnClick="CancelEditMessage">Cancel</MudButton>
+                                        <MudButton Size="Size.Small" Variant="Variant.Filled" Color="Color.Primary"
+                                                   Disabled="@string.IsNullOrWhiteSpace(_editText)"
+                                                   OnClick="SubmitEditMessage">Save</MudButton>
+                                    </div>
+                                    <MudText Typo="Typo.caption" Color="Color.Secondary">Enter to save · Esc to cancel</MudText>
+                                </div>
                             }
+                            else if (msg.IsDeleted)
+                            {
+                                <MudText Typo="Typo.body2" Color="Color.Secondary" Style="font-style:italic">
+                                    Message deleted
+                                </MudText>
+                            }
+                            else
+                            {
+                            @if (msg.ReplyPreview is { } quote)
+                            {
+                                <div class="chat-msg-quote @(quote.IsUnavailable ? "unavailable" : string.Empty)">
+                                    @if (quote.IsUnavailable)
+                                    {
+                                        <span class="chat-msg-quote-text">Message unavailable</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="chat-msg-quote-author">@quote.SenderName</span>
+                                        <span class="chat-msg-quote-text">@quote.Snippet</span>
+                                    }
+                                </div>
+                            }
+                            <div class="chat-msg-body">@Md.Render(msg.Id, msg.Content)</div>
+                            var previewUrl = ExtractFirstHttpUrl(msg.Content);
+                            var preview = GetCachedLinkPreview(previewUrl);
                             @if (preview != null && !string.IsNullOrWhiteSpace(preview.Url))
                             {
                                 var href = !string.IsNullOrWhiteSpace(preview.CanonicalUrl) ? preview.CanonicalUrl : preview.Url;
@@ -152,8 +236,14 @@
                                     }
                                 </div>
                             }
+
+                            <ReactionBar Reactions="msg.Reactions"
+                                         CurrentUserId="Auth.CurrentUser?.Id"
+                                         ResolveUserName="ResolveParticipantName"
+                                         Toggle="emoji => Store.ToggleReactionAsync(msg.Id, emoji)" />
+                            }
                         </div>
-                    }
+                    </VirtualMessageList>
                 </div>
                 <button type="button"
                         class="chat-jump-latest-button"
@@ -164,7 +254,8 @@
                 </button>
             </div>
 
-            <div class="chat-input-area @(_isAttachmentDragActive ? "drag-over" : "")"
+            <div id="dmAttachmentDropZone"
+                 class="chat-input-area @(_isAttachmentDragActive ? "drag-over" : "")"
                  @ondragenter="OnAttachmentDragEnter"
                  @ondragenter:preventDefault
                  @ondragover="OnAttachmentDragOver"
@@ -194,28 +285,77 @@
                     <MudText Typo="Typo.caption" Color="Color.Error" Class="mb-2">@_uploadError</MudText>
                 }
 
-                <MudStack Row AlignItems="AlignItems.Center" Spacing="1" Class="chat-composer-row">
-                    <div class="file-picker-wrapper">
-                        <MudButton Variant="Variant.Text" Size="Size.Small" Class="file-picker-button"
-                                   Disabled="_uploading"
-                                   OnClick="TriggerFilePicker">
-                            <MudIcon Icon="@Icons.Material.Filled.AttachFile" Size="Size.Small" />
-                            <span class="ml-1">@(_uploading ? "Uploading..." : "Attach")</span>
-                        </MudButton>
-                        <InputFile @ref="_fileInput" OnChange="HandleAttachmentSelected" multiple
-                                   style="display:none" id="dmFileInput" />
+                @if (Store.TypingSummary is { } typingSummary)
+                {
+                    <MudText Typo="Typo.caption" Color="Color.Secondary" Class="chat-typing-indicator">@typingSummary</MudText>
+                }
+
+                @if (_replyTo != null)
+                {
+                    <div class="chat-reply-banner">
+                        <MudIcon Icon="@Icons.Material.Filled.Reply" Size="Size.Small" />
+                        <span class="chat-reply-banner-text">
+                            Replying to <b>@_replyTo.SenderName</b> — @ReplySnippet(_replyTo.Content)
+                        </span>
+                        <MudIconButton Icon="@Icons.Material.Filled.Close" Size="Size.Small"
+                                       OnClick="CancelReply" Style="padding:2px" title="Cancel reply" />
                     </div>
+                }
 
-                    <MudTextField @bind-Value="_messageText" Placeholder="Type a message..."
-                                  Variant="Variant.Outlined" Immediate="true" Dense="true"
-                                  OnKeyDown="HandleKeyDown"
-                                  Class="chat-input-field" />
+                <div class="chat-composer">
+                    <ComposerToolbar HostId="dmComposerHost"
+                                     Disabled="_uploading"
+                                     PreviewActive="_composerPreview"
+                                     PreviewActiveChanged="v => _composerPreview = v"
+                                     Expanded="_composerExpanded"
+                                     ExpandedChanged="v => _composerExpanded = v"
+                                     OnOpenStickers="OpenStickerPicker" />
 
-                    <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SendMessage"
-                               Disabled="@(_uploading || (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0))">
-                        Send
-                    </MudButton>
-                </MudStack>
+                    @if (_composerPreview)
+                    {
+                        <div class="chat-composer-preview chat-msg-body @(_composerExpanded ? "expanded" : string.Empty)" @ref="_composerPreviewRef">
+                            @if (string.IsNullOrWhiteSpace(_messageText))
+                            {
+                                <span class="chat-composer-preview-empty">Nothing to preview yet.</span>
+                            }
+                            else
+                            {
+                                @Md.Render(_composerPreviewId, _messageText)
+                            }
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="chat-input-mention-host" id="dmComposerHost">
+                            <MudTextField @bind-Value="_messageText" @bind-Value:after="OnMessageTextEdited"
+                                          Placeholder="Type a message..."
+                                          Variant="Variant.Text" Underline="false" Immediate="true"
+                                          Lines="1" MaxLines="@(_composerExpanded ? 18 : 8)" Sizing="InputSizing.Auto"
+                                          OnKeyDown="HandleKeyDown"
+                                          Class="chat-input-field chat-composer-field" />
+                        </div>
+                    }
+
+                    <div class="chat-composer-bottom">
+                        <div class="file-picker-wrapper">
+                            <MudButton Variant="Variant.Text" Size="Size.Small" Class="file-picker-button"
+                                       Disabled="_uploading"
+                                       OnClick="TriggerFilePicker">
+                                <MudIcon Icon="@Icons.Material.Filled.AttachFile" Size="Size.Small" />
+                                <span class="ml-1">@(_uploading ? "Uploading..." : "Attach")</span>
+                            </MudButton>
+                            <InputFile @ref="_fileInput" OnChange="HandleAttachmentSelected" multiple
+                                       style="display:none" id="dmFileInput" />
+                        </div>
+
+                        <span class="chat-composer-hint">Enter to send · Shift+Enter for line break</span>
+
+                        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SendMessage"
+                                   Disabled="@(_uploading || (string.IsNullOrWhiteSpace(_messageText) && _pendingAttachments.Count == 0))">
+                            Send
+                        </MudButton>
+                    </div>
+                </div>
 
                 <div class="chat-input-drop-overlay" aria-hidden="@(!_isAttachmentDragActive)">
                     <InputFile OnChange="HandleAttachmentSelected"
@@ -249,14 +389,25 @@
     private InputFile? _fileInput;
     private bool _isAttachmentDragActive;
     private int _attachmentDragDepth;
+    private bool _attachmentPasteInitialized;
     private Guid? _lastAutoOpenedUserId;
     private string? _lastAutoJoinCallToken;
     private bool _joiningCall;
     private ElementReference _messagesContainerRef;
     private ElementReference _jumpLatestButtonRef;
+    private VirtualMessageList<PrivateMessage>? _virtualMessages;
     private bool _forceScrollToBottom;
     private int _lastRenderedMessageCount = -1;
+    private int _lastRenderedMessagesVersion = -1;
     private Guid? _lastRenderedContactId;
+    private Guid? _editingMessageId;
+    private string _editText = string.Empty;
+    private PrivateMessage? _replyTo;
+    private bool _composerPreview;
+    private bool _composerExpanded;
+    private ElementReference _composerPreviewRef;
+    // Stable id for the preview's render-cache slot; content changes re-render it.
+    private readonly Guid _composerPreviewId = Guid.NewGuid();
     private static readonly System.Text.RegularExpressions.Regex UrlRegex = new(
         "(?i)\\bhttps?://[^\\s<>()]+",
         System.Text.RegularExpressions.RegexOptions.Compiled);
@@ -299,25 +450,57 @@
         if (Store.SelectedContact == null)
             return;
 
+        if (!_attachmentPasteInitialized)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("chatAttachmentPaste.init", "dmFileInput", "dmAttachmentDropZone");
+                _attachmentPasteInitialized = true;
+            }
+            catch
+            {
+                // Ignore paste/drop hook initialization failures and keep chat usable.
+            }
+        }
+
         try
         {
             await JS.InvokeVoidAsync("chatScrollManager.init", _messagesContainerRef, _jumpLatestButtonRef, 20, 180);
+            await JS.InvokeVoidAsync("chatInput.init", "dmComposerHost");
+            if (_editingMessageId != null)
+            {
+                // The inline editor is a fresh textarea each time editing starts, so
+                // it needs its own Enter-to-submit hook.
+                await JS.InvokeVoidAsync("chatInput.init", "dmEditHost");
+            }
+            if (_composerPreview)
+            {
+                // Preview should look exactly like the sent message, highlighting
+                // included. The data-hl guard makes repeat calls cheap.
+                await JS.InvokeVoidAsync("chatCode.highlightNew", _composerPreviewRef);
+            }
 
             var contactId = Store.SelectedContactId;
             var contactChanged = _lastRenderedContactId != contactId;
             var messageCount = Store.Messages.Count;
-            var countChanged = messageCount != _lastRenderedMessageCount;
+            // In-place mutations (edit, delete) leave the count untouched but change
+            // message heights, so the version has to gate the scroll pass too.
+            var messagesVersion = Store.MessagesVersion;
+            var contentChanged = messageCount != _lastRenderedMessageCount ||
+                                 messagesVersion != _lastRenderedMessagesVersion;
             var shouldForce = _forceScrollToBottom || contactChanged || firstRender || _lastRenderedMessageCount < 0;
 
-            if (shouldForce || countChanged)
+            if (shouldForce || contentChanged)
             {
                 await JS.InvokeVoidAsync("chatScrollManager.onMessagesChanged", _messagesContainerRef, shouldForce);
+                await JS.InvokeVoidAsync("chatCode.highlightNew", _messagesContainerRef);
             }
 
             QueueVisibleLinkPreviewLoads();
 
             _lastRenderedContactId = contactId;
             _lastRenderedMessageCount = messageCount;
+            _lastRenderedMessagesVersion = messagesVersion;
             _forceScrollToBottom = false;
         }
         catch
@@ -326,7 +509,75 @@
         }
     }
 
-    private async Task SelectContact(UserInfo contact) => await Store.SelectContactAsync(contact);
+    private async Task SelectContact(UserInfo contact)
+    {
+        CancelEditMessage();
+        CancelReply();
+        _lastRenderedMessagesVersion = -1;
+        await Store.SelectContactAsync(contact);
+    }
+
+    private async Task DeleteMessage(Guid messageId)
+    {
+        if (_editingMessageId == messageId)
+        {
+            CancelEditMessage();
+        }
+
+        await Store.DeleteMessageAsync(messageId);
+    }
+
+    /// <summary>A DM has exactly two participants, so no roster lookup is needed.</summary>
+    private string ResolveParticipantName(Guid userId)
+    {
+        if (userId == Auth.CurrentUser?.Id) return "You";
+        if (userId == Store.SelectedContact?.Id)
+        {
+            var contact = Store.SelectedContact;
+            return string.IsNullOrWhiteSpace(contact.DisplayName) ? contact.UserName : contact.DisplayName;
+        }
+
+        return string.Empty;
+    }
+
+    private void BeginEditMessage(PrivateMessage msg)
+    {
+        _editingMessageId = msg.Id;
+        _editText = msg.Content;
+    }
+
+    private void CancelEditMessage()
+    {
+        _editingMessageId = null;
+        _editText = string.Empty;
+    }
+
+    private async Task SubmitEditMessage()
+    {
+        if (_editingMessageId == null || string.IsNullOrWhiteSpace(_editText)) return;
+
+        if (await Store.EditMessageAsync(_editingMessageId.Value, _editText))
+        {
+            CancelEditMessage();
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task HandleEditKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+        {
+            CancelEditMessage();
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        if (e.Key == "Enter" && !e.ShiftKey)
+        {
+            await SubmitEditMessage();
+        }
+    }
 
     private async Task JoinPrivateCall()
     {
@@ -393,8 +644,113 @@
         _pendingAttachments.Clear();
         _forceScrollToBottom = true;
         await InvokeAsync(StateHasChanged);
-        await Store.SendMessageAsync(text, attachments);
+        // Sending returns you to writing mode; previewing an empty box is noise.
+        _composerPreview = false;
+        var replyTo = _replyTo;
+        _replyTo = null;
+        var sent = await Store.SendMessageAsync(text, attachments, replyTo?.Id);
+        if (!sent)
+        {
+            // Failed sends surface Store.Error; put the user's text back instead of
+            // losing it to the eager clear above.
+            _messageText = text;
+            _pendingAttachments.AddRange(attachments);
+            _replyTo = replyTo;
+            await InvokeAsync(StateHasChanged);
+        }
     }
+
+    /// <summary>Stickers send as an ordinary image attachment with no text.</summary>
+    private async Task OpenStickerPicker()
+    {
+        var dialog = await Dialogs.ShowAsync<StickerPickerDialog>("Stickers",
+            new DialogOptions { MaxWidth = MaxWidth.Small, FullWidth = true });
+
+        var result = await dialog.Result;
+        if (result is null || result.Canceled || result.Data is not CustomAssetInfo sticker) return;
+
+        var attachment = new AttachmentInfo
+        {
+            Id = sticker.Id,
+            FileName = $"{sticker.Name}.sticker",
+            ContentType = GuessStickerContentType(sticker.Url),
+            SizeBytes = 0,
+            Url = sticker.Url
+        };
+
+        _forceScrollToBottom = true;
+        await Store.SendMessageAsync(string.Empty, [attachment]);
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private static string GuessStickerContentType(string url) =>
+        Path.GetExtension(url).ToLowerInvariant() switch
+        {
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            _ => "image/jpeg"
+        };
+
+    private async Task OpenSearch()
+    {
+        // No RoomId: opened from DMs, so the dialog offers all-rooms and DM scopes only.
+        var parameters = new DialogParameters
+        {
+            { nameof(SearchDialog.OnOpenConversation), EventCallback.Factory.Create<Guid>(this, OpenConversationFromSearch) }
+        };
+
+        await Dialogs.ShowAsync<SearchDialog>("Search messages", parameters,
+            new DialogOptions { MaxWidth = MaxWidth.Medium, FullWidth = true });
+    }
+
+    private async Task OpenConversationFromSearch(Guid peerUserId)
+    {
+        var contact = Store.Contacts.FirstOrDefault(c => c.Id == peerUserId);
+        if (contact != null)
+        {
+            await Store.OpenConversationAsync(contact);
+            _forceScrollToBottom = true;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        Nav.NavigateTo($"/dm?userId={peerUserId}");
+    }
+
+    private void OnMessageTextEdited()
+    {
+        // Fire-and-forget: the store throttles, and a failed typing ping is not worth
+        // blocking keystrokes or surfacing.
+        if (!string.IsNullOrWhiteSpace(_messageText))
+        {
+            _ = Store.NotifyTypingAsync();
+        }
+    }
+
+    private void BeginReply(PrivateMessage msg)
+    {
+        _replyTo = msg;
+        CancelEditMessage();
+    }
+
+    private void CancelReply() => _replyTo = null;
+
+    private static string ReplySnippet(string? content)
+    {
+        var text = (content ?? string.Empty).Replace('\n', ' ').Replace('\r', ' ').Trim();
+        return text.Length <= 80 ? text : text[..80] + "…";
+    }
+
+    private async Task LoadOlderMessages()
+    {
+        // The measured virtual list preserves its first visible message across prepends.
+        await Store.LoadOlderMessagesAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void HandleMessageWindowChanged() => QueueVisibleLinkPreviewLoads();
+
 
     private async Task TriggerFilePicker()
     {
@@ -604,7 +960,7 @@
 
     private void QueueVisibleLinkPreviewLoads()
     {
-        foreach (var message in Store.Messages)
+        foreach (var message in _virtualMessages?.VisibleItems ?? [])
         {
             var url = ExtractFirstHttpUrl(message.Content);
             if (string.IsNullOrWhiteSpace(url)) continue;
@@ -889,6 +1245,14 @@
 
     public void Dispose()
     {
+        try
+        {
+            _ = JS.InvokeVoidAsync("chatAttachmentPaste.dispose");
+        }
+        catch
+        {
+            // Ignore JS interop failures during teardown/navigation.
+        }
         Store.OnChange -= OnStoreChanged;
         Call.OnChange -= OnCallChanged;
     }

@@ -1,0 +1,211 @@
+@using Shared.Models
+@inject ApiClientService Api
+@inject MarkdownRenderService Md
+@inject IDialogService Dialogs
+
+@* Message search across rooms or direct messages. Results page with the same
+   newest-first cursor the history endpoints use. *@
+
+<MudDialog>
+    <TitleContent>
+        <MudText Typo="Typo.h6">Search messages</MudText>
+    </TitleContent>
+    <DialogContent>
+        <div class="chat-search-controls">
+            <MudTextField @bind-Value="_query" Immediate="true" Placeholder="Search..."
+                          Variant="Variant.Outlined" Margin="Margin.Dense"
+                          Adornment="Adornment.End" AdornmentIcon="@Icons.Material.Filled.Search"
+                          OnAdornmentClick="RunSearch"
+                          OnKeyDown="HandleKeyDown" />
+
+            <MudRadioGroup T="SearchScope" Value="_scope" ValueChanged="OnScopeChanged" Class="chat-search-scope">
+                @if (RoomId != null)
+                {
+                    <MudRadio T="SearchScope" Value="SearchScope.ThisRoom" Size="Size.Small">This room</MudRadio>
+                }
+                <MudRadio T="SearchScope" Value="SearchScope.AllRooms" Size="Size.Small">All rooms</MudRadio>
+                <MudRadio T="SearchScope" Value="SearchScope.DirectMessages" Size="Size.Small">Direct messages</MudRadio>
+            </MudRadioGroup>
+        </div>
+
+        @if (_error != null)
+        {
+            <MudAlert Severity="Severity.Error" Dense="true" Class="mt-2">@_error</MudAlert>
+        }
+
+        <div class="chat-search-results">
+            @if (_searching && _results.Count == 0)
+            {
+                <MudProgressCircular Indeterminate="true" Size="Size.Small" />
+            }
+            else if (_hasSearched && _results.Count == 0)
+            {
+                <MudText Typo="Typo.body2" Color="Color.Secondary">
+                    No messages found.
+                    @if (_query.Trim().Length is > 0 and < 3)
+                    {
+                        <span> Short terms match literally rather than by word.</span>
+                    }
+                </MudText>
+            }
+            else
+            {
+                @foreach (var result in _results)
+                {
+                    <button type="button" class="chat-search-result" @key="result.Key"
+                            @onclick="() => OpenResult(result)">
+                        <div class="chat-search-result-meta">
+                            <span class="chat-search-result-sender">@result.SenderName</span>
+                            @if (!string.IsNullOrWhiteSpace(result.ContextName))
+                            {
+                                <span class="chat-search-result-room">@result.ContextName</span>
+                            }
+                            <span class="chat-search-result-time">@result.SentAt.ToLocalTime().ToString("g")</span>
+                        </div>
+                        <div class="chat-msg-body chat-search-result-body">@Md.Render(result.Key, result.Content)</div>
+                    </button>
+                }
+
+                @if (_canLoadMore)
+                {
+                    <div class="chat-load-older">
+                        <MudButton Size="Size.Small" Variant="Variant.Text" Disabled="_searching" OnClick="LoadMore">
+                            @(_searching ? "Loading..." : "More results")
+                        </MudButton>
+                    </div>
+                }
+            }
+        </div>
+    </DialogContent>
+    <DialogActions>
+        <MudButton OnClick="Close">Close</MudButton>
+    </DialogActions>
+</MudDialog>
+
+@code {
+    public enum SearchScope { ThisRoom, AllRooms, DirectMessages }
+
+    /// <summary>Flattened result row, so room hits and DM hits render through one loop.</summary>
+    private sealed record SearchRow(
+        Guid Key,
+        Guid? RoomId,
+        Guid? PeerUserId,
+        string SenderName,
+        string ContextName,
+        string Content,
+        DateTime SentAt);
+
+    [CascadingParameter] private IMudDialogInstance MudDialog { get; set; } = default!;
+
+    /// <summary>Null when opened from the DM page, which has no room context.</summary>
+    [Parameter] public Guid? RoomId { get; set; }
+
+    /// <summary>Raised when the user picks a DM result, so the page can open that conversation.</summary>
+    [Parameter] public EventCallback<Guid> OnOpenConversation { get; set; }
+
+    private const int PageSize = 30;
+
+    private string _query = string.Empty;
+    private SearchScope _scope;
+    private readonly List<SearchRow> _results = [];
+    private bool _searching;
+    private bool _hasSearched;
+    private bool _canLoadMore;
+    private string? _error;
+
+    protected override void OnInitialized()
+    {
+        _scope = RoomId != null ? SearchScope.ThisRoom : SearchScope.AllRooms;
+    }
+
+    private async Task OnScopeChanged(SearchScope scope)
+    {
+        _scope = scope;
+        if (_hasSearched) await RunSearch();
+    }
+
+    private async Task HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await RunSearch();
+    }
+
+    private async Task RunSearch()
+    {
+        _results.Clear();
+        _canLoadMore = false;
+        await FetchAsync(before: null);
+    }
+
+    private async Task LoadMore()
+    {
+        if (_results.Count == 0) return;
+        await FetchAsync(before: _results[^1].SentAt);
+    }
+
+    private async Task FetchAsync(DateTime? before)
+    {
+        var query = _query.Trim();
+        if (query.Length == 0) return;
+
+        _searching = true;
+        _error = null;
+
+        try
+        {
+            List<SearchRow> rows;
+
+            if (_scope == SearchScope.DirectMessages)
+            {
+                var hits = await Api.SearchPrivateMessagesAsync(query, before, PageSize);
+                rows = hits.Select(m => new SearchRow(
+                    m.Id, null, m.SenderId, m.SenderName, "Direct message", m.Content, m.SentAt)).ToList();
+            }
+            else
+            {
+                var scopeRoomId = _scope == SearchScope.ThisRoom ? RoomId : null;
+                var hits = await Api.SearchRoomMessagesAsync(query, scopeRoomId, before, PageSize);
+                rows = hits.Select(r => new SearchRow(
+                    r.Message.Id, r.Message.RoomId, null, r.Message.SenderName, r.RoomName, r.Message.Content, r.Message.SentAt)).ToList();
+            }
+
+            // The cursor has no id tiebreaker, so a page boundary on identical
+            // timestamps can repeat a row.
+            var known = _results.Select(r => r.Key).ToHashSet();
+            _results.AddRange(rows.Where(r => known.Add(r.Key)));
+            _canLoadMore = rows.Count >= PageSize;
+        }
+        catch (Exception ex)
+        {
+            _error = $"Search failed: {ex.Message}";
+        }
+        finally
+        {
+            _searching = false;
+            _hasSearched = true;
+        }
+    }
+
+    private async Task OpenResult(SearchRow row)
+    {
+        if (row.PeerUserId is { } peerUserId)
+        {
+            MudDialog.Close();
+            await OnOpenConversation.InvokeAsync(peerUserId);
+            return;
+        }
+
+        if (row.RoomId is not { } roomId) return;
+
+        // Show the hit in place rather than trying to page the live view back to it.
+        var parameters = new DialogParameters
+        {
+            { nameof(MessageContextDialog.RoomId), roomId },
+            { nameof(MessageContextDialog.MessageId), row.Key }
+        };
+
+        await Dialogs.ShowAsync<MessageContextDialog>("Message context", parameters,
+            new DialogOptions { MaxWidth = MaxWidth.Medium, FullWidth = true });
+    }
+
+    private void Close() => MudDialog.Close();
+}

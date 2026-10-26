@@ -1,0 +1,99 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:ChatApp.Ui.ViewModels"
+             xmlns:controls="using:ChatApp.Ui.Controls"
+             xmlns:primitives="using:Avalonia.Controls.Primitives"
+             mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="420"
+             x:Class="ChatApp.Ui.Views.CallView"
+             x:DataType="vm:CallViewModel">
+
+  <UserControl.Styles>
+    <!-- Speaking ring. A border rather than a glow: it survives being drawn over the
+         video, and costs nothing per frame. -->
+    <Style Selector="Border.tile">
+      <Setter Property="BorderBrush" Value="Transparent" />
+    </Style>
+    <Style Selector="Border.tile.speaking">
+      <Setter Property="BorderBrush" Value="#22C55E" />
+    </Style>
+
+    <!-- Your own camera reads as a mirror; a screen share must not. -->
+    <Style Selector="controls|VideoView.mirrored">
+      <Setter Property="RenderTransformOrigin" Value="0.5,0.5" />
+      <Setter Property="RenderTransform">
+        <ScaleTransform ScaleX="-1" />
+      </Setter>
+    </Style>
+  </UserControl.Styles>
+
+  <Panel Background="#111214">
+
+    <TextBlock Text="Waiting for video…"
+               HorizontalAlignment="Center"
+               VerticalAlignment="Center"
+               Opacity="0.5"
+               Foreground="White"
+               IsVisible="{Binding !HasTiles}" />
+
+    <ItemsControl ItemsSource="{Binding Tiles}" Margin="4">
+      <ItemsControl.ItemsPanel>
+        <ItemsPanelTemplate>
+          <primitives:UniformGrid />
+        </ItemsPanelTemplate>
+      </ItemsControl.ItemsPanel>
+
+      <ItemsControl.ItemTemplate>
+        <DataTemplate x:DataType="vm:VideoTileViewModel">
+          <Border Classes="tile"
+                  Classes.speaking="{Binding IsSpeaking}"
+                  Margin="4"
+                  MinWidth="160"
+                  MinHeight="90"
+                  CornerRadius="8"
+                  BorderThickness="2"
+                  ClipToBounds="True"
+                  Background="#1E1F22">
+            <Panel>
+
+              <!-- Shown until frames arrive, and again if they stop. -->
+              <Border Width="72"
+                      Height="72"
+                      CornerRadius="36"
+                      Background="#3F4248"
+                      HorizontalAlignment="Center"
+                      VerticalAlignment="Center"
+                      IsVisible="{Binding #Video.IsRendering,
+                                          Converter={x:Static BoolConverters.Not}}">
+                <TextBlock Text="{Binding Initials}"
+                           FontSize="26"
+                           FontWeight="SemiBold"
+                           Foreground="White"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center" />
+              </Border>
+
+              <controls:VideoView x:Name="Video"
+                                  Source="{Binding Source}"
+                                  Stretch="UniformToFill"
+                                  Classes.mirrored="{Binding IsMirrored}" />
+
+              <Border VerticalAlignment="Bottom"
+                      HorizontalAlignment="Left"
+                      Margin="8"
+                      Padding="8,3"
+                      CornerRadius="4"
+                      Background="#99000000">
+                <TextBlock Text="{Binding DisplayName}"
+                           Foreground="White"
+                           FontSize="12"
+                           TextTrimming="CharacterEllipsis" />
+              </Border>
+            </Panel>
+          </Border>
+        </DataTemplate>
+      </ItemsControl.ItemTemplate>
+    </ItemsControl>
+  </Panel>
+</UserControl>

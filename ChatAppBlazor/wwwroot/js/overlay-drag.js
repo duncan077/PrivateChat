@@ -48,9 +48,17 @@ window.overlayDrag = window.overlayDrag || (() => {
             setPosition(startLeft + deltaX, startTop + deltaY);
         }
 
-        function pointerUp(event) {
+        // Any pointer ending the gesture ends the drag.
+        //
+        // This used to return early unless the pointerId matched the one that started
+        // it, which left `dragging` true whenever it did not - a second finger lifting,
+        // or the pointercancel Android raises under its own id. The window listeners
+        // then stayed attached for the life of the overlay, so every pointermove
+        // ANYWHERE on the page dragged the overlay under the user's finger, and at
+        // z-index 9999 it intercepted whatever they were reaching for. The symptom is
+        // that the entire UI goes dead and only the call window still responds.
+        function pointerUp() {
             if (!dragging) return;
-            if (activePointerId !== null && event && event.pointerId !== activePointerId) return;
             dragging = false;
             activePointerId = null;
             overlay.classList.remove("dragging");
@@ -66,7 +74,22 @@ window.overlayDrag = window.overlayDrag || (() => {
             const ignored = event.target.closest("button,.mud-icon-button");
             if (ignored) return;
 
+            // Never stack two drags; if one was somehow left open, close it first.
+            pointerUp();
+
             const rect = overlay.getBoundingClientRect();
+
+            // Pin the current width before setPosition switches to left/top anchoring.
+            //
+            // On narrow screens the stylesheet stretches this overlay between `left` and
+            // `right` with `width: auto`, so clearing `right` leaves the width to
+            // shrink-to-fit its contents. Once a call carries video those contents are a
+            // <video> with intrinsic dimensions, and the box resolves far wider than the
+            // panel you can see - overflow:hidden keeps it looking correct while it
+            // covers the page and swallows every tap. That is why this only ever
+            // happened with a video stream.
+            overlay.style.width = `${rect.width}px`;
+
             dragging = true;
             startX = event.clientX;
             startY = event.clientY;
@@ -86,6 +109,10 @@ window.overlayDrag = window.overlayDrag || (() => {
             }
             event.preventDefault();
         });
+
+        // Losing capture without a pointerup - which Android does on its own when a
+        // gesture is taken over - has to end the drag too, or it strands exactly as above.
+        handle.addEventListener("lostpointercapture", pointerUp);
 
         window.addEventListener("resize", () => {
             if (!overlay.style.left || !overlay.style.top) return;

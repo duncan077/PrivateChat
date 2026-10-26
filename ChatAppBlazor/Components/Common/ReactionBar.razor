@@ -1,0 +1,100 @@
+@using Shared.Models
+@implements IDisposable
+@inject ServerAssetStore Assets
+
+@* Aggregated reaction chips under a message, plus the add-reaction picker.
+   Shared by room chat and DMs; the parent supplies the toggle callback so this
+   component stays unaware of which hub method to call. *@
+
+<div class="chat-reactions">
+    @foreach (var reaction in Reactions)
+    {
+        var mine = CurrentUserId != null && reaction.UserIds.Contains(CurrentUserId.Value);
+        <button type="button"
+                class="chat-reaction-chip @(mine ? "mine" : string.Empty)"
+                title="@DescribeReactors(reaction)"
+                @onclick="() => Toggle.InvokeAsync(reaction.Emoji)">
+            @if (ResolveCustomEmojiUrl(reaction.Emoji) is { } customUrl)
+            {
+                <img class="chat-custom-emoji" src="@customUrl" alt="@reaction.Emoji" />
+            }
+            else
+            {
+                <span class="chat-reaction-emoji">@reaction.Emoji</span>
+            }
+            <span class="chat-reaction-count">@reaction.UserIds.Length</span>
+        </button>
+    }
+
+    <MudMenu Icon="@Icons.Material.Filled.AddReaction" Size="Size.Small"
+             Dense="true" AnchorOrigin="Origin.BottomLeft" TransformOrigin="Origin.TopLeft"
+             Class="chat-reaction-add" title="Add reaction">
+        <div class="chat-reaction-palette">
+            @foreach (var emoji in Palette)
+            {
+                <button type="button" class="chat-reaction-palette-item"
+                        @onclick="() => Toggle.InvokeAsync(emoji)">@emoji</button>
+            }
+        </div>
+
+        @if (Assets.EmojiByName.Count > 0)
+        {
+            <MudDivider />
+            <div class="chat-reaction-palette">
+                @foreach (var custom in Assets.EmojiByName.Values.OrderBy(a => a.Name, StringComparer.Ordinal))
+                {
+                    var token = $":{custom.Name}:";
+                    <button type="button" class="chat-reaction-palette-item" title="@token"
+                            @onclick="() => Toggle.InvokeAsync(token)">
+                        <img class="chat-custom-emoji" src="@custom.Url" alt="@custom.Name" />
+                    </button>
+                }
+            </div>
+        }
+    </MudMenu>
+</div>
+
+@code {
+    /// <summary>Quick palette. Kept short on purpose — a full picker is noise in a chat row.</summary>
+    private static readonly string[] Palette =
+    [
+        "👍", "❤️", "😂", "😮", "😢", "😡", "🎉", "👀",
+        "🔥", "✅", "❌", "🙏", "💯", "🤔", "👋", "😍"
+    ];
+
+    [Parameter, EditorRequired] public ReactionInfo[] Reactions { get; set; } = [];
+    [Parameter] public Guid? CurrentUserId { get; set; }
+    [Parameter, EditorRequired] public EventCallback<string> Toggle { get; set; }
+
+    /// <summary>Resolves reactor ids to names for the chip tooltip.</summary>
+    [Parameter] public Func<Guid, string>? ResolveUserName { get; set; }
+
+    protected override void OnInitialized() => Assets.OnChange += HandleAssetsChanged;
+
+    private void HandleAssetsChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Assets.OnChange -= HandleAssetsChanged;
+
+    /// <summary>
+    /// Custom reactions travel as <c>:name:</c> tokens. An unknown name (deleted emoji,
+    /// or a registry not refreshed yet) renders as the literal token rather than a
+    /// broken image.
+    /// </summary>
+    private string? ResolveCustomEmojiUrl(string emoji)
+    {
+        if (emoji.Length < 4 || emoji[0] != ':' || emoji[^1] != ':') return null;
+        var name = emoji[1..^1];
+        return Assets.EmojiByName.TryGetValue(name, out var asset) ? asset.Url : null;
+    }
+
+    private string DescribeReactors(ReactionInfo reaction)
+    {
+        if (ResolveUserName == null)
+        {
+            return $"{reaction.UserIds.Length} reacted";
+        }
+
+        var names = reaction.UserIds.Select(ResolveUserName).Where(n => !string.IsNullOrWhiteSpace(n)).ToArray();
+        return names.Length == 0 ? $"{reaction.UserIds.Length} reacted" : string.Join(", ", names);
+    }
+}

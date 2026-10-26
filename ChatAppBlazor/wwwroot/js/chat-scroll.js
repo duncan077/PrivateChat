@@ -69,6 +69,9 @@
     }
 
     window.chatScrollManager = {
+        isFollowing: function (container) {
+            return getState(container)?.autoStick ?? true;
+        },
         init: function (container, button, snapPx, buttonShowPx) {
             ensureState(container, button, snapPx, buttonShowPx);
         },
@@ -95,6 +98,53 @@
             state.autoStick = true;
             container.scrollTop = container.scrollHeight;
             setButtonVisibility(state);
+        },
+
+        // Records the current scroll extent so prepended history can be compensated
+        // for. Prepending grows scrollHeight above the viewport, which would otherwise
+        // shove the reader's position down by exactly the amount that was added.
+        captureBeforePrepend: function (container) {
+            const state = ensureState(container, null);
+            if (!state) return;
+            state.prependAnchor = {
+                scrollHeight: container.scrollHeight,
+                scrollTop: container.scrollTop
+            };
+        },
+
+        restoreAfterPrepend: function (container) {
+            const state = getState(container);
+            if (!state || !state.prependAnchor) return;
+
+            const delta = container.scrollHeight - state.prependAnchor.scrollHeight;
+            container.scrollTop = state.prependAnchor.scrollTop + delta;
+            state.prependAnchor = null;
+            // Loading history is never a reason to start following the tail again.
+            state.autoStick = false;
+            setButtonVisibility(state);
+        },
+
+        scrollToMessage: function (container, elementId, highlight) {
+            const state = ensureState(container, null);
+            if (!state || !container) return false;
+
+            // Jumping to an old message means the reader is no longer at the tail.
+            state.autoStick = false;
+            const target = document.getElementById(elementId);
+            if (!target) return window.chatVirtualList?.jumpToMessage(container, elementId) ?? false;
+            target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+
+            if (highlight === true) {
+                target.classList.remove('chat-msg-flash');
+                // Force a reflow so re-adding the class restarts the animation when the
+                // same message is targeted twice in a row.
+                void target.offsetWidth;
+                target.classList.add('chat-msg-flash');
+                setTimeout(() => target.classList.remove('chat-msg-flash'), 1600);
+            }
+
+            setButtonVisibility(state);
+            return true;
         },
 
         dispose: function (container) {

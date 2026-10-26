@@ -4,6 +4,7 @@ using ChatServer.Data.Entities;
 using MagicOnion;
 using MagicOnion.Server;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Distributed;
 using Shared.Models;
 using Shared.Requests;
 using Shared.Responses;
@@ -15,11 +16,13 @@ public class AuthServiceImpl : ServiceBase<IAuthService>, IAuthService
 {
     private readonly AppDbContext _db;
     private readonly JwtTokenService _jwt;
+    private readonly IDistributedCache _cache;
 
-    public AuthServiceImpl(AppDbContext db, JwtTokenService jwt)
+    public AuthServiceImpl(AppDbContext db, JwtTokenService jwt, IDistributedCache cache)
     {
         _db = db;
         _jwt = jwt;
+        _cache = cache;
     }
 
     public async UnaryResult<AuthResponse> LoginAsync(LoginRequest request)
@@ -53,6 +56,15 @@ public class AuthServiceImpl : ServiceBase<IAuthService>, IAuthService
             return new AuthResponse { Success = false, Error = "Username already taken" };
         }
 
+        // DisplayName is a bounded column now; UpdateProfileAsync already enforced a
+        // limit but registration did not, so this was the one way to write a row longer
+        // than the schema allows.
+        var displayName = (request.DisplayName ?? string.Empty).Trim();
+        if (displayName.Length > 64)
+        {
+            return new AuthResponse { Success = false, Error = "Display name must be 64 characters or fewer" };
+        }
+
         var isFirstUser = !await _db.Users.AnyAsync();
 
         var user = new AppUser
@@ -60,7 +72,7 @@ public class AuthServiceImpl : ServiceBase<IAuthService>, IAuthService
             Id = Guid.NewGuid(),
             UserName = request.UserName,
             NormalizedUserName = request.UserName.ToUpperInvariant(),
-            DisplayName = request.DisplayName,
+            DisplayName = displayName,
             GlobalRole = isFirstUser ? UserRole.Owner : UserRole.Member,
             PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password),
             SecurityStamp = Guid.NewGuid().ToString()
@@ -68,6 +80,8 @@ public class AuthServiceImpl : ServiceBase<IAuthService>, IAuthService
 
         _db.Users.Add(user);
         await _db.SaveChangesAsync();
+        // The new account has to show up in the member list without waiting out its TTL.
+        await CacheKeys.InvalidateServerMembersAsync(_cache);
 
         var token = _jwt.GenerateToken(user);
         return new AuthResponse

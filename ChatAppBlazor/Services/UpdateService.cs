@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using ChatAppBlazor.Serialization;
 #if ANDROID
 using Android.Content;
 using Microsoft.Maui.ApplicationModel;
@@ -82,10 +83,7 @@ namespace ChatAppBlazor.Services
                 }
 
                 var json = await response.Content.ReadAsStringAsync();
-                var info = JsonSerializer.Deserialize<UpdateInfoDto>(json, new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                });
+                var info = JsonSerializer.Deserialize(json, AppJsonContext.Default.UpdateInfoDto);
 
                 if (info == null)
                 {
@@ -361,7 +359,7 @@ namespace ChatAppBlazor.Services
             _http.Dispose();
         }
 
-        private sealed class UpdateInfoDto
+        internal sealed class UpdateInfoDto
         {
             [JsonPropertyName("version")]
             public string Version { get; set; } = string.Empty;

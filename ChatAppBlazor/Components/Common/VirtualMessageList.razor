@@ -1,0 +1,90 @@
+@typeparam TItem
+@implements IAsyncDisposable
+@inject IJSRuntime JS
+
+<div class="chat-virtual-list" @ref="_root">
+    <div data-virtual-spacer="before" aria-hidden="true"></div>
+    @for (var i = _start; i < Math.Min(_end, Items.Count); i++)
+    {
+        var item = Items[i];
+        <div class="chat-virtual-row" data-virtual-key="@ItemKey(item)" @key="ItemKey(item)">
+            @ChildContent(item)
+        </div>
+    }
+    <div data-virtual-spacer="after" aria-hidden="true"></div>
+</div>
+
+@code {
+    [Parameter, EditorRequired] public List<TItem> Items { get; set; } = [];
+    [Parameter, EditorRequired] public Func<TItem, Guid> ItemKey { get; set; } = default!;
+    [Parameter, EditorRequired] public RenderFragment<TItem> ChildContent { get; set; } = default!;
+    [Parameter] public EventCallback WindowChanged { get; set; }
+    public IEnumerable<TItem> VisibleItems => Items.Skip(_start).Take(Math.Max(0, _end - _start));
+
+    private ElementReference _root;
+    private DotNetObjectReference<VirtualMessageList<TItem>>? _reference;
+    private string[] _keys = [];
+    private int _start;
+    private int _end;
+    private int _revision;
+    private bool _keysChanged;
+    private bool _windowChanged;
+    private bool _disposed;
+
+    protected override void OnParametersSet()
+    {
+        var first = Items.Count == 0 ? null : ItemKey(Items[0]).ToString();
+        var last = Items.Count == 0 ? null : ItemKey(Items[^1]).ToString();
+        if (_keys.Length == Items.Count && _keys.FirstOrDefault() == first && _keys.LastOrDefault() == last) return;
+
+        var anchor = _start < _keys.Length ? _keys[_start] : null;
+        var windowSize = Math.Clamp(_end - _start, 40, 160);
+        _keys = Items.Select(item => ItemKey(item).ToString()).ToArray();
+        var anchorIndex = anchor is null ? -1 : Array.IndexOf(_keys, anchor);
+        _start = anchorIndex >= 0 ? anchorIndex : Math.Max(0, Items.Count - 40);
+        _end = Math.Min(Items.Count, _start + windowSize);
+        _keysChanged = true;
+        _revision++;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_disposed) return;
+        _reference ??= DotNetObjectReference.Create(this);
+        var changed = _keysChanged;
+        _keysChanged = false;
+        try
+        {
+            await JS.InvokeVoidAsync("chatVirtualList.sync", _root, _reference, changed || firstRender ? _keys : null, _revision);
+            if (_windowChanged)
+            {
+                _windowChanged = false;
+                await WindowChanged.InvokeAsync();
+            }
+        }
+        catch (JSDisconnectedException) { }
+    }
+
+    [JSInvokable]
+    public Task SetWindow(int start, int end, int revision) => InvokeAsync(() =>
+    {
+        if (_disposed || revision != _revision) return;
+        start = Math.Clamp(start, 0, Items.Count);
+        end = Math.Clamp(end, start, Math.Min(Items.Count, start + 160));
+        if (start == _start && end == _end) return;
+        _start = start;
+        _end = end;
+        _windowChanged = true;
+        StateHasChanged();
+    });
+
+    public async ValueTask DisposeAsync()
+    {
+        _disposed = true;
+        if (_reference is null) return;
+        try { await JS.InvokeVoidAsync("chatVirtualList.dispose", _root); }
+        catch (JSDisconnectedException) { }
+        catch (TaskCanceledException) { }
+        _reference?.Dispose();
+    }
+}

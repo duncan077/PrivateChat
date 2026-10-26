@@ -51,6 +51,20 @@ namespace ChatAppBlazor
             HandleNotificationIntent(intent);
         }
 
+#pragma warning disable CS0672, CA1422 // Deprecated in favour of predictive back, which this app does not enable.
+        public override void OnBackPressed()
+        {
+            // A fullscreen video (WebView custom view) swallows the whole screen;
+            // back should dismiss it rather than background the app.
+            if (MainPage.AndroidMediaWebChromeClient.TryCloseFullscreenView())
+            {
+                return;
+            }
+
+            base.OnBackPressed();
+        }
+#pragma warning restore CS0672, CA1422
+
         public override void OnRequestPermissionsResult(
             int requestCode,
             string[] permissions,

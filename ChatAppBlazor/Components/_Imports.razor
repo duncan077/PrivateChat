@@ -10,6 +10,9 @@
 @using ChatAppBlazor.Components
 @using ChatAppBlazor.Components.Pages
 @using ChatAppBlazor.Components.Call
+@* Not "Components.Shared" — that name shadows the Shared project's namespace,
+   so `@using Shared.Models` would resolve inside it and fail to find the models. *@
+@using ChatAppBlazor.Components.Common
 @using ChatAppBlazor.Services
 @using ChatAppBlazor.State
 @using ChatAppBlazor.WebRtc
