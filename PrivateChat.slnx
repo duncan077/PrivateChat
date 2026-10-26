@@ -1,10 +1,8 @@
 <Solution>
-  <Folder Name="/Legacy/">
-    <Project Path="ChatAppBlazor/ChatAppBlazor.csproj" Id="c1cb50ae-aebd-42e4-a298-70b1c1fd0fc8">
-      <Deploy />
-    </Project>
-    <Project Path="MusicBot/MusicBot.csproj" Id="2d8246e1-43f3-401b-949c-9d27520d4a77" />
-  </Folder>
+  <Project Path="ChatAppBlazor/ChatAppBlazor.csproj" Id="c1cb50ae-aebd-42e4-a298-70b1c1fd0fc8">
+    <Deploy />
+  </Project>
+  <Project Path="MusicBot/MusicBot.csproj" Id="2d8246e1-43f3-401b-949c-9d27520d4a77" />
   <Project Path="ChatServer/ChatServer.csproj" Id="ff1ef5ab-7282-45fe-8c97-b77c4cd01db2" />
   <Project Path="Shared/Shared.csproj" />
   <Project Path="ChatApp.Tests/ChatApp.Tests.csproj" />

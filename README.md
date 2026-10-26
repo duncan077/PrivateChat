@@ -2,8 +2,6 @@
 
 Aplicación de chat con salas, mensajes privados, llamadas de voz y video, y pantalla compartida. El cliente activo es **ChatAppBlazor**, desarrollado con .NET MAUI Blazor Hybrid y MudBlazor. El servidor utiliza ASP.NET Core, MagicOnion/gRPC y MariaDB; las llamadas se integran con Janus mediante WebRTC.
 
-> La implementación Avalonia está deprecada. Sus proyectos y documentos se conservan como referencia y no forman parte del cliente en uso.
-
 ## Funcionalidades
 
 - Salas de chat y conversaciones privadas con adjuntos y vistas previas de enlaces.
@@ -25,7 +23,6 @@ Aplicación de chat con salas, mensajes privados, llamadas de voz y video, y pan
 | `MusicBot/` | Cliente auxiliar para reproducción de música en llamadas. |
 | `tools/` | Herramientas de compilación, publicación y despliegue. |
 | `docs/` | Notas técnicas y documentación de implementación. |
-| `ChatApp.Core/`, `ChatApp.Ui/`, `ChatApp.Desktop/`, `ChatApp.Android/`, `ChatApp.Media/`, `ChatApp.Media.Tests/` | Implementación Avalonia y motor multimedia anterior; deprecados. |
 
 ## Requisitos
 
@@ -121,7 +118,3 @@ El script publica el servidor para `linux-arm64` y sin incluir el runtime de .NE
 En el modo predeterminado `Merge`, el despliegue conserva la configuración remota y actualiza únicamente la sección `AppUpdate`. Si `RestartCommand` tiene el valor `none`, el reinicio del servicio debe realizarse por separado.
 
 Despliega el servidor antes de los clientes que utilizan los nuevos RPC de paginación. Los RPC anteriores se conservan para compatibilidad.
-
-## Estado del código histórico
-
-Los documentos sobre Avalonia describen una implementación anterior. Para desarrollo y publicación actuales, utiliza `ChatAppBlazor`, `ChatServer`, `Shared` y las instrucciones de este README.

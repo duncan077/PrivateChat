@@ -1,6 +1,6 @@
 # Blazor chat history
 
-The active client is `ChatAppBlazor`. These changes do not use the deprecated Avalonia client.
+The client is `ChatAppBlazor` (.NET MAUI Blazor Hybrid).
 
 - Room and DM stores retain their message list and existing message objects. An ID set deduplicates page results and live arrivals; new rows are inserted in timestamp/ID order. Delayed pages do not overwrite newer live edits or reactions.
 - `VirtualMessageList` renders a measured window with spacers. Row heights are tracked by message ID, including attachment and preview resizing. It preserves the first visible message across prepends and follows new messages only while the reader is at the bottom. Link previews are requested for rendered rows only.
